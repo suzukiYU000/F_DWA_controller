@@ -18,8 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#ifndef F_DWA_CONTROLLER__TERMINAL_STOP_DYNAMICS_HPP_
-#define F_DWA_CONTROLLER__TERMINAL_STOP_DYNAMICS_HPP_
+#ifndef F_DWA_CONTROLLER__FIR_INPUT_DYNAMICS_HPP_
+#define F_DWA_CONTROLLER__FIR_INPUT_DYNAMICS_HPP_
 
 #include <vector>
 
@@ -28,37 +28,40 @@
 namespace f_dwa_controller
 {
 
-struct StopSequence
+struct ProjectedFirStep
 {
-  std::vector<double> native_inputs;
-  std::vector<AxisState> states;
+  AxisState state;
+  std::vector<double> history;
+  double applied_native_input{0.0};
   bool feasible{false};
-  bool terminal_state_cleared{false};
 };
 
-StopSequence generate_acceleration_stop_sequence(
-  const AxisState & initial_state,
-  const AxisLimits & limits,
-  double time_step,
-  int maximum_steps,
-  double stop_velocity_threshold);
+double fir_acceleration(
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history,
+  double native_input);
 
-StopSequence generate_jerk_stop_sequence(
-  const AxisState & initial_state,
-  const AxisLimits & limits,
-  double time_step,
-  int maximum_steps,
-  double stop_velocity_threshold);
+void push_fir_input(
+  std::vector<double> & history,
+  double native_input);
 
-StopSequence generate_fir_stop_sequence(
-  const AxisState & initial_state,
+FeasibleInterval held_fir_input_interval(
+  const AxisState & state,
   const AxisLimits & limits,
   const std::vector<double> & coefficients,
   const std::vector<double> & history,
   double time_step,
-  int maximum_steps,
-  double stop_velocity_threshold);
+  int remaining_steps);
+
+ProjectedFirStep project_held_fir_step(
+  const AxisState & state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history,
+  double native_input_reference,
+  double time_step,
+  int remaining_steps);
 
 }  // namespace f_dwa_controller
 
-#endif  // F_DWA_CONTROLLER__TERMINAL_STOP_DYNAMICS_HPP_
+#endif  // F_DWA_CONTROLLER__FIR_INPUT_DYNAMICS_HPP_

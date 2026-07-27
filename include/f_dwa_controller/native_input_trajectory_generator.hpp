@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "dwb_plugins/standard_traj_generator.hpp"
+#include "f_dwa_controller/fir_input_dynamics.hpp"
 #include "f_dwa_controller/native_input_dynamics.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -38,7 +39,8 @@ namespace f_dwa_controller
 enum class NativeInputOrder
 {
   kAcceleration,
-  kJerk
+  kJerk,
+  kFir
 };
 
 class NativeInputTrajectoryGenerator
@@ -77,6 +79,8 @@ protected:
     double initial_angular_velocity{0.0};
     double initial_linear_acceleration{0.0};
     double initial_angular_acceleration{0.0};
+    std::vector<double> initial_linear_fir_history;
+    std::vector<double> initial_angular_fir_history;
   };
 
   ProjectedAxisStep project_axis(
@@ -102,6 +106,9 @@ private:
   double control_period_{0.03};
   double maximum_linear_jerk_{1.57};
   double maximum_angular_jerk_{1.57};
+  double maximum_linear_raw_input_{1.2};
+  double maximum_angular_raw_input_{1.57};
+  double native_state_reset_velocity_threshold_{0.01};
   int linear_samples_{11};
   int angular_samples_{11};
   bool require_applied_command_state_{false};
@@ -115,6 +122,9 @@ private:
   geometry_msgs::msg::Twist latest_applied_command_;
   double applied_linear_acceleration_{0.0};
   double applied_angular_acceleration_{0.0};
+  std::vector<double> fir_coefficients_;
+  std::vector<double> applied_linear_fir_history_;
+  std::vector<double> applied_angular_fir_history_;
   bool applied_command_state_ready_{false};
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr
@@ -133,6 +143,13 @@ class JerkTrajectoryGenerator
 {
 public:
   JerkTrajectoryGenerator();
+};
+
+class FirTrajectoryGenerator
+  : public NativeInputTrajectoryGenerator
+{
+public:
+  FirTrajectoryGenerator();
 };
 
 }  // namespace f_dwa_controller

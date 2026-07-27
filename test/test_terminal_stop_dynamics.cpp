@@ -101,6 +101,21 @@ TEST(TerminalStopDynamics, JerkClearsStateInsideVelocityCaptureTube)
   EXPECT_TRUE(sequence.states.empty());
 }
 
+TEST(TerminalStopDynamics, FirStopsWithFilteredAcceleration)
+{
+  const AxisLimits limits{-1.2, 1.2, -1.2, 1.2, -1.2, 1.2};
+  const std::vector<double> coefficients{0.5, 0.3, 0.2};
+  const std::vector<double> history(coefficients.size() - 1u, 0.0);
+
+  const StopSequence sequence =
+    generate_fir_stop_sequence(
+    AxisState{1.0, 0.0}, limits, coefficients, history,
+    0.03, 267, 0.01);
+
+  expect_directional_bounds(sequence, true, limits);
+  EXPECT_EQ(sequence.native_inputs.size(), sequence.states.size());
+}
+
 TEST(TerminalStopDynamics, RejectsStateThatCannotRespectDirectionalBounds)
 {
   const AxisLimits limits{-1.2, 1.2, -1.2, 1.2, -1.57, 1.57};

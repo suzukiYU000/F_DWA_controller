@@ -24,6 +24,7 @@ set(transport_library_name f_dwa_transport)
 add_library(${library_name} SHARED
   src/certified_dwb_local_planner.cpp
   src/dwa_controllers.cpp
+  src/fir_input_dynamics.cpp
   src/native_input_dynamics.cpp
   src/native_input_trajectory_generator.cpp
   src/terminal_stop_dynamics.cpp
@@ -132,12 +133,27 @@ if(BUILD_TESTING)
     )
   endif()
 
+  ament_add_gtest(test_fir_input_dynamics
+    test/test_fir_input_dynamics.cpp
+    src/fir_input_dynamics.cpp
+  )
+  if(TARGET test_fir_input_dynamics)
+    target_include_directories(test_fir_input_dynamics
+      PRIVATE
+        include
+    )
+  endif()
+
   ament_add_gtest(test_native_input_trajectory_generator
     test/test_native_input_trajectory_generator.cpp
   )
   if(TARGET test_native_input_trajectory_generator)
     target_link_libraries(
       test_native_input_trajectory_generator ${library_name}
+    )
+    target_compile_definitions(test_native_input_trajectory_generator
+      PRIVATE
+        F_DWA_CONTROLLER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
     ament_target_dependencies(test_native_input_trajectory_generator
       dwb_msgs
@@ -178,6 +194,7 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_terminal_stop_dynamics
     test/test_terminal_stop_dynamics.cpp
+    src/fir_input_dynamics.cpp
     src/native_input_dynamics.cpp
     src/terminal_stop_dynamics.cpp
   )

@@ -37,9 +37,11 @@ namespace
 
 constexpr char kPluginName[] = "FollowPath";
 
-nav2_util::LifecycleNode::SharedPtr make_node(const std::string & name)
+nav2_util::LifecycleNode::SharedPtr make_node(
+  const std::string & name,
+  const bool load_f8_config = false)
 {
-  const std::vector<rclcpp::Parameter> parameters{
+  std::vector<rclcpp::Parameter> parameters{
     rclcpp::Parameter("FollowPath.min_vel_x", 0.0),
     rclcpp::Parameter("FollowPath.max_vel_x", 1.2),
     rclcpp::Parameter("FollowPath.min_vel_y", 0.0),
@@ -61,9 +63,23 @@ nav2_util::LifecycleNode::SharedPtr make_node(const std::string & name)
     rclcpp::Parameter("FollowPath.discretize_by_time", true),
     rclcpp::Parameter("FollowPath.time_granularity", 0.03),
     rclcpp::Parameter("FollowPath.native_input_control_period", 0.03),
+    rclcpp::Parameter("FollowPath.max_linear_raw_input", 1.2),
+    rclcpp::Parameter("FollowPath.max_angular_raw_input", 1.57),
     rclcpp::Parameter("FollowPath.require_applied_command_state", false)};
+  if (!load_f8_config) {
+    parameters.emplace_back(
+      "FollowPath.fir_coefficients",
+      std::vector<double>{0.5, 0.3, 0.2});
+  }
   rclcpp::NodeOptions options;
   options.parameter_overrides(parameters);
+  if (load_f8_config) {
+    options.arguments(
+        {
+          "--ros-args", "--params-file",
+          std::string(F_DWA_CONTROLLER_SOURCE_DIR) + "/config/f_dwa.yaml"
+      });
+  }
   return std::make_shared<nav2_util::LifecycleNode>(name, "", options);
 }
 
@@ -142,6 +158,26 @@ TEST_F(NativeInputTrajectoryGeneratorTest, JerkGeneratorRollsOut121Candidates)
 {
   const auto node = make_node("jerk_generator_test");
   JerkTrajectoryGenerator generator;
+
+  generator.initialize(node, kPluginName);
+
+  expect_finite_trajectory(generator);
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, FirGeneratorRollsOut121Candidates)
+{
+  const auto node = make_node("fir_generator_test");
+  FirTrajectoryGenerator generator;
+
+  generator.initialize(node, kPluginName);
+
+  expect_finite_trajectory(generator);
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, NamedF8ConfigRollsOutAndStops)
+{
+  const auto node = make_node("controller_server", true);
+  FirTrajectoryGenerator generator;
 
   generator.initialize(node, kPluginName);
 

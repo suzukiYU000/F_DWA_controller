@@ -1,0 +1,81 @@
+controller_server:
+  ros__parameters:
+    FollowPath:
+      plugin: "f_dwa_controller::FDwaController"
+      trajectory_generator_name: "f_dwa_controller::FirTrajectoryGenerator"
+      enable_certification: true
+      native_input_control_period: 0.03
+      applied_command_topic: "/controller/applied_cmd_vel"
+      require_applied_command_state: true
+      native_state_reset_velocity_threshold: 0.01
+      max_linear_raw_input: 1.2
+      max_angular_raw_input: 1.57
+
+      # F-8 default: exact coefficients from the named ROS 1
+      # advanced_dwa/profiles/f-8.yaml.
+      #
+      # Design evidence:
+      #   mode: lowpass
+      #   original_numtaps: 91
+      #   cutoff_hz: 1.2
+      #   window: hamming
+      #   minimum_phase: true
+      #
+      # Existing ROS 1 profile change patterns:
+      #   F-7: cutoff_hz 0.5, otherwise the same design family; replace the
+      #        complete vector with advanced_dwa/profiles/f-7.yaml.
+      #   F-9: cutoff_hz 2.0, otherwise the same design family; replace the
+      #        complete vector with advanced_dwa/profiles/f-9.yaml.
+      #
+      # Paper-design change pattern:
+      #   Keep this file and replace this complete vector with the frozen
+      #   paper-design coefficient vector. Record its mode, original_numtaps,
+      #   bands/stopbands, window, minimum_phase, DC gain, and fingerprint in
+      #   the experiment manifest. Do not mix coefficients from both designs.
+      fir_coefficients:
+        - 0.035777752054243377
+        - 0.045878186521488222
+        - 0.062570166323592219
+        - 0.080418053293563399
+        - 0.097354323429160616
+        - 0.11144922512678268
+        - 0.12092495177347996
+        - 0.12436852339294074
+        - 0.12095127393441359
+        - 0.1105850418522388
+        - 0.093965326304448427
+        - 0.072517228453112995
+        - 0.048228323572667313
+        - 0.023398363395377694
+        - 0.00034114993981969538
+        - -0.018872755721100698
+        - -0.032757703647982202
+        - -0.040433615647479486
+        - -0.041877094771567445
+        - -0.03775517681492236
+        - -0.029318076048936586
+        - -0.018245918418712495
+        - -0.0063632259584258501
+        - 0.0046272774558554462
+        - 0.013345914377498467
+        - 0.018885917438178999
+        - 0.020891029358078711
+        - 0.019566571466093852
+        - 0.015582497582436421
+        - 0.0099104480557659497
+        - 0.0036435108533970366
+        - -0.0021643057581705039
+        - -0.0066913280814105578
+        - -0.0094021045255587524
+        - -0.010148404350806425
+        - -0.0091223166292755467
+        - -0.0067781407345996495
+        - -0.0037410844795388166
+        - -0.00065405392845232927
+        - 0.0019347283013266016
+        - 0.0036468558098516875
+        - 0.0043335642412935804
+        - 0.0040642521005097108
+        - 0.0030832199513741699
+        - 0.0017309988770192455
+        - 0.0003506302809301164

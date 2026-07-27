@@ -9,11 +9,13 @@ integration remain common across the compared methods.
 
 ## Current status
 
-The DWB-derived A-DWA, J-DWA, and F-DWA controller class names are registered.
-A-DWA and J-DWA also have native-input trajectory generators. They preserve the
-11 x 11 candidate budget, use the common 2.4 s DWB rollout, and project each
-native input into a remaining-horizon feasible interval. J-DWA reconstructs its
-acceleration state from `/controller/applied_cmd_vel`.
+The DWB-derived A-DWA, J-DWA, and F-DWA controller class names and native-input
+trajectory generators are registered. They preserve the 11 x 11 candidate
+budget, use the common 2.4 s DWB rollout, and project each native input into a
+remaining-horizon feasible interval. J-DWA reconstructs its acceleration state
+from `/controller/applied_cmd_vel`. F-DWA reconstructs its FIR input history
+from the same stream; a transport-induced hold is retained as disturbance
+history while future selected raw inputs remain bounded.
 
 The common controller applies the 70 ms nominal activation preview before both
 DWB cost evaluation and safety certification. Certification connects a
@@ -28,8 +30,9 @@ The 0.01 velocity capture tube is a deliberate hybrid transition: the simulator
 transport converts components inside it to exact zero and the associated
 controller state is cleared. Recovery candidates that start inside the
 certificate margin and move outward remain pending and are disabled by default.
-F-DWA also remains without a trajectory generator until the exact F-8
-coefficient definition is selected.
+F-DWA defaults to the exact named ROS 1 F-8 low-pass coefficient vector.
+Alternative filter designs are recorded as commented, atomic
+coefficient-replacement patterns in `config/f_dwa.yaml`.
 
 The package also provides `command_delay_transport`, a simulation-only command
 transport. It receives Nav2 commands, samples an independent truncated-normal

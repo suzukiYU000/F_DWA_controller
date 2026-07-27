@@ -26,8 +26,7 @@
     type="f_dwa_controller::FDwaController"
     base_class_type="nav2_core::Controller">
     <description>
-      DWB-derived F-DWA controller. Its FIR trajectory generator is installed
-      only after a coefficient set is selected explicitly.
+      DWB-derived F-DWA controller using the FIR trajectory generator.
     </description>
   </class>
 </library>

@@ -9,5 +9,8 @@ for an ablation, while the common 70 ms nominal pose preview remains enabled.
 `v_dwb.yaml` selects Nav2's `LimitedAccelGenerator`; the separate
 `v_dwb_standard.yaml` selects `StandardTrajectoryGenerator`.
 
-F-DWA configuration is intentionally not installed until the F-8 coefficient
-definition is confirmed.
+`f_dwa.yaml` uses the named ROS 1 `f-8.yaml` low-pass coefficients by default.
+The paper-design replacement pattern is kept as comments beside that
+coefficient block so the four-method comparison does not need another config
+file. Replace the complete coefficient vector atomically; mixing design
+metadata and coefficients from different filters is not a valid experiment.

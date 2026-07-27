@@ -17,4 +17,13 @@
       satisfied.
     </description>
   </class>
+  <class
+    type="f_dwa_controller::FirTrajectoryGenerator"
+    base_class_type="dwb_core::TrajectoryGenerator">
+    <description>
+      Samples raw acceleration inputs, applies the configured FIR dynamics,
+      and projects the inputs so velocity and filtered-acceleration bounds
+      remain satisfied.
+    </description>
+  </class>
 </library>

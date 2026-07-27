@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "f_dwa_controller/fir_input_dynamics.hpp"
+
 namespace f_dwa_controller
 {
 
@@ -218,6 +220,90 @@ StopSequence generate_jerk_stop_sequence(
     sequence.native_inputs.push_back(step.applied_native_input);
     sequence.states.push_back(step.state);
     state = step.state;
+    if (std::abs(state.velocity) <= stop_velocity_threshold) {
+      mark_terminal(sequence);
+      return sequence;
+    }
+  }
+  return sequence;
+}
+
+StopSequence generate_fir_stop_sequence(
+  const AxisState & initial_state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history,
+  const double time_step,
+  const int maximum_steps,
+  const double stop_velocity_threshold)
+{
+  StopSequence sequence;
+  if (!stop_problem_is_valid(
+      initial_state, limits, time_step, maximum_steps,
+      stop_velocity_threshold) ||
+    coefficients.empty() ||
+    history.size() + 1u != coefficients.size() ||
+    std::abs(coefficients.front()) <= 1.0e-12)
+  {
+    return sequence;
+  }
+  if (std::abs(initial_state.velocity) <= stop_velocity_threshold) {
+    sequence.feasible = true;
+    sequence.terminal_state_cleared = true;
+    return sequence;
+  }
+
+  const bool positive_direction = initial_state.velocity > 0.0;
+  const AxisLimits stop_limits =
+    directional_limits(limits, positive_direction);
+  AxisState state = initial_state;
+  std::vector<double> current_history = history;
+  sequence.native_inputs.reserve(static_cast<std::size_t>(maximum_steps));
+  sequence.states.reserve(static_cast<std::size_t>(maximum_steps));
+  for (int step_index = 0; step_index < maximum_steps; ++step_index) {
+    const int lookahead_steps =
+      std::min(
+      maximum_steps - step_index,
+      static_cast<int>(coefficients.size()));
+    const FeasibleInterval feasible_input =
+      held_fir_input_interval(
+      state, stop_limits, coefficients, current_history,
+      time_step, lookahead_steps);
+    if (!feasible_input.feasible) {
+      return sequence;
+    }
+
+    const double acceleration_lower =
+      std::max(
+      stop_limits.acceleration_min,
+      (stop_limits.velocity_min - state.velocity) / time_step);
+    const double acceleration_upper =
+      std::min(
+      stop_limits.acceleration_max,
+      (stop_limits.velocity_max - state.velocity) / time_step);
+    if (acceleration_lower > acceleration_upper) {
+      return sequence;
+    }
+    const double requested_acceleration =
+      positive_direction ? acceleration_lower : acceleration_upper;
+    const double free_acceleration =
+      fir_acceleration(coefficients, current_history, 0.0);
+    const double requested_input =
+      (requested_acceleration - free_acceleration) /
+      coefficients.front();
+    const ProjectedFirStep step =
+      project_held_fir_step(
+      state, stop_limits, coefficients, current_history,
+      std::clamp(
+        requested_input, feasible_input.lower, feasible_input.upper),
+      time_step, lookahead_steps);
+    if (!step.feasible) {
+      return sequence;
+    }
+    sequence.native_inputs.push_back(step.applied_native_input);
+    sequence.states.push_back(step.state);
+    state = step.state;
+    current_history = step.history;
     if (std::abs(state.velocity) <= stop_velocity_threshold) {
       mark_terminal(sequence);
       return sequence;
