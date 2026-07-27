@@ -4,7 +4,11 @@ project(f_dwa_controller)
 find_package(ament_cmake REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(dwb_core REQUIRED)
+find_package(dwb_msgs REQUIRED)
+find_package(dwb_plugins REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav_2d_msgs REQUIRED)
+find_package(nav_2d_utils REQUIRED)
 find_package(nav2_core REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
 find_package(nav2_util REQUIRED)
@@ -19,6 +23,9 @@ set(transport_library_name f_dwa_transport)
 
 add_library(${library_name} SHARED
   src/certified_dwb_local_planner.cpp
+  src/dwa_controllers.cpp
+  src/native_input_dynamics.cpp
+  src/native_input_trajectory_generator.cpp
 )
 
 add_library(${transport_library_name} SHARED
@@ -41,7 +48,11 @@ target_include_directories(${transport_library_name}
 
 ament_target_dependencies(${library_name}
   dwb_core
+  dwb_msgs
+  dwb_plugins
   geometry_msgs
+  nav_2d_msgs
+  nav_2d_utils
   nav2_core
   nav2_costmap_2d
   nav2_util
@@ -66,6 +77,9 @@ target_link_libraries(command_delay_transport ${transport_library_name})
 ament_target_dependencies(command_delay_transport rclcpp)
 
 pluginlib_export_plugin_description_file(nav2_core f_dwa_controller.xml)
+pluginlib_export_plugin_description_file(
+  dwb_core f_dwa_trajectory_generators.xml
+)
 
 install(
   TARGETS
@@ -104,6 +118,39 @@ if(BUILD_TESTING)
     target_link_libraries(test_command_delay_queue ${transport_library_name})
     ament_target_dependencies(test_command_delay_queue geometry_msgs rclcpp)
   endif()
+
+  ament_add_gtest(test_native_input_dynamics
+    test/test_native_input_dynamics.cpp
+    src/native_input_dynamics.cpp
+  )
+  if(TARGET test_native_input_dynamics)
+    target_include_directories(test_native_input_dynamics
+      PRIVATE
+        include
+    )
+  endif()
+
+  ament_add_gtest(test_native_input_trajectory_generator
+    test/test_native_input_trajectory_generator.cpp
+  )
+  if(TARGET test_native_input_trajectory_generator)
+    target_link_libraries(
+      test_native_input_trajectory_generator ${library_name}
+    )
+    ament_target_dependencies(test_native_input_trajectory_generator
+      dwb_msgs
+      nav_2d_utils
+      nav2_util
+      rclcpp
+    )
+    # nav_2d_utils exports plain libraries and upstream dwb_core leaves these
+    # symbols unresolved. Keep them after dwb_core in the executable link order.
+    target_link_libraries(test_native_input_trajectory_generator
+      conversions
+      path_ops
+      tf_help
+    )
+  endif()
 endif()
 
 ament_export_include_directories(include)
@@ -112,6 +159,10 @@ ament_export_targets(export_${library_name} HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   diagnostic_msgs
   dwb_core
+  dwb_msgs
+  dwb_plugins
+  nav_2d_msgs
+  nav_2d_utils
   nav2_core
   nav2_costmap_2d
   nav2_util

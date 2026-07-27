@@ -8,4 +8,26 @@
       certification is rejected until its candidate-level implementation is complete.
     </description>
   </class>
+  <class
+    type="f_dwa_controller::ADwaController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      DWB-derived A-DWA controller using the acceleration trajectory generator.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::JDwaController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      DWB-derived J-DWA controller using the jerk trajectory generator.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::FDwaController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      DWB-derived F-DWA controller. Its FIR trajectory generator is installed
+      only after a coefficient set is selected explicitly.
+    </description>
+  </class>
 </library>

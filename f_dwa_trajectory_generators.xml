@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<library path="f_dwa_controller">
+  <class
+    type="f_dwa_controller::AccelerationTrajectoryGenerator"
+    base_class_type="dwb_core::TrajectoryGenerator">
+    <description>
+      Samples acceleration inputs and projects them during rollout so velocity
+      and acceleration bounds remain satisfied.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::JerkTrajectoryGenerator"
+    base_class_type="dwb_core::TrajectoryGenerator">
+    <description>
+      Samples jerk inputs from applied-command acceleration state and projects
+      them during rollout so velocity, acceleration, and jerk bounds remain
+      satisfied.
+    </description>
+  </class>
+</library>

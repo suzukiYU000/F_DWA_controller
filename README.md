@@ -9,16 +9,18 @@ integration remain common across the compared methods.
 
 ## Current status
 
-This branch contains the initial buildable plugin scaffold.
+The DWB-derived A-DWA, J-DWA, and F-DWA controller class names are registered.
+A-DWA and J-DWA also have native-input trajectory generators. They preserve the
+11 x 11 candidate budget, use the common 2.4 s DWB rollout, and project each
+native input into a remaining-horizon feasible interval. J-DWA reconstructs its
+acceleration state from `/controller/applied_cmd_vel`.
 
-Only `f_dwa_controller::CertifiedDWBLocalPlanner` is registered. With
-`enable_certification: false`, it delegates to stock DWB. Enabling certification
-fails during configuration because candidate-level certification, terminal stop
-suffixes, and retained backups have not yet been implemented.
-
-A-DWA, J-DWA, and F-DWA are intentionally not registered yet. This prevents an
-incomplete controller from publishing motion commands under a research-method
-name.
+Candidate-level collision certification, terminal stop suffixes, and retained
+backup revalidation are still in progress. Consequently the A/J configurations
+set `enable_certification: true` and fail closed during controller
+configuration. Setting it to false is limited to generator development and is
+not a certified comparison run. F-DWA remains without a trajectory generator
+until the exact F-8 coefficient definition is selected.
 
 The package also provides `command_delay_transport`, a simulation-only command
 transport. It receives Nav2 commands, samples an independent truncated-normal
