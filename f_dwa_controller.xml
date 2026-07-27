@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<library path="f_dwa_controller">
+  <class
+    type="f_dwa_controller::CertifiedDWBLocalPlanner"
+    base_class_type="nav2_core::Controller">
+    <description>
+      Common DWB-derived controller base. The scaffold supports stock DWB behavior only;
+      certification is rejected until its candidate-level implementation is complete.
+    </description>
+  </class>
+</library>
