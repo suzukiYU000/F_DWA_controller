@@ -60,6 +60,12 @@ public:
     const geometry_msgs::msg::Pose2D & start_pose,
     const nav_2d_msgs::msg::Twist2D & start_velocity,
     const nav_2d_msgs::msg::Twist2D & command_velocity) override;
+  bool generate_stop_trajectory(
+    const geometry_msgs::msg::Pose2D & start_pose,
+    int maximum_stop_steps,
+    double stop_velocity_threshold,
+    std::vector<geometry_msgs::msg::Pose2D> & poses,
+    std::vector<nav_2d_msgs::msg::Twist2D> & velocities);
 
 protected:
   struct Candidate
@@ -67,6 +73,8 @@ protected:
     nav_2d_msgs::msg::Twist2D command_velocity;
     double linear_native_input{0.0};
     double angular_native_input{0.0};
+    double initial_linear_velocity{0.0};
+    double initial_angular_velocity{0.0};
     double initial_linear_acceleration{0.0};
     double initial_angular_acceleration{0.0};
   };

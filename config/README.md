@@ -1,8 +1,13 @@
 # Configuration
 
-Controller configurations will be added with the A-DWA, J-DWA, F-DWA, and
-candidate-level certification implementations.
+The common file contains parameters shared by V-DWB, A-DWA, J-DWA, and F-DWA.
+Method files should contain only the plugin and native-dynamics differences.
 
-Until then, `f_dwa_controller::CertifiedDWBLocalPlanner` must be configured with
-`enable_certification: false`. It then delegates trajectory generation and
-scoring to Nav2 DWB without changing the selected command.
+`enable_certification: true` adds the common terminal-stop certificate and
+retained-backup revalidation. It can be disabled through the research launch
+for an ablation, while the common 70 ms nominal pose preview remains enabled.
+`v_dwb.yaml` selects Nav2's `LimitedAccelGenerator`; the separate
+`v_dwb_standard.yaml` selects `StandardTrajectoryGenerator`.
+
+F-DWA configuration is intentionally not installed until the F-8 coefficient
+definition is confirmed.

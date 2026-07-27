@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "dwb_core/exceptions.hpp"
+#include "f_dwa_controller/terminal_stop_dynamics.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "rclcpp/duration.hpp"
@@ -195,6 +196,8 @@ void NativeInputTrajectoryGenerator::startNewIteration(
       candidate.command_velocity.theta = angular_step.state.velocity;
       candidate.linear_native_input = linear_input;
       candidate.angular_native_input = angular_input;
+      candidate.initial_linear_velocity = current_velocity.x;
+      candidate.initial_angular_velocity = current_velocity.theta;
       candidate.initial_linear_acceleration = initial_linear_acceleration;
       candidate.initial_angular_acceleration = initial_angular_acceleration;
       candidates_.push_back(candidate);
@@ -281,6 +284,101 @@ NativeInputTrajectoryGenerator::generateTrajectory(
       rclcpp::Duration::from_seconds(running_time));
   }
   return trajectory;
+}
+
+bool NativeInputTrajectoryGenerator::generate_stop_trajectory(
+  const geometry_msgs::msg::Pose2D & start_pose,
+  const int maximum_stop_steps,
+  const double stop_velocity_threshold,
+  std::vector<geometry_msgs::msg::Pose2D> & poses,
+  std::vector<nav_2d_msgs::msg::Twist2D> & velocities)
+{
+  poses.clear();
+  velocities.clear();
+  if (!has_active_candidate_ || maximum_stop_steps <= 0 ||
+    !std::isfinite(stop_velocity_threshold) ||
+    stop_velocity_threshold <= 0.0)
+  {
+    return false;
+  }
+
+  const AxisLimits linear_axis_limits = linear_limits();
+  const AxisLimits angular_axis_limits = angular_limits();
+  const AxisState initial_linear_state{
+    active_candidate_.initial_linear_velocity,
+    active_candidate_.initial_linear_acceleration};
+  const AxisState initial_angular_state{
+    active_candidate_.initial_angular_velocity,
+    active_candidate_.initial_angular_acceleration};
+  const int rollout_step_count =
+    static_cast<int>(std::ceil(sim_time_ / time_granularity_));
+  const ProjectedAxisStep first_linear_step =
+    project_axis(
+    initial_linear_state, linear_axis_limits,
+    active_candidate_.linear_native_input, control_period_,
+    rollout_step_count);
+  const ProjectedAxisStep first_angular_step =
+    project_axis(
+    initial_angular_state, angular_axis_limits,
+    active_candidate_.angular_native_input, control_period_,
+    rollout_step_count);
+  if (!first_linear_step.feasible || !first_angular_step.feasible) {
+    return false;
+  }
+
+  StopSequence linear_stop;
+  StopSequence angular_stop;
+  if (input_order_ == NativeInputOrder::kAcceleration) {
+    linear_stop = generate_acceleration_stop_sequence(
+      first_linear_step.state, linear_axis_limits, control_period_,
+      maximum_stop_steps, stop_velocity_threshold);
+    angular_stop = generate_acceleration_stop_sequence(
+      first_angular_step.state, angular_axis_limits, control_period_,
+      maximum_stop_steps, stop_velocity_threshold);
+  } else {
+    linear_stop = generate_jerk_stop_sequence(
+      first_linear_step.state, linear_axis_limits, control_period_,
+      maximum_stop_steps, stop_velocity_threshold);
+    angular_stop = generate_jerk_stop_sequence(
+      first_angular_step.state, angular_axis_limits, control_period_,
+      maximum_stop_steps, stop_velocity_threshold);
+  }
+  if (!linear_stop.feasible || !angular_stop.feasible ||
+    !linear_stop.terminal_state_cleared ||
+    !angular_stop.terminal_state_cleared)
+  {
+    return false;
+  }
+
+  geometry_msgs::msg::Pose2D pose = start_pose;
+  poses.push_back(pose);
+  nav_2d_msgs::msg::Twist2D first_velocity;
+  first_velocity.x = first_linear_step.state.velocity;
+  first_velocity.theta = first_angular_step.state.velocity;
+  pose = computeNewPosition(pose, first_velocity, control_period_);
+  velocities.push_back(first_velocity);
+  poses.push_back(pose);
+
+  const std::size_t stop_step_count =
+    std::max(linear_stop.states.size(), angular_stop.states.size());
+  for (std::size_t step_index = 0;
+    step_index < stop_step_count; ++step_index)
+  {
+    nav_2d_msgs::msg::Twist2D stop_velocity;
+    if (step_index < linear_stop.states.size()) {
+      stop_velocity.x = linear_stop.states[step_index].velocity;
+    }
+    if (step_index < angular_stop.states.size()) {
+      stop_velocity.theta = angular_stop.states[step_index].velocity;
+    }
+    pose = computeNewPosition(pose, stop_velocity, control_period_);
+    velocities.push_back(stop_velocity);
+    poses.push_back(pose);
+  }
+  nav_2d_msgs::msg::Twist2D zero_velocity;
+  velocities.push_back(zero_velocity);
+  poses.push_back(pose);
+  return true;
 }
 
 ProjectedAxisStep NativeInputTrajectoryGenerator::project_axis(

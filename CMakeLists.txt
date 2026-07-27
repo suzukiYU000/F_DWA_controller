@@ -26,6 +26,8 @@ add_library(${library_name} SHARED
   src/dwa_controllers.cpp
   src/native_input_dynamics.cpp
   src/native_input_trajectory_generator.cpp
+  src/terminal_stop_dynamics.cpp
+  src/trajectory_certifier.cpp
 )
 
 add_library(${transport_library_name} SHARED
@@ -144,11 +146,60 @@ if(BUILD_TESTING)
       rclcpp
     )
     # nav_2d_utils exports plain libraries and upstream dwb_core leaves these
-    # symbols unresolved. Keep them after dwb_core in the executable link order.
+    # symbols unresolved. Resolve their installed paths explicitly and keep
+    # them after dwb_core in the executable link order.
+    get_filename_component(
+      nav_2d_utils_prefix "${nav_2d_utils_DIR}/../../.." ABSOLUTE
+    )
+    find_library(nav_2d_utils_conversions
+      NAMES conversions
+      PATHS "${nav_2d_utils_prefix}/lib"
+      NO_DEFAULT_PATH
+      REQUIRED
+    )
+    find_library(nav_2d_utils_path_ops
+      NAMES path_ops
+      PATHS "${nav_2d_utils_prefix}/lib"
+      NO_DEFAULT_PATH
+      REQUIRED
+    )
+    find_library(nav_2d_utils_tf_help
+      NAMES tf_help
+      PATHS "${nav_2d_utils_prefix}/lib"
+      NO_DEFAULT_PATH
+      REQUIRED
+    )
     target_link_libraries(test_native_input_trajectory_generator
-      conversions
-      path_ops
-      tf_help
+      "${nav_2d_utils_conversions}"
+      "${nav_2d_utils_path_ops}"
+      "${nav_2d_utils_tf_help}"
+    )
+  endif()
+
+  ament_add_gtest(test_terminal_stop_dynamics
+    test/test_terminal_stop_dynamics.cpp
+    src/native_input_dynamics.cpp
+    src/terminal_stop_dynamics.cpp
+  )
+  if(TARGET test_terminal_stop_dynamics)
+    target_include_directories(test_terminal_stop_dynamics
+      PRIVATE
+        include
+    )
+  endif()
+
+  ament_add_gtest(test_trajectory_certifier
+    test/test_trajectory_certifier.cpp
+    src/trajectory_certifier.cpp
+  )
+  if(TARGET test_trajectory_certifier)
+    target_include_directories(test_trajectory_certifier
+      PRIVATE
+        include
+    )
+    ament_target_dependencies(test_trajectory_certifier
+      geometry_msgs
+      nav2_costmap_2d
     )
   endif()
 endif()

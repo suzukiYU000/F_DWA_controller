@@ -31,6 +31,18 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       include_last_point: true
+      enable_nominal_delay_preview: true
+      nominal_delay_preview_seconds: 0.07
+      certification_control_period: 0.03
+      terminal_stop_maximum_time: 8.0
+      terminal_stop_velocity_threshold: 0.01
+      # This is an additional certificate reserve outside the common 0.10 m
+      # planning footprint padding. Recovery from reserve intrusion is off by
+      # default and will be implemented as a separate switchable policy.
+      minimum_certified_margin: 0.02
+      # At 0.05 m costmap resolution, checking at half-cell swept distance
+      # prevents translation plus rectangle-corner rotation from skipping a cell.
+      maximum_swept_distance: 0.025
       transform_tolerance: 0.2
       short_circuit_trajectory_evaluation: false
       stateful: true

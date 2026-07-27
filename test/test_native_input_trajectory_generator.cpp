@@ -89,6 +89,19 @@ void expect_finite_trajectory(
     EXPECT_TRUE(std::isfinite(pose.theta));
   }
 
+  std::vector<geometry_msgs::msg::Pose2D> stop_poses;
+  std::vector<nav_2d_msgs::msg::Twist2D> stop_velocities;
+  ASSERT_TRUE(
+    generator.generate_stop_trajectory(
+      start_pose, 267, 0.01, stop_poses, stop_velocities));
+  ASSERT_EQ(stop_poses.size(), stop_velocities.size() + 1u);
+  ASSERT_FALSE(stop_velocities.empty());
+  EXPECT_NEAR(stop_velocities.front().x, first_command.x, 1.0e-12);
+  EXPECT_NEAR(
+    stop_velocities.front().theta, first_command.theta, 1.0e-12);
+  EXPECT_LE(std::abs(stop_velocities.back().x), 0.01);
+  EXPECT_LE(std::abs(stop_velocities.back().theta), 0.01);
+
   std::size_t candidate_count = 1;
   while (generator.hasMoreTwists()) {
     generator.nextTwist();

@@ -15,12 +15,21 @@ A-DWA and J-DWA also have native-input trajectory generators. They preserve the
 native input into a remaining-horizon feasible interval. J-DWA reconstructs its
 acceleration state from `/controller/applied_cmd_vel`.
 
-Candidate-level collision certification, terminal stop suffixes, and retained
-backup revalidation are still in progress. Consequently the A/J configurations
-set `enable_certification: true` and fail closed during controller
-configuration. Setting it to false is limited to generator development and is
-not a certified comparison run. F-DWA remains without a trajectory generator
-until the exact F-8 coefficient definition is selected.
+The common controller applies the 70 ms nominal activation preview before both
+DWB cost evaluation and safety certification. Certification connects a
+dynamics-feasible stop sequence after the first executable sample, checks the
+complete padded footprint interior on the local costmap, rejects unknown or
+off-costmap poses, and interpolates the sweep at no more than half the 0.05 m
+costmap resolution. The selected stop suffix is retained. If no ordinary
+candidate is legal on a later cycle, the remaining suffix is rebuilt from the
+current preview pose and revalidated against the current costmap before use.
+
+The 0.01 velocity capture tube is a deliberate hybrid transition: the simulator
+transport converts components inside it to exact zero and the associated
+controller state is cleared. Recovery candidates that start inside the
+certificate margin and move outward remain pending and are disabled by default.
+F-DWA also remains without a trajectory generator until the exact F-8
+coefficient definition is selected.
 
 The package also provides `command_delay_transport`, a simulation-only command
 transport. It receives Nav2 commands, samples an independent truncated-normal
@@ -45,11 +54,12 @@ dwb_core::DWBLocalPlanner
     └── f_dwa_controller::FDwaController
 ```
 
-V-DWB uses `dwb_core::DWBLocalPlanner` directly when common certification is
-disabled. When certification is enabled, it uses
-`f_dwa_controller::CertifiedDWBLocalPlanner` with Nav2's
-`dwb_plugins::LimitedAccelGenerator`. A separate configuration can select
-`dwb_plugins::StandardTrajectoryGenerator`.
+V-DWB uses `f_dwa_controller::CertifiedDWBLocalPlanner` so the nominal delay
+preview remains common even when certification is disabled. Its default
+trajectory generator is Nav2's `dwb_plugins::LimitedAccelGenerator`. A separate
+configuration selects `dwb_plugins::StandardTrajectoryGenerator` and enables
+`limit_vel_cmd_in_traj` so the command sent to the robot is its first
+acceleration-limited executable sample.
 
 ## Source compatibility
 
