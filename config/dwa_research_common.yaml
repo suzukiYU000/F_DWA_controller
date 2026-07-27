@@ -1,0 +1,94 @@
+controller_server:
+  ros__parameters:
+    controller_frequency: 33.333333333333333
+    enable_stamped_cmd_vel: false
+    controller_plugins: ["FollowPath"]
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    FollowPath:
+      debug_trajectory_details: true
+      min_vel_x: 0.0
+      min_vel_y: 0.0
+      max_vel_x: 1.2  # 0.6 for the initial real-robot limit
+      max_vel_y: 0.0
+      max_vel_theta: 1.57
+      min_speed_xy: 0.0
+      max_speed_xy: 1.2  # 0.6 for the initial real-robot limit
+      min_speed_theta: 0.0
+      acc_lim_x: 1.2
+      acc_lim_y: 0.0
+      acc_lim_theta: 1.57
+      decel_lim_x: -1.2
+      decel_lim_y: 0.0
+      decel_lim_theta: -1.57
+      vx_samples: 11
+      vy_samples: 1
+      vtheta_samples: 11
+      sim_time: 2.4
+      discretize_by_time: true
+      time_granularity: 0.03
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      include_last_point: true
+      transform_tolerance: 0.2
+      short_circuit_trajectory_evaluation: false
+      stateful: true
+      critics:
+        - RotateToGoal
+        - Oscillation
+        - ObstacleFootprint
+        - GoalAlign
+        - PathAlign
+        - PathDist
+        - GoalDist
+      ObstacleFootprint.scale: 0.10
+      ObstacleFootprint.sum_scores: true
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.325
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.325
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+velocity_smoother:
+  ros__parameters:
+    enable_stamped_cmd_vel: false
+    smoothing_frequency: 33.333333333333333
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [1.2, 0.0, 1.57]  # [0.6, 0.0, 1.57] on the real robot
+    min_velocity: [0.0, 0.0, -1.57]
+    max_accel: [1.2, 0.0, 1.57]
+    max_decel: [-1.2, 0.0, -1.57]
+    odom_topic: "/whill/odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+collision_monitor:
+  ros__parameters:
+    enable_stamped_cmd_vel: false
+    cmd_vel_in_topic: "cmd_vel_collision_unused_input"
+    cmd_vel_out_topic: "cmd_vel_collision_unused"
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      resolution: 0.05
+      width: 10.0
+      height: 10.0
+      # Rectangle is the default research footprint. The 0.10 m padding is
+      # the planning margin and is not treated as physical contact.
+      footprint: "[[-0.2, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.2, 0.3]]"
+      footprint_padding: 0.10
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      resolution: 0.05
+      footprint: "[[-0.2, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.2, 0.3]]"
+      footprint_padding: 0.10

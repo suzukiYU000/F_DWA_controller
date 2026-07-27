@@ -20,6 +20,19 @@ A-DWA, J-DWA, and F-DWA are intentionally not registered yet. This prevents an
 incomplete controller from publishing motion commands under a research-method
 name.
 
+The package also provides `command_delay_transport`, a simulation-only command
+transport. It receives Nav2 commands, samples an independent truncated-normal
+delay for every command, preserves FIFO order, and applies at most one queued
+command per 33.333 Hz ROS-clock timer tick. The default distribution is bounded
+to 60--80 ms with mean 70 ms and standard deviation 3.333 ms.
+
+The transport publishes the command actually sent to the simulator on
+`/controller/applied_cmd_vel`. A queue overflow publishes
+`/dwa_experiment/transport_valid = false`, records queue and last-command data
+on `/diagnostics`, clears the queue, and publishes zero thereafter. Such a run
+is a transport-invalid run, not an algorithm failure, and must be excluded and
+retried by the experiment runner.
+
 ## Planned hierarchy
 
 ```text
