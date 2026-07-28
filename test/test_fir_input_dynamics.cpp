@@ -75,4 +75,20 @@ TEST(FirInputDynamics, RejectsUnrecoverableHistoryResponse)
   EXPECT_FALSE(interval.feasible);
 }
 
+TEST(FirInputDynamics, ProjectedStepRejectsConstraintViolationWithoutClamping)
+{
+  const AxisState state{0.99, 0.0};
+  const AxisLimits limits{0.0, 1.0, -1.0, 1.0, -2.0, 2.0};
+  const std::vector<double> coefficients{1.0};
+  const std::vector<double> history;
+
+  const ProjectedFirStep step =
+    apply_projected_fir_step(
+    state, limits, coefficients, history, 2.0, 0.03);
+
+  EXPECT_FALSE(step.feasible);
+  EXPECT_DOUBLE_EQ(step.applied_native_input, 2.0);
+  EXPECT_GT(step.state.velocity, limits.velocity_max);
+}
+
 }  // namespace f_dwa_controller

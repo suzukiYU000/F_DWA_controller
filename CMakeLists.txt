@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.8)
 project(f_dwa_controller)
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(dwb_core REQUIRED)
 find_package(dwb_msgs REQUIRED)
@@ -15,11 +17,28 @@ find_package(nav2_util REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2_ros REQUIRED)
 
-set(library_name f_dwa_controller)
+set(library_name f_dwa_controller_core)
 set(transport_library_name f_dwa_transport)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/CommandDispatch.msg"
+  DEPENDENCIES
+    builtin_interfaces
+    geometry_msgs
+    std_msgs
+)
+
+# rosidl owns the generated f_dwa_controller Python package. Install the design
+# helper as a submodule without creating a second same-named Python target.
+install(
+  FILES python/${PROJECT_NAME}/fir_filter_design.py
+  DESTINATION "${PYTHON_INSTALL_DIR}/${PROJECT_NAME}"
+)
 
 add_library(${library_name} SHARED
   src/certified_dwb_local_planner.cpp
@@ -35,6 +54,14 @@ add_library(${transport_library_name} SHARED
   src/command_delay_node.cpp
   src/command_delay_queue.cpp
 )
+
+rosidl_get_typesupport_target(
+  cpp_typesupport_target
+  ${PROJECT_NAME}
+  rosidl_typesupport_cpp
+)
+target_link_libraries(${library_name} "${cpp_typesupport_target}")
+target_link_libraries(${transport_library_name} "${cpp_typesupport_target}")
 
 target_compile_features(${library_name} PUBLIC cxx_std_17)
 target_compile_features(${transport_library_name} PUBLIC cxx_std_17)
@@ -62,6 +89,7 @@ ament_target_dependencies(${library_name}
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  std_srvs
   tf2_ros
 )
 
@@ -70,6 +98,7 @@ ament_target_dependencies(${transport_library_name}
   geometry_msgs
   rclcpp
   std_msgs
+  std_srvs
 )
 
 add_executable(command_delay_transport
@@ -107,6 +136,7 @@ install(
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   # ament_copyright treats every Git repository root as requiring a
   # license-only CONTRIBUTING.md. The repository already has an MIT LICENSE
@@ -120,6 +150,17 @@ if(BUILD_TESTING)
   if(TARGET test_command_delay_queue)
     target_link_libraries(test_command_delay_queue ${transport_library_name})
     ament_target_dependencies(test_command_delay_queue geometry_msgs rclcpp)
+  endif()
+
+  ament_add_gtest(test_command_delay_node
+    test/test_command_delay_node.cpp
+  )
+  if(TARGET test_command_delay_node)
+    target_link_libraries(test_command_delay_node ${transport_library_name})
+    ament_target_dependencies(test_command_delay_node
+      rclcpp
+      std_srvs
+    )
   endif()
 
   ament_add_gtest(test_native_input_dynamics
@@ -150,10 +191,6 @@ if(BUILD_TESTING)
   if(TARGET test_native_input_trajectory_generator)
     target_link_libraries(
       test_native_input_trajectory_generator ${library_name}
-    )
-    target_compile_definitions(test_native_input_trajectory_generator
-      PRIVATE
-        F_DWA_CONTROLLER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
     ament_target_dependencies(test_native_input_trajectory_generator
       dwb_msgs
@@ -219,12 +256,19 @@ if(BUILD_TESTING)
       nav2_costmap_2d
     )
   endif()
+
+  ament_add_pytest_test(
+    test_fir_filter_design
+    test/test_fir_filter_design.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python
+  )
 endif()
 
 ament_export_include_directories(include)
 ament_export_libraries(${library_name} ${transport_library_name})
 ament_export_targets(export_${library_name} HAS_LIBRARY_TARGET)
 ament_export_dependencies(
+  builtin_interfaces
   diagnostic_msgs
   dwb_core
   dwb_msgs
@@ -237,7 +281,9 @@ ament_export_dependencies(
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  rosidl_default_runtime
   std_msgs
+  std_srvs
   tf2_ros
 )
 

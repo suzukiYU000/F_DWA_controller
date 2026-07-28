@@ -116,4 +116,48 @@ TEST(CommandDelayQueue, NormalizesOnlyComponentsInsideStopThreshold)
   EXPECT_TRUE(CommandDelayQueue::is_zero(command, 0.01));
 }
 
+TEST(CommandDelayQueue, TrialResetClearsStateAndRestartsSeed)
+{
+  CommandDelayParameters parameters;
+  parameters.max_queue_depth = 2;
+  parameters.random_seed = 42;
+  CommandDelayQueue queue(parameters);
+  geometry_msgs::msg::Twist command;
+  const rclcpp::Time now(0, 0, RCL_ROS_TIME);
+
+  ASSERT_TRUE(queue.enqueue(command, now));
+  const DelayedCommand * first = queue.front();
+  ASSERT_NE(first, nullptr);
+  const double first_delay_ms = first->sampled_delay_ms;
+  EXPECT_EQ(first->sequence, 0u);
+
+  queue.reset(parameters.random_seed);
+  EXPECT_TRUE(queue.empty());
+  EXPECT_EQ(queue.next_sequence(), 0u);
+
+  ASSERT_TRUE(queue.enqueue(command, now));
+  const DelayedCommand * repeated = queue.front();
+  ASSERT_NE(repeated, nullptr);
+  EXPECT_EQ(repeated->sequence, 0u);
+  EXPECT_DOUBLE_EQ(repeated->sampled_delay_ms, first_delay_ms);
+}
+
+TEST(CommandDelayQueue, DefaultThresholdPreservesFirStartupIncrement)
+{
+  CommandDelayParameters parameters;
+  parameters.min_delay_ms = 0.0;
+  parameters.max_delay_ms = 0.0;
+  parameters.mean_delay_ms = 0.0;
+  parameters.delay_stddev_ms = 0.0;
+  CommandDelayQueue queue(parameters);
+
+  geometry_msgs::msg::Twist command;
+  command.linear.x = 0.001;
+  ASSERT_TRUE(queue.enqueue(command, rclcpp::Time(0, 0, RCL_ROS_TIME)));
+  const auto dispatched =
+    queue.pop_due(rclcpp::Time(0, 0, RCL_ROS_TIME));
+  ASSERT_TRUE(dispatched.has_value());
+  EXPECT_DOUBLE_EQ(dispatched->command.linear.x, command.linear.x);
+}
+
 }  // namespace f_dwa_controller

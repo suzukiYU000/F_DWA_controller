@@ -140,6 +140,15 @@ void CommandDelayQueue::clear()
   queue_.clear();
 }
 
+void CommandDelayQueue::reset(const uint64_t random_seed)
+{
+  queue_.clear();
+  parameters_.random_seed = random_seed;
+  random_engine_.seed(random_seed);
+  delay_distribution_.reset();
+  next_sequence_ = 0;
+}
+
 geometry_msgs::msg::Twist CommandDelayQueue::normalized_command(
   const geometry_msgs::msg::Twist & command,
   const double zero_threshold)

@@ -62,6 +62,17 @@ ProjectedFirStep project_held_fir_step(
   double time_step,
   int remaining_steps);
 
+// Applies an input that was already projected against the full-horizon
+// feasible interval. It never clamps the input; a constraint violation makes
+// the step infeasible so the model cannot silently diverge from the command.
+ProjectedFirStep apply_projected_fir_step(
+  const AxisState & state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history,
+  double projected_native_input,
+  double time_step);
+
 }  // namespace f_dwa_controller
 
 #endif  // F_DWA_CONTROLLER__FIR_INPUT_DYNAMICS_HPP_

@@ -203,4 +203,43 @@ ProjectedFirStep project_held_fir_step(
   return result;
 }
 
+ProjectedFirStep apply_projected_fir_step(
+  const AxisState & state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history,
+  const double projected_native_input,
+  const double time_step)
+{
+  ProjectedFirStep result;
+  if (!valid_fir_problem(
+      state, limits, coefficients, history, time_step, 1) ||
+    !std::isfinite(projected_native_input) ||
+    projected_native_input <
+    limits.native_input_min - kIntervalTolerance ||
+    projected_native_input >
+    limits.native_input_max + kIntervalTolerance)
+  {
+    return result;
+  }
+
+  result.applied_native_input = projected_native_input;
+  result.state.acceleration =
+    fir_acceleration(coefficients, history, projected_native_input);
+  result.state.velocity =
+    state.velocity + time_step * result.state.acceleration;
+  result.history = history;
+  push_fir_input(result.history, projected_native_input);
+  result.feasible =
+    std::isfinite(result.state.acceleration) &&
+    std::isfinite(result.state.velocity) &&
+    result.state.acceleration >=
+    limits.acceleration_min - kIntervalTolerance &&
+    result.state.acceleration <=
+    limits.acceleration_max + kIntervalTolerance &&
+    result.state.velocity >= limits.velocity_min - kIntervalTolerance &&
+    result.state.velocity <= limits.velocity_max + kIntervalTolerance;
+  return result;
+}
+
 }  // namespace f_dwa_controller

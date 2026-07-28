@@ -21,13 +21,22 @@
 #ifndef F_DWA_CONTROLLER__CERTIFIED_DWB_LOCAL_PLANNER_HPP_
 #define F_DWA_CONTROLLER__CERTIFIED_DWB_LOCAL_PLANNER_HPP_
 
+#include <chrono>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "dwb_core/dwb_local_planner.hpp"
+#include "f_dwa_controller/msg/command_dispatch.hpp"
 #include "f_dwa_controller/native_input_dynamics.hpp"
+#include "f_dwa_controller/native_input_trajectory_generator.hpp"
+#include "f_dwa_controller/planning_snapshot.hpp"
 #include "f_dwa_controller/trajectory_certifier.hpp"
+#include "geometry_msgs/msg/twist_stamped.hpp"
+#include "std_srvs/srv/trigger.hpp"
+#include "std_msgs/msg/bool.hpp"
 
 namespace f_dwa_controller
 {
@@ -43,6 +52,7 @@ public:
     std::string name,
     std::shared_ptr<tf2_ros::Buffer> tf,
     std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros) override;
+  void cleanup() override;
   geometry_msgs::msg::TwistStamped computeVelocityCommands(
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & velocity,
@@ -59,10 +69,30 @@ protected:
     std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & results) override;
 
 private:
+  struct IssuedCommand
+  {
+    rclcpp::Time issued_at;
+    nav_2d_msgs::msg::Twist2D command;
+  };
+
+  void command_dispatch_callback(
+    const f_dwa_controller::msg::CommandDispatch::SharedPtr message);
+  void transport_valid_callback(
+    const std_msgs::msg::Bool::SharedPtr message);
+  std::shared_ptr<const PlanningSnapshot> build_planning_snapshot(
+    const geometry_msgs::msg::PoseStamped & pose);
+  void record_issued_command(
+    const geometry_msgs::msg::TwistStamped & command,
+    const rclcpp::Time & issued_at);
+  void record_planning_duration(
+    std::chrono::steady_clock::time_point started_at);
+  void report_planning_metrics(const char * scope);
   bool build_stop_trajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory,
     std::vector<geometry_msgs::msg::Pose2D> & poses,
-    std::vector<nav_2d_msgs::msg::Twist2D> & velocities);
+    std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
+    std::vector<NativeInputTrajectoryGenerator::NativeCommandState> *
+    command_states);
   bool build_revalidated_backup(
     const geometry_msgs::msg::Pose2D & start_pose,
     dwb_msgs::msg::TrajectoryScore & backup_score);
@@ -71,9 +101,26 @@ private:
     CertificationFailure & failure) const;
   AxisLimits linear_limits() const;
   AxisLimits angular_limits() const;
+  void reset_trial_callback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
 
+  std::mutex controller_state_mutex_;
+  std::mutex command_state_mutex_;
+  rclcpp::Clock::SharedPtr clock_;
+  rclcpp::Subscription<f_dwa_controller::msg::CommandDispatch>::SharedPtr
+    command_dispatch_subscriber_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
+    transport_valid_subscriber_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_trial_service_;
   bool certification_enabled_{false};
   bool nominal_delay_preview_enabled_{true};
+  bool require_command_dispatch_state_{true};
+  bool command_dispatch_observed_{false};
+  bool command_transport_valid_{false};
+  bool command_ledger_valid_{false};
+  bool expected_dispatch_sequence_ready_{false};
+  uint64_t expected_dispatch_sequence_{0};
   double nominal_delay_preview_seconds_{0.07};
   double certification_control_period_{0.03};
   double terminal_stop_maximum_time_{8.0};
@@ -87,9 +134,23 @@ private:
   double maximum_linear_deceleration_{-1.2};
   double maximum_angular_acceleration_{1.57};
   double maximum_angular_deceleration_{-1.57};
+  nav_2d_msgs::msg::Twist2D dispatched_command_;
+  std::deque<IssuedCommand> pending_issued_commands_;
+  std::shared_ptr<const PlanningSnapshot> planning_snapshot_;
+  bool planning_metrics_enabled_{true};
+  int planning_metrics_report_interval_{1000};
+  double planning_deadline_seconds_{0.03};
+  std::vector<double> planning_durations_seconds_;
+  uint64_t planning_cycle_count_{0};
+  uint64_t planning_deadline_miss_count_{0};
+  double maximum_planning_duration_seconds_{0.0};
   std::vector<nav_2d_msgs::msg::Twist2D>
   current_candidate_stop_velocities_;
   std::vector<nav_2d_msgs::msg::Twist2D> retained_backup_commands_;
+  std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
+  current_candidate_stop_states_;
+  std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
+  retained_backup_states_;
 };
 
 }  // namespace f_dwa_controller

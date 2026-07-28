@@ -27,9 +27,11 @@
 
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
 #include "f_dwa_controller/command_delay_queue.hpp"
+#include "f_dwa_controller/msg/command_dispatch.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_srvs/srv/trigger.hpp"
 
 namespace f_dwa_controller
 {
@@ -42,6 +44,9 @@ public:
 private:
   void command_callback(const geometry_msgs::msg::Twist::SharedPtr message);
   void timer_callback();
+  void reset_trial_callback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   void invalidate_transport(const rclcpp::Time & detected_at);
   void publish_transport_valid(bool is_valid);
   void publish_diagnostic(
@@ -54,13 +59,18 @@ private:
   std::mutex mutex_;
   std::unique_ptr<CommandDelayQueue> delay_queue_;
   geometry_msgs::msg::Twist last_applied_command_;
+  uint64_t last_applied_sequence_{0};
+  bool has_applied_sequence_{false};
   bool transport_valid_{true};
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_subscriber_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr command_publisher_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr applied_command_publisher_;
+  rclcpp::Publisher<f_dwa_controller::msg::CommandDispatch>::SharedPtr
+    command_dispatch_publisher_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr transport_valid_publisher_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_trial_service_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
 };
 

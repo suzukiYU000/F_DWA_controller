@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,7 +40,8 @@ constexpr char kPluginName[] = "FollowPath";
 
 nav2_util::LifecycleNode::SharedPtr make_node(
   const std::string & name,
-  const bool load_f8_config = false)
+  const bool coefficients_generated = true,
+  const bool require_applied_command_state = false)
 {
   std::vector<rclcpp::Parameter> parameters{
     rclcpp::Parameter("FollowPath.min_vel_x", 0.0),
@@ -65,21 +67,16 @@ nav2_util::LifecycleNode::SharedPtr make_node(
     rclcpp::Parameter("FollowPath.native_input_control_period", 0.03),
     rclcpp::Parameter("FollowPath.max_linear_raw_input", 1.2),
     rclcpp::Parameter("FollowPath.max_angular_raw_input", 1.57),
-    rclcpp::Parameter("FollowPath.require_applied_command_state", false)};
-  if (!load_f8_config) {
-    parameters.emplace_back(
-      "FollowPath.fir_coefficients",
-      std::vector<double>{0.5, 0.3, 0.2});
-  }
+    rclcpp::Parameter(
+      "FollowPath.require_applied_command_state",
+      require_applied_command_state)};
+  parameters.emplace_back(
+    "FollowPath.fir_coefficients",
+    std::vector<double>{0.5, 0.3, 0.2});
+  parameters.emplace_back(
+    "FollowPath.fir_coefficients_generated", coefficients_generated);
   rclcpp::NodeOptions options;
   options.parameter_overrides(parameters);
-  if (load_f8_config) {
-    options.arguments(
-        {
-          "--ros-args", "--params-file",
-          std::string(F_DWA_CONTROLLER_SOURCE_DIR) + "/config/f_dwa.yaml"
-      });
-  }
   return std::make_shared<nav2_util::LifecycleNode>(name, "", options);
 }
 
@@ -124,6 +121,21 @@ void expect_finite_trajectory(
     ++candidate_count;
   }
   EXPECT_EQ(candidate_count, 121u);
+}
+
+PlanningSnapshot make_observable_zero_snapshot(
+  const rclcpp::Time & stamp)
+{
+  PlanningSnapshot snapshot;
+  snapshot.measurement_time = stamp;
+  snapshot.activation_time = stamp;
+  snapshot.current_state.activation_time = stamp;
+  snapshot.activation_state.activation_time = stamp;
+  snapshot.current_state.native_state_valid = true;
+  snapshot.activation_state.native_state_valid = true;
+  snapshot.dispatch_state_observed = true;
+  snapshot.valid = true;
+  return snapshot;
 }
 
 }  // namespace
@@ -174,14 +186,129 @@ TEST_F(NativeInputTrajectoryGeneratorTest, FirGeneratorRollsOut121Candidates)
   expect_finite_trajectory(generator);
 }
 
-TEST_F(NativeInputTrajectoryGeneratorTest, NamedF8ConfigRollsOutAndStops)
+TEST_F(NativeInputTrajectoryGeneratorTest, FirGeneratorRejectsUngeneratedCoefficients)
 {
-  const auto node = make_node("controller_server", true);
+  const auto node = make_node("ungenerated_fir_test", false);
   FirTrajectoryGenerator generator;
 
+  EXPECT_THROW(generator.initialize(node, kPluginName), std::invalid_argument);
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, TrialResetRetainsFirDesign)
+{
+  const auto node = make_node("fir_trial_reset_test", true, true);
+  FirTrajectoryGenerator generator;
   generator.initialize(node, kPluginName);
 
+  nav_2d_msgs::msg::Twist2D current_velocity;
+  generator.startNewIteration(current_velocity);
+  EXPECT_FALSE(generator.hasMoreTwists());
+
+  generator.reset_trial_state();
+
   expect_finite_trajectory(generator);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  PlanningSnapshotMakesFirCandidateIndependentOfOdomVelocity)
+{
+  const auto node = make_node("fir_snapshot_source_test", true, true);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  PlanningSnapshot snapshot =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(snapshot);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(snapshot));
+
+  nav_2d_msgs::msg::Twist2D first_odom;
+  first_odom.x = 0.1;
+  generator.startNewIteration(first_odom);
+  ASSERT_TRUE(generator.hasMoreTwists());
+  const nav_2d_msgs::msg::Twist2D first_command =
+    generator.nextTwist();
+
+  nav_2d_msgs::msg::Twist2D second_odom;
+  second_odom.x = 1.0;
+  second_odom.theta = 0.5;
+  generator.startNewIteration(second_odom);
+  ASSERT_TRUE(generator.hasMoreTwists());
+  const nav_2d_msgs::msg::Twist2D second_command =
+    generator.nextTwist();
+
+  EXPECT_DOUBLE_EQ(first_command.x, second_command.x);
+  EXPECT_DOUBLE_EQ(first_command.theta, second_command.theta);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  FirStateAdvancesFromSelectedCommandMetadata)
+{
+  const auto node = make_node("fir_native_ledger_test", true, true);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  PlanningSnapshot snapshot =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(snapshot);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(snapshot));
+  nav_2d_msgs::msg::Twist2D odom_velocity;
+  generator.startNewIteration(odom_velocity);
+  ASSERT_TRUE(generator.hasMoreTwists());
+  const nav_2d_msgs::msg::Twist2D command = generator.nextTwist();
+  const auto selected_state =
+    generator.active_candidate_command_state();
+  ASSERT_TRUE(selected_state.has_value());
+  generator.select_command_for_dispatch(selected_state);
+  generator.commit_selected_command(command, node->now());
+
+  f_dwa_controller::msg::CommandDispatch dispatch;
+  dispatch.header.stamp = node->now();
+  dispatch.command.linear.x = command.x;
+  dispatch.command.angular.z = command.theta;
+  dispatch.has_sequence = true;
+  generator.observe_command_dispatch(dispatch);
+
+  PlanningSnapshot after_dispatch =
+    make_observable_zero_snapshot(node->now());
+  after_dispatch.current_state.velocity = command;
+  after_dispatch.activation_state.velocity = command;
+  generator.enrich_planning_snapshot(after_dispatch);
+  EXPECT_TRUE(after_dispatch.valid);
+  EXPECT_TRUE(after_dispatch.current_state.native_state_valid);
+  EXPECT_NEAR(
+    after_dispatch.current_state.linear_acceleration,
+    selected_state->linear_state.acceleration, 1.0e-12);
+  EXPECT_EQ(
+    after_dispatch.current_state.linear_fir_history,
+    selected_state->linear_fir_history);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  FirStateRejectsUncorrelatedNonzeroDispatch)
+{
+  const auto node = make_node("fir_uncorrelated_dispatch_test", true, true);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  f_dwa_controller::msg::CommandDispatch dispatch;
+  dispatch.header.stamp = node->now();
+  dispatch.command.linear.x = 0.2;
+  dispatch.has_sequence = true;
+  generator.observe_command_dispatch(dispatch);
+
+  PlanningSnapshot snapshot =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(snapshot);
+  EXPECT_FALSE(snapshot.valid);
+  EXPECT_FALSE(snapshot.current_state.native_state_valid);
 }
 
 }  // namespace f_dwa_controller

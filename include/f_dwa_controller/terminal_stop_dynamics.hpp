@@ -32,6 +32,7 @@ struct StopSequence
 {
   std::vector<double> native_inputs;
   std::vector<AxisState> states;
+  std::vector<std::vector<double>> fir_histories;
   bool feasible{false};
   bool terminal_state_cleared{false};
 };

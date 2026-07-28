@@ -292,16 +292,17 @@ StopSequence generate_fir_stop_sequence(
       (requested_acceleration - free_acceleration) /
       coefficients.front();
     const ProjectedFirStep step =
-      project_held_fir_step(
+      apply_projected_fir_step(
       state, stop_limits, coefficients, current_history,
       std::clamp(
         requested_input, feasible_input.lower, feasible_input.upper),
-      time_step, lookahead_steps);
+      time_step);
     if (!step.feasible) {
       return sequence;
     }
     sequence.native_inputs.push_back(step.applied_native_input);
     sequence.states.push_back(step.state);
+    sequence.fir_histories.push_back(step.history);
     state = step.state;
     current_history = step.history;
     if (std::abs(state.velocity) <= stop_velocity_threshold) {

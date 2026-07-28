@@ -48,7 +48,7 @@ struct CommandDelayParameters
   double max_delay_ms{80.0};
   double mean_delay_ms{70.0};
   double delay_stddev_ms{3.333333333333333};
-  double zero_threshold{0.01};
+  double zero_threshold{0.0};
   std::size_t max_queue_depth{4};
   uint64_t random_seed{0};
 };
@@ -69,6 +69,7 @@ public:
   [[nodiscard]] uint64_t next_sequence() const;
 
   void clear();
+  void reset(uint64_t random_seed);
 
   [[nodiscard]] static geometry_msgs::msg::Twist normalized_command(
     const geometry_msgs::msg::Twist & command,

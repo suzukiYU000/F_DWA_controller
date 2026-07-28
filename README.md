@@ -11,28 +11,81 @@ integration remain common across the compared methods.
 
 The DWB-derived A-DWA, J-DWA, and F-DWA controller class names and native-input
 trajectory generators are registered. They preserve the 11 x 11 candidate
-budget, use the common 2.4 s DWB rollout, and project each native input into a
-remaining-horizon feasible interval. J-DWA reconstructs its acceleration state
-from `/controller/applied_cmd_vel`. F-DWA reconstructs its FIR input history
-from the same stream; a transport-induced hold is retained as disturbance
-history while future selected raw inputs remain bounded.
+budget and use the common 2.4 s DWB rollout. Each cycle builds one immutable
+planning snapshot from the latest TF pose, the last robot-facing software
+dispatch, locally issued commands, and the configured 70 ms nominal delay.
+Odometry velocity is not a nominal-state input.
 
-The common controller applies the 70 ms nominal activation preview before both
-DWB cost evaluation and safety certification. Certification connects a
-dynamics-feasible stop sequence after the first executable sample, checks the
-complete padded footprint interior on the local costmap, rejects unknown or
-off-costmap poses, and interpolates the sweep at no more than half the 0.05 m
-costmap resolution. The selected stop suffix is retained. If no ordinary
-candidate is legal on a later cycle, the remaining suffix is rebuilt from the
-current preview pose and revalidated against the current costmap before use.
+`/controller/command_dispatch` is an
+`f_dwa_controller/msg/CommandDispatch` event published only when a command is
+handed to the robot-facing publisher. Its stamp is observable software dispatch
+time, not an estimate of the physical motor-actuation instant. Its sequence ID
+detects dropped, reordered, or ambiguous duplicate-velocity events. The
+controller correlates each event with its FIFO command ledger. A/J state follows
+that ledger; F-DWA carries the selected raw input and FIR state as metadata.
+Inverse FIR reconstruction from differentiated velocity is not used by the
+certified path. An unmatched nonzero dispatch invalidates the certificate
+instead of inventing state.
 
-The 0.01 velocity capture tube is a deliberate hybrid transition: the simulator
-transport converts components inside it to exact zero and the associated
-controller state is cleared. Recovery candidates that start inside the
-certificate margin and move outward remain pending and are disabled by default.
-F-DWA defaults to the exact named ROS 1 F-8 low-pass coefficient vector.
-Alternative filter designs are recorded as commented, atomic
-coefficient-replacement patterns in `config/f_dwa.yaml`.
+The common controller replays already issued commands to the next nominal
+activation time and certifies that shared delay trajectory once. Candidate
+certification then includes the candidate held over the configured stop-command
+delay, its dynamically feasible stop sequence, and retained-backup
+revalidation. It checks the complete padded footprint interior, rejects unknown
+or off-costmap poses, and interpolates swept motion at no more than half the
+0.05 m costmap resolution.
+
+Command quantization and stop capture are separate. Simulation defaults to
+`command_zero_threshold: 0.0`, while `stop_capture_velocity: 0.01` is used only
+to finish a planned stop and clear its native state. This preserves F-8's small
+startup increments. Recovery candidates that start inside the certificate
+margin and move outward remain pending and are disabled by default.
+F-DWA defaults to the named ROS 1 F-8 low-pass design. Its coefficients are
+generated deterministically by Python before Nav2 starts, so no source YAML
+contains a coefficient vector. Alternative design names remain as commented
+patterns in `config/f_dwa.yaml`.
+
+The design registry in `python/f_dwa_controller/fir_filter_design.py` owns the
+tap count, design sample frequency, cutoff or attenuation bands, window, and
+minimum-phase conversion. F-8 retains its historical 20 Hz design frequency
+even though this controller executes at 33.333 Hz. A design using the controller
+frequency must receive a new name for experiment traceability.
+
+Every F-DWA research-launch startup regenerates the selected profile. No
+coefficient cache or previous temporary parameter file is reused. Coefficients
+remain frozen for the complete run; applying a changed design requires a fresh
+launch rather than an in-run lifecycle reactivation.
+
+## Continuous simulation batches
+
+A parameter-search batch may keep `controller_server` and the command-delay
+transport alive. FIR coefficients are generated and set once when the batch
+launch starts. At each run boundary, first cancel and await completion of the
+old FollowPath action, then pause and reset the simulated robot. Call these
+services in order:
+
+```text
+/command_delay_transport/reset_trial_state
+/controller_server/FollowPath/reset_trial_state
+```
+
+Both use `std_srvs/srv/Trigger`. The controller reset clears the current
+candidates, retained stop backup, critic state, global path, and A/J/F native
+state, while retaining the configured FIR coefficients. The transport reset
+clears its FIFO, last applied command and sequence, restores transport validity,
+reseeds the delay generator from its current `random_seed` parameter, and
+immediately publishes a zero applied command. Submit the next saved Path only
+after both calls succeed.
+
+The order is intentional. The Controller reset is last and establishes the
+A/J/F applied state as a known zero, avoiding a race between the transport's
+zero publication and the first control cycle of the next FollowPath action.
+Calling the Controller reset while the old action or robot is still moving
+violates this trial-boundary precondition.
+
+Set `/command_delay_transport.random_seed` before its reset when a run needs a
+different seed. Reusing the same seed intentionally reproduces the same jitter
+sequence for fair method or parameter comparisons.
 
 The package also provides `command_delay_transport`, a simulation-only command
 transport. It receives Nav2 commands, samples an independent truncated-normal
@@ -41,11 +94,22 @@ command per 33.333 Hz ROS-clock timer tick. The default distribution is bounded
 to 60--80 ms with mean 70 ms and standard deviation 3.333 ms.
 
 The transport publishes the command actually sent to the simulator on
-`/controller/applied_cmd_vel`. A queue overflow publishes
+`/controller/applied_cmd_vel` and publishes a stamped change event on
+`/controller/command_dispatch`. A queue overflow publishes
 `/dwa_experiment/transport_valid = false`, records queue and last-command data
 on `/diagnostics`, clears the queue, and publishes zero thereafter. Such a run
 is a transport-invalid run, not an algorithm failure, and must be excluded and
 retried by the experiment runner.
+
+FIR axes are rolled out 11 times for translation and 11 times for rotation,
+then combined into the 121 pose candidates. A full-horizon projected FIR input
+is applied without per-step re-projection; numerical constraint violations
+invalidate the candidate rather than clipping its velocity. Critics run before
+the terminal-stop certificate, and only candidates capable of improving the
+best certified score receive that expensive certificate. Every configured
+number of cycles, `planning_timing` logs p50/p95/p99/maximum and the cumulative
+30 ms deadline-miss count using a steady clock. Trial reset emits the final
+run summary before clearing these metrics.
 
 ## Planned hierarchy
 

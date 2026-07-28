@@ -22,15 +22,18 @@
 #define F_DWA_CONTROLLER__NATIVE_INPUT_TRAJECTORY_GENERATOR_HPP_
 
 #include <cstddef>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "dwb_plugins/standard_traj_generator.hpp"
 #include "f_dwa_controller/fir_input_dynamics.hpp"
+#include "f_dwa_controller/msg/command_dispatch.hpp"
 #include "f_dwa_controller/native_input_dynamics.hpp"
-#include "geometry_msgs/msg/twist.hpp"
+#include "f_dwa_controller/planning_snapshot.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 namespace f_dwa_controller
@@ -47,6 +50,16 @@ class NativeInputTrajectoryGenerator
   : public dwb_plugins::StandardTrajectoryGenerator
 {
 public:
+  struct NativeCommandState
+  {
+    nav_2d_msgs::msg::Twist2D command_velocity;
+    AxisState linear_state;
+    AxisState angular_state;
+    std::vector<double> linear_fir_history;
+    std::vector<double> angular_fir_history;
+    bool valid{false};
+  };
+
   explicit NativeInputTrajectoryGenerator(NativeInputOrder input_order);
   ~NativeInputTrajectoryGenerator() override = default;
 
@@ -54,6 +67,21 @@ public:
     const nav2_util::LifecycleNode::SharedPtr & node,
     const std::string & plugin_name) override;
   void reset() override;
+  // Trial reset is called only after the simulator and delayed transport have
+  // been stopped and reset, so the applied state is known to be exactly zero.
+  void reset_trial_state();
+  void enrich_planning_snapshot(PlanningSnapshot & snapshot) const;
+  void set_planning_snapshot(
+    std::shared_ptr<const PlanningSnapshot> snapshot);
+  void observe_command_dispatch(
+    const f_dwa_controller::msg::CommandDispatch & dispatch);
+  [[nodiscard]] std::optional<NativeCommandState>
+  active_candidate_command_state() const;
+  void select_command_for_dispatch(
+    const std::optional<NativeCommandState> & command_state);
+  void commit_selected_command(
+    const nav_2d_msgs::msg::Twist2D & command,
+    const rclcpp::Time & issued_at);
   void startNewIteration(
     const nav_2d_msgs::msg::Twist2D & current_velocity) override;
   bool hasMoreTwists() override;
@@ -67,9 +95,18 @@ public:
     int maximum_stop_steps,
     double stop_velocity_threshold,
     std::vector<geometry_msgs::msg::Pose2D> & poses,
-    std::vector<nav_2d_msgs::msg::Twist2D> & velocities);
+    std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
+    std::vector<NativeCommandState> * command_states = nullptr);
 
 protected:
+  struct AxisRollout
+  {
+    std::vector<AxisState> states;
+    std::vector<std::vector<double>> fir_histories;
+    double native_input{0.0};
+    bool valid{false};
+  };
+
   struct Candidate
   {
     nav_2d_msgs::msg::Twist2D command_velocity;
@@ -81,6 +118,9 @@ protected:
     double initial_angular_acceleration{0.0};
     std::vector<double> initial_linear_fir_history;
     std::vector<double> initial_angular_fir_history;
+    NativeCommandState first_command_state;
+    std::shared_ptr<const AxisRollout> linear_rollout;
+    std::shared_ptr<const AxisRollout> angular_rollout;
   };
 
   ProjectedAxisStep project_axis(
@@ -95,8 +135,12 @@ protected:
     double time_step) const;
 
 private:
-  void applied_command_callback(
-    const geometry_msgs::msg::Twist::SharedPtr message);
+  struct PendingNativeCommand
+  {
+    rclcpp::Time issued_at;
+    NativeCommandState state;
+  };
+
   AxisLimits linear_limits() const;
   AxisLimits angular_limits() const;
   void validate_parameters() const;
@@ -108,9 +152,11 @@ private:
   double maximum_angular_jerk_{1.57};
   double maximum_linear_raw_input_{1.2};
   double maximum_angular_raw_input_{1.57};
-  double native_state_reset_velocity_threshold_{0.01};
+  double stop_capture_velocity_{0.01};
+  double stop_command_delay_seconds_{0.07};
   int linear_samples_{11};
   int angular_samples_{11};
+  bool fir_coefficients_generated_{false};
   bool require_applied_command_state_{false};
 
   std::vector<Candidate> candidates_;
@@ -118,17 +164,15 @@ private:
   Candidate active_candidate_;
   bool has_active_candidate_{false};
 
-  std::mutex applied_command_mutex_;
-  geometry_msgs::msg::Twist latest_applied_command_;
-  double applied_linear_acceleration_{0.0};
-  double applied_angular_acceleration_{0.0};
+  mutable std::mutex applied_command_mutex_;
+  nav_2d_msgs::msg::Twist2D latest_applied_command_;
+  rclcpp::Time applied_dispatch_time_;
+  NativeCommandState applied_native_state_;
   std::vector<double> fir_coefficients_;
-  std::vector<double> applied_linear_fir_history_;
-  std::vector<double> applied_angular_fir_history_;
   bool applied_command_state_ready_{false};
-
-  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr
-    applied_command_subscriber_;
+  std::deque<PendingNativeCommand> pending_native_commands_;
+  std::optional<NativeCommandState> selected_command_state_;
+  std::shared_ptr<const PlanningSnapshot> planning_snapshot_;
 };
 
 class AccelerationTrajectoryGenerator

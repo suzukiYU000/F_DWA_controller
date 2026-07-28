@@ -33,9 +33,18 @@ controller_server:
       include_last_point: true
       enable_nominal_delay_preview: true
       nominal_delay_preview_seconds: 0.07
+      # This is a robot-observable software dispatch event. It does not claim
+      # knowledge of the internal motor actuation instant.
+      command_dispatch_topic: "/controller/command_dispatch"
+      transport_valid_topic: "/dwa_experiment/transport_valid"
+      require_command_dispatch_state: true
       certification_control_period: 0.03
       terminal_stop_maximum_time: 8.0
       terminal_stop_velocity_threshold: 0.01
+      stop_capture_velocity: 0.01
+      # Certification rounds this upward to complete 30 ms command ticks
+      # (70 ms -> 3 ticks) for every DWB-derived method.
+      terminal_stop_command_delay_seconds: 0.07
       # This is an additional certificate reserve outside the common 0.10 m
       # planning footprint padding. Recovery from reserve intrusion is off by
       # default and will be implemented as a separate switchable policy.
@@ -43,8 +52,16 @@ controller_server:
       # At 0.05 m costmap resolution, checking at half-cell swept distance
       # prevents translation plus rectangle-corner rotation from skipping a cell.
       maximum_swept_distance: 0.025
+      # Batch search keeps controller_server alive. Call this service once at
+      # each run boundary; configured FIR coefficients are retained.
+      trial_reset_service_name: "~/FollowPath/reset_trial_state"
       transform_tolerance: 0.2
-      short_circuit_trajectory_evaluation: false
+      # All configured critic scores are non-negative. This only skips critic
+      # work for candidates that cannot beat the best certified candidate.
+      short_circuit_trajectory_evaluation: true
+      planning_metrics_enabled: true
+      planning_metrics_report_interval: 1000
+      planning_deadline_seconds: 0.03
       stateful: true
       critics:
         - RotateToGoal
