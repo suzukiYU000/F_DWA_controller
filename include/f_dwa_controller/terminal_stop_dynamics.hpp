@@ -37,6 +37,19 @@ struct StopSequence
   bool terminal_state_cleared{false};
 };
 
+struct FirStopCoefficientResponse
+{
+  std::vector<double> coefficients;
+  std::vector<double> held_unit_accelerations;
+  std::vector<double> held_unit_velocities;
+  double time_step{0.0};
+  bool valid{false};
+};
+
+FirStopCoefficientResponse prepare_fir_stop_coefficient_response(
+  const std::vector<double> & coefficients,
+  double time_step);
+
 StopSequence generate_acceleration_stop_sequence(
   const AxisState & initial_state,
   const AxisLimits & limits,
@@ -58,7 +71,9 @@ StopSequence generate_fir_stop_sequence(
   const std::vector<double> & history,
   double time_step,
   int maximum_steps,
-  double stop_velocity_threshold);
+  double stop_velocity_threshold,
+  bool record_fir_histories = true,
+  const FirStopCoefficientResponse * coefficient_response = nullptr);
 
 }  // namespace f_dwa_controller
 

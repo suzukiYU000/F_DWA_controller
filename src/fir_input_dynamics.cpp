@@ -129,16 +129,31 @@ FeasibleInterval held_fir_input_interval(
   const double time_step,
   const int remaining_steps)
 {
-  FeasibleInterval interval;
-  interval.lower = limits.native_input_min;
-  interval.upper = limits.native_input_max;
+  return prepare_held_fir_affine_response(
+    state, limits, coefficients, history, time_step,
+    remaining_steps).input_interval;
+}
+
+HeldFirAffineResponse prepare_held_fir_affine_response(
+  const AxisState & state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history,
+  const double time_step,
+  const int remaining_steps)
+{
+  HeldFirAffineResponse response;
+  response.input_interval.lower = limits.native_input_min;
+  response.input_interval.upper = limits.native_input_max;
   if (!valid_fir_problem(
       state, limits, coefficients, history, time_step,
       remaining_steps))
   {
-    return interval;
+    return response;
   }
 
+  response.free_states.reserve(static_cast<std::size_t>(remaining_steps));
+  response.unit_states.reserve(static_cast<std::size_t>(remaining_steps));
   std::vector<double> free_history = history;
   std::vector<double> unit_history(history.size(), 0.0);
   double free_velocity = state.velocity;
@@ -152,22 +167,76 @@ FeasibleInterval held_fir_input_interval(
       fir_acceleration(coefficients, unit_history, 1.0);
     free_velocity += time_step * free_acceleration;
     unit_velocity += time_step * unit_acceleration;
+    response.free_states.push_back(
+      AxisState{free_velocity, free_acceleration});
+    response.unit_states.push_back(
+      AxisState{unit_velocity, unit_acceleration});
     if (!intersect_affine_bounds(
         free_acceleration, unit_acceleration,
         limits.acceleration_min, limits.acceleration_max,
-        interval.lower, interval.upper) ||
+        response.input_interval.lower, response.input_interval.upper) ||
       !intersect_affine_bounds(
         free_velocity, unit_velocity,
         limits.velocity_min, limits.velocity_max,
-        interval.lower, interval.upper))
+        response.input_interval.lower, response.input_interval.upper))
     {
-      return interval;
+      return response;
     }
     push_fir_input(free_history, 0.0);
     push_fir_input(unit_history, 1.0);
   }
-  interval.feasible = true;
-  return interval;
+  response.input_interval.feasible = true;
+  return response;
+}
+
+bool sample_held_fir_affine_response(
+  const HeldFirAffineResponse & response,
+  const AxisLimits & limits,
+  const double held_native_input,
+  std::vector<AxisState> & states)
+{
+  states.clear();
+  if (!response.input_interval.feasible ||
+    response.free_states.size() != response.unit_states.size() ||
+    !std::isfinite(held_native_input) ||
+    held_native_input <
+    response.input_interval.lower - kIntervalTolerance ||
+    held_native_input >
+    response.input_interval.upper + kIntervalTolerance ||
+    held_native_input < limits.native_input_min - kIntervalTolerance ||
+    held_native_input > limits.native_input_max + kIntervalTolerance)
+  {
+    return false;
+  }
+
+  states.reserve(response.free_states.size());
+  for (std::size_t step_index = 0;
+    step_index < response.free_states.size(); ++step_index)
+  {
+    const AxisState & free_state = response.free_states[step_index];
+    const AxisState & unit_state = response.unit_states[step_index];
+    AxisState sampled_state;
+    sampled_state.acceleration =
+      free_state.acceleration +
+      held_native_input * unit_state.acceleration;
+    sampled_state.velocity =
+      free_state.velocity +
+      held_native_input * unit_state.velocity;
+    if (!std::isfinite(sampled_state.acceleration) ||
+      !std::isfinite(sampled_state.velocity) ||
+      sampled_state.acceleration <
+      limits.acceleration_min - kIntervalTolerance ||
+      sampled_state.acceleration >
+      limits.acceleration_max + kIntervalTolerance ||
+      sampled_state.velocity < limits.velocity_min - kIntervalTolerance ||
+      sampled_state.velocity > limits.velocity_max + kIntervalTolerance)
+    {
+      states.clear();
+      return false;
+    }
+    states.push_back(sampled_state);
+  }
+  return true;
 }
 
 ProjectedFirStep project_held_fir_step(
@@ -240,6 +309,48 @@ ProjectedFirStep apply_projected_fir_step(
     result.state.velocity >= limits.velocity_min - kIntervalTolerance &&
     result.state.velocity <= limits.velocity_max + kIntervalTolerance;
   return result;
+}
+
+bool apply_projected_fir_step_in_place(
+  AxisState & state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  std::vector<double> & history,
+  const double projected_native_input,
+  const double time_step)
+{
+  if (!valid_fir_problem(
+      state, limits, coefficients, history, time_step, 1) ||
+    !std::isfinite(projected_native_input) ||
+    projected_native_input <
+    limits.native_input_min - kIntervalTolerance ||
+    projected_native_input >
+    limits.native_input_max + kIntervalTolerance)
+  {
+    return false;
+  }
+
+  AxisState next_state;
+  next_state.acceleration =
+    fir_acceleration(coefficients, history, projected_native_input);
+  next_state.velocity =
+    state.velocity + time_step * next_state.acceleration;
+  const bool feasible =
+    std::isfinite(next_state.acceleration) &&
+    std::isfinite(next_state.velocity) &&
+    next_state.acceleration >=
+    limits.acceleration_min - kIntervalTolerance &&
+    next_state.acceleration <=
+    limits.acceleration_max + kIntervalTolerance &&
+    next_state.velocity >= limits.velocity_min - kIntervalTolerance &&
+    next_state.velocity <= limits.velocity_max + kIntervalTolerance;
+  if (!feasible) {
+    return false;
+  }
+
+  state = next_state;
+  push_fir_input(history, projected_native_input);
+  return true;
 }
 
 }  // namespace f_dwa_controller

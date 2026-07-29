@@ -130,6 +130,11 @@ const DelayedCommand * CommandDelayQueue::front() const
   return queue_.empty() ? nullptr : &queue_.front();
 }
 
+std::vector<DelayedCommand> CommandDelayQueue::snapshot() const
+{
+  return std::vector<DelayedCommand>(queue_.cbegin(), queue_.cend());
+}
+
 uint64_t CommandDelayQueue::next_sequence() const
 {
   return next_sequence_;

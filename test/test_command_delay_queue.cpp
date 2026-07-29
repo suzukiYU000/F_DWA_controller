@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <vector>
 
 #include "f_dwa_controller/command_delay_queue.hpp"
 #include "gtest/gtest.h"
@@ -74,6 +75,30 @@ TEST(CommandDelayQueue, RejectsOverflowWithoutDroppingQueuedCommands)
   EXPECT_EQ(queue.next_sequence(), 2u);
 }
 
+TEST(CommandDelayQueue, DefaultDepthBoundsOneDelayedTimerSlot)
+{
+  CommandDelayParameters parameters;
+  parameters.min_delay_ms = 0.0;
+  parameters.max_delay_ms = 0.0;
+  parameters.mean_delay_ms = 0.0;
+  parameters.delay_stddev_ms = 0.0;
+  CommandDelayQueue queue(parameters);
+  geometry_msgs::msg::Twist command;
+  const rclcpp::Time now(0, 0, RCL_ROS_TIME);
+
+  // Three entries cover ceil(80 ms / 30 ms). A fourth permits normal
+  // arrival-before-timer ordering, and a fifth bounds one delayed timer.
+  for (std::size_t index = 0; index < 5u; ++index) {
+    EXPECT_TRUE(queue.enqueue(command, now));
+  }
+  EXPECT_EQ(queue.size(), 5u);
+
+  // A second missed service slot is not hidden by unbounded buffering.
+  EXPECT_FALSE(queue.enqueue(command, now));
+  EXPECT_EQ(queue.size(), 5u);
+  EXPECT_EQ(queue.next_sequence(), 5u);
+}
+
 TEST(CommandDelayQueue, TruncatedNormalStaysInsideConfiguredBounds)
 {
   CommandDelayParameters parameters;
@@ -125,21 +150,30 @@ TEST(CommandDelayQueue, TrialResetClearsStateAndRestartsSeed)
   geometry_msgs::msg::Twist command;
   const rclcpp::Time now(0, 0, RCL_ROS_TIME);
 
-  ASSERT_TRUE(queue.enqueue(command, now));
-  const DelayedCommand * first = queue.front();
-  ASSERT_NE(first, nullptr);
-  const double first_delay_ms = first->sampled_delay_ms;
-  EXPECT_EQ(first->sequence, 0u);
+  std::vector<double> first_run_delays;
+  for (std::size_t index = 0; index < 8u; ++index) {
+    ASSERT_TRUE(queue.enqueue(command, now));
+    const DelayedCommand * queued = queue.front();
+    ASSERT_NE(queued, nullptr);
+    EXPECT_EQ(queued->sequence, index);
+    first_run_delays.push_back(queued->sampled_delay_ms);
+    queue.clear();
+  }
 
   queue.reset(parameters.random_seed);
   EXPECT_TRUE(queue.empty());
   EXPECT_EQ(queue.next_sequence(), 0u);
 
-  ASSERT_TRUE(queue.enqueue(command, now));
-  const DelayedCommand * repeated = queue.front();
-  ASSERT_NE(repeated, nullptr);
-  EXPECT_EQ(repeated->sequence, 0u);
-  EXPECT_DOUBLE_EQ(repeated->sampled_delay_ms, first_delay_ms);
+  std::vector<double> repeated_run_delays;
+  for (std::size_t index = 0; index < first_run_delays.size(); ++index) {
+    ASSERT_TRUE(queue.enqueue(command, now));
+    const DelayedCommand * queued = queue.front();
+    ASSERT_NE(queued, nullptr);
+    EXPECT_EQ(queued->sequence, index);
+    repeated_run_delays.push_back(queued->sampled_delay_ms);
+    queue.clear();
+  }
+  EXPECT_EQ(repeated_run_delays, first_run_delays);
 }
 
 TEST(CommandDelayQueue, DefaultThresholdPreservesFirStartupIncrement)

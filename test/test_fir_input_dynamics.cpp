@@ -20,6 +20,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <random>
 #include <vector>
 
 #include "f_dwa_controller/fir_input_dynamics.hpp"
@@ -89,6 +93,164 @@ TEST(FirInputDynamics, ProjectedStepRejectsConstraintViolationWithoutClamping)
   EXPECT_FALSE(step.feasible);
   EXPECT_DOUBLE_EQ(step.applied_native_input, 2.0);
   EXPECT_GT(step.state.velocity, limits.velocity_max);
+}
+
+TEST(FirInputDynamics, InPlaceStepMatchesValueReturningStep)
+{
+  const AxisState state{0.2, 0.1};
+  const AxisLimits limits{-1.2, 1.2, -1.2, 1.2, -1.2, 1.2};
+  const std::vector<double> coefficients{0.5, 0.3, 0.2};
+  const std::vector<double> history{0.4, -0.2};
+  const ProjectedFirStep expected =
+    apply_projected_fir_step(
+    state, limits, coefficients, history, 0.6, 0.03);
+  AxisState in_place_state = state;
+  std::vector<double> in_place_history = history;
+
+  const bool feasible = apply_projected_fir_step_in_place(
+    in_place_state, limits, coefficients, in_place_history, 0.6, 0.03);
+
+  ASSERT_EQ(feasible, expected.feasible);
+  EXPECT_DOUBLE_EQ(in_place_state.velocity, expected.state.velocity);
+  EXPECT_DOUBLE_EQ(in_place_state.acceleration, expected.state.acceleration);
+  EXPECT_EQ(in_place_history, expected.history);
+}
+
+TEST(FirInputDynamics, AffineResponseMatchesBoundaryHeldInputRollouts)
+{
+  constexpr int kStepCount = 80;
+  constexpr double kTimeStep = 0.03;
+  const AxisState initial_state{0.17, -0.08};
+  const AxisLimits limits{-1.2, 1.2, -1.2, 1.2, -1.2, 1.2};
+  const std::vector<double> coefficients{0.5, 0.3, 0.2};
+  const std::vector<double> initial_history{0.4, -0.2};
+  const HeldFirAffineResponse response =
+    prepare_held_fir_affine_response(
+    initial_state, limits, coefficients, initial_history,
+    kTimeStep, kStepCount);
+  ASSERT_TRUE(response.input_interval.feasible);
+  const FeasibleInterval delegated_interval =
+    held_fir_input_interval(
+    initial_state, limits, coefficients, initial_history,
+    kTimeStep, kStepCount);
+  EXPECT_DOUBLE_EQ(
+    delegated_interval.lower, response.input_interval.lower);
+  EXPECT_DOUBLE_EQ(
+    delegated_interval.upper, response.input_interval.upper);
+  EXPECT_EQ(
+    delegated_interval.feasible, response.input_interval.feasible);
+
+  const std::vector<double> inputs{
+    response.input_interval.lower,
+    0.5 * (
+      response.input_interval.lower + response.input_interval.upper),
+    response.input_interval.upper};
+  for (const double input : inputs) {
+    std::vector<AxisState> affine_states;
+    ASSERT_TRUE(
+      sample_held_fir_affine_response(
+        response, limits, input, affine_states));
+    ASSERT_EQ(affine_states.size(), static_cast<std::size_t>(kStepCount));
+
+    AxisState direct_state = initial_state;
+    std::vector<double> direct_history = initial_history;
+    for (int step_index = 0;
+      step_index < kStepCount; ++step_index)
+    {
+      ASSERT_TRUE(
+        apply_projected_fir_step_in_place(
+          direct_state, limits, coefficients, direct_history,
+          input, kTimeStep));
+      const AxisState & affine_state =
+        affine_states[static_cast<std::size_t>(step_index)];
+      EXPECT_NEAR(affine_state.velocity, direct_state.velocity, 1.0e-12);
+      EXPECT_NEAR(
+        affine_state.acceleration, direct_state.acceleration, 1.0e-12);
+    }
+  }
+}
+
+TEST(FirInputDynamics, AffineResponseMatchesRandomFortySixTapRollouts)
+{
+  constexpr int kStepCount = 80;
+  constexpr int kTapCount = 46;
+  constexpr double kTimeStep = 0.03;
+  constexpr int kTrialCount = 100;
+  std::mt19937 random_engine(43019u);
+  std::uniform_real_distribution<double> coefficient_distribution(
+    0.001, 1.0);
+  std::uniform_real_distribution<double> state_distribution(-0.4, 0.4);
+  const AxisLimits limits{-2.0, 2.0, -1.5, 1.5, -1.2, 1.2};
+  int feasible_trial_count = 0;
+
+  for (int trial_index = 0;
+    trial_index < kTrialCount; ++trial_index)
+  {
+    std::vector<double> coefficients(
+      static_cast<std::size_t>(kTapCount));
+    std::generate(
+      coefficients.begin(), coefficients.end(),
+      [&]() {return coefficient_distribution(random_engine);});
+    const double coefficient_sum =
+      std::accumulate(coefficients.begin(), coefficients.end(), 0.0);
+    for (double & coefficient : coefficients) {
+      coefficient /= coefficient_sum;
+    }
+    std::vector<double> initial_history(
+      static_cast<std::size_t>(kTapCount - 1));
+    std::generate(
+      initial_history.begin(), initial_history.end(),
+      [&]() {return state_distribution(random_engine);});
+    const AxisState initial_state{
+      state_distribution(random_engine),
+      state_distribution(random_engine)};
+    const HeldFirAffineResponse response =
+      prepare_held_fir_affine_response(
+      initial_state, limits, coefficients, initial_history,
+      kTimeStep, kStepCount);
+    if (!response.input_interval.feasible) {
+      continue;
+    }
+    ++feasible_trial_count;
+
+    std::vector<double> inputs;
+    inputs.reserve(11u);
+    for (int input_index = 0; input_index < 11; ++input_index) {
+      const double ratio =
+        static_cast<double>(input_index) / 10.0;
+      inputs.push_back(
+        response.input_interval.lower +
+        (response.input_interval.upper - response.input_interval.lower) *
+        ratio);
+    }
+    ASSERT_EQ(inputs.size(), 11u);
+    for (const double input : inputs) {
+      std::vector<AxisState> affine_states;
+      ASSERT_TRUE(
+        sample_held_fir_affine_response(
+          response, limits, input, affine_states));
+      ASSERT_EQ(
+        affine_states.size(), static_cast<std::size_t>(kStepCount));
+
+      AxisState direct_state = initial_state;
+      std::vector<double> direct_history = initial_history;
+      for (int step_index = 0;
+        step_index < kStepCount; ++step_index)
+      {
+        ASSERT_TRUE(
+          apply_projected_fir_step_in_place(
+            direct_state, limits, coefficients, direct_history,
+            input, kTimeStep));
+        const AxisState & affine_state =
+          affine_states[static_cast<std::size_t>(step_index)];
+        EXPECT_NEAR(
+          affine_state.velocity, direct_state.velocity, 1.0e-12);
+        EXPECT_NEAR(
+          affine_state.acceleration, direct_state.acceleration, 1.0e-12);
+      }
+    }
+  }
+  EXPECT_GE(feasible_trial_count, 90);
 }
 
 }  // namespace f_dwa_controller

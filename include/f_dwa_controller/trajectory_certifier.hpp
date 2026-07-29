@@ -47,11 +47,35 @@ struct CertificationResult
   std::size_t checked_pose_count{0};
 };
 
+struct CertificationWorkspace
+{
+  std::vector<nav2_costmap_2d::MapLocation> map_footprint;
+  std::vector<nav2_costmap_2d::MapLocation> footprint_cells;
+  std::vector<std::size_t> hazard_prefix_sum;
+  unsigned int hazard_size_x{0};
+  unsigned int hazard_size_y{0};
+  double hazard_origin_x{0.0};
+  double hazard_origin_y{0.0};
+  double hazard_resolution{0.0};
+  bool hazard_prefix_valid{false};
+};
+
+// The prefix is valid only while the caller keeps the costmap snapshot
+// unchanged. The planner prepares it under DWB's costmap mutex once per
+// control cycle and invalidates it before the next snapshot.
+bool prepare_certification_broadphase(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  CertificationWorkspace & workspace);
+
+void invalidate_certification_broadphase(
+  CertificationWorkspace & workspace);
+
 CertificationResult certify_pose_sequence(
   nav2_costmap_2d::Costmap2D & costmap,
   const std::vector<geometry_msgs::msg::Point> & footprint,
   const std::vector<geometry_msgs::msg::Pose2D> & poses,
-  double maximum_swept_distance);
+  double maximum_swept_distance,
+  CertificationWorkspace * workspace = nullptr);
 
 const char * certification_failure_name(CertificationFailure failure);
 

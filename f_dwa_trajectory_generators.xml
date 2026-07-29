@@ -1,6 +1,20 @@
 <?xml version="1.0"?>
 <library path="f_dwa_controller_core">
   <class
+    type="f_dwa_controller::VLimitedAccelTrajectoryGenerator"
+    base_class_type="dwb_core::TrajectoryGenerator">
+    <description>
+      Behavior-preserving adapter for Nav2 LimitedAccelGenerator.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::VStandardTrajectoryGenerator"
+    base_class_type="dwb_core::TrajectoryGenerator">
+    <description>
+      Behavior-preserving adapter for Nav2 StandardTrajectoryGenerator.
+    </description>
+  </class>
+  <class
     type="f_dwa_controller::AccelerationTrajectoryGenerator"
     base_class_type="dwb_core::TrajectoryGenerator">
     <description>

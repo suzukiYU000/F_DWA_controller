@@ -25,6 +25,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -52,12 +53,15 @@ public:
     std::string name,
     std::shared_ptr<tf2_ros::Buffer> tf,
     std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros) override;
+  void activate() override;
+  void deactivate() override;
   void cleanup() override;
   geometry_msgs::msg::TwistStamped computeVelocityCommands(
     const geometry_msgs::msg::PoseStamped & pose,
     const geometry_msgs::msg::Twist & velocity,
     nav2_core::GoalChecker * goal_checker) override;
   void setPlan(const nav_msgs::msg::Path & path) override;
+  void reset() override;
   dwb_msgs::msg::TrajectoryScore scoreTrajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory,
     double best_score = -1) override;
@@ -79,6 +83,7 @@ private:
     const f_dwa_controller::msg::CommandDispatch::SharedPtr message);
   void transport_valid_callback(
     const std_msgs::msg::Bool::SharedPtr message);
+  void request_transport_invalidation(const char * reason);
   std::shared_ptr<const PlanningSnapshot> build_planning_snapshot(
     const geometry_msgs::msg::PoseStamped & pose);
   void record_issued_command(
@@ -87,12 +92,21 @@ private:
   void record_planning_duration(
     std::chrono::steady_clock::time_point started_at);
   void report_planning_metrics(const char * scope);
+  bool should_publish_evaluation();
+  void publish_evaluation(
+    const std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & evaluation);
+  void prepare_certified_footprint();
+  void score_trajectory_components(
+    const dwb_msgs::msg::Trajectory2D & trajectory,
+    double best_score,
+    dwb_msgs::msg::TrajectoryScore & score);
   bool build_stop_trajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory,
     std::vector<geometry_msgs::msg::Pose2D> & poses,
-    std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
+    std::vector<nav_2d_msgs::msg::Twist2D> * velocities,
     std::vector<NativeInputTrajectoryGenerator::NativeCommandState> *
-    command_states);
+    command_states,
+    std::optional<std::size_t> native_candidate_index = std::nullopt);
   bool build_revalidated_backup(
     const geometry_msgs::msg::Pose2D & start_pose,
     dwb_msgs::msg::TrajectoryScore & backup_score);
@@ -108,10 +122,14 @@ private:
   std::mutex controller_state_mutex_;
   std::mutex command_state_mutex_;
   rclcpp::Clock::SharedPtr clock_;
+  rclcpp_lifecycle::LifecyclePublisher<
+    dwb_msgs::msg::LocalPlanEvaluation>::SharedPtr evaluation_publisher_;
   rclcpp::Subscription<f_dwa_controller::msg::CommandDispatch>::SharedPtr
     command_dispatch_subscriber_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
     transport_valid_subscriber_;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr
+    transport_invalidation_client_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_trial_service_;
   bool certification_enabled_{false};
   bool nominal_delay_preview_enabled_{true};
@@ -140,17 +158,20 @@ private:
   bool planning_metrics_enabled_{true};
   int planning_metrics_report_interval_{1000};
   double planning_deadline_seconds_{0.03};
+  bool publish_evaluation_{true};
+  double evaluation_publish_frequency_{0.0};
+  rclcpp::Time last_evaluation_publish_time_{0, 0, RCL_ROS_TIME};
+  bool has_evaluation_publish_time_{false};
   std::vector<double> planning_durations_seconds_;
   uint64_t planning_cycle_count_{0};
   uint64_t planning_deadline_miss_count_{0};
   double maximum_planning_duration_seconds_{0.0};
-  std::vector<nav_2d_msgs::msg::Twist2D>
-  current_candidate_stop_velocities_;
   std::vector<nav_2d_msgs::msg::Twist2D> retained_backup_commands_;
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
-  current_candidate_stop_states_;
-  std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
   retained_backup_states_;
+  std::vector<geometry_msgs::msg::Point> certified_footprint_;
+  mutable CertificationWorkspace certification_workspace_;
+  std::vector<geometry_msgs::msg::Pose2D> stop_pose_scratch_;
 };
 
 }  // namespace f_dwa_controller

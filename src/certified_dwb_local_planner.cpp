@@ -25,6 +25,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <utility>
@@ -145,6 +146,9 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".transport_valid_topic",
     rclcpp::ParameterValue("/dwa_experiment/transport_valid"));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".transport_invalidation_service",
+    rclcpp::ParameterValue("/command_delay_transport/invalidate_trial"));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".certification_control_period",
     rclcpp::ParameterValue(0.03));
   nav2_util::declare_parameter_if_not_declared(
@@ -171,6 +175,12 @@ void CertifiedDWBLocalPlanner::configure(
   nav2_util::declare_parameter_if_not_declared(
     node, name + ".planning_deadline_seconds",
     rclcpp::ParameterValue(0.03));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".publish_evaluation",
+    rclcpp::ParameterValue(true));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".evaluation_publish_frequency",
+    rclcpp::ParameterValue(0.0));
 
   node->get_parameter(name + ".enable_certification", certification_enabled_);
   node->get_parameter(
@@ -204,10 +214,18 @@ void CertifiedDWBLocalPlanner::configure(
     planning_metrics_report_interval_);
   node->get_parameter(
     name + ".planning_deadline_seconds", planning_deadline_seconds_);
+  node->get_parameter(
+    name + ".publish_evaluation", publish_evaluation_);
+  node->get_parameter(
+    name + ".evaluation_publish_frequency",
+    evaluation_publish_frequency_);
   const std::string command_dispatch_topic =
     node->get_parameter(name + ".command_dispatch_topic").as_string();
   const std::string transport_valid_topic =
     node->get_parameter(name + ".transport_valid_topic").as_string();
+  const std::string transport_invalidation_service =
+    node->get_parameter(
+    name + ".transport_invalidation_service").as_string();
   const std::string trial_reset_service_name =
     node->get_parameter(name + ".trial_reset_service_name").as_string();
 
@@ -220,7 +238,9 @@ void CertifiedDWBLocalPlanner::configure(
     minimum_certified_margin_ < 0.0 ||
     !is_positive_finite(maximum_swept_distance_) ||
     planning_metrics_report_interval_ <= 0 ||
-    !is_positive_finite(planning_deadline_seconds_))
+    !is_positive_finite(planning_deadline_seconds_) ||
+    !std::isfinite(evaluation_publish_frequency_) ||
+    evaluation_publish_frequency_ < 0.0)
   {
     throw nav2_core::ControllerException(
             "Invalid delay-preview or trajectory-certification parameter");
@@ -246,6 +266,9 @@ void CertifiedDWBLocalPlanner::configure(
     plugin_name + ".decel_lim_theta", maximum_angular_deceleration_);
 
   clock_ = node->get_clock();
+  evaluation_publisher_ =
+    node->create_publisher<dwb_msgs::msg::LocalPlanEvaluation>(
+    "evaluation", rclcpp::QoS(1));
   command_dispatch_subscriber_ =
     node->create_subscription<f_dwa_controller::msg::CommandDispatch>(
     command_dispatch_topic,
@@ -260,6 +283,9 @@ void CertifiedDWBLocalPlanner::configure(
     std::bind(
       &CertifiedDWBLocalPlanner::transport_valid_callback,
       this, std::placeholders::_1));
+  transport_invalidation_client_ =
+    node->create_client<std_srvs::srv::Trigger>(
+    transport_invalidation_service);
   reset_trial_service_ = node->create_service<std_srvs::srv::Trigger>(
     trial_reset_service_name,
     std::bind(
@@ -267,14 +293,26 @@ void CertifiedDWBLocalPlanner::configure(
       this, std::placeholders::_1, std::placeholders::_2));
 }
 
+void CertifiedDWBLocalPlanner::activate()
+{
+  dwb_core::DWBLocalPlanner::activate();
+  evaluation_publisher_->on_activate();
+}
+
+void CertifiedDWBLocalPlanner::deactivate()
+{
+  evaluation_publisher_->on_deactivate();
+  dwb_core::DWBLocalPlanner::deactivate();
+}
+
 void CertifiedDWBLocalPlanner::cleanup()
 {
   command_dispatch_subscriber_.reset();
   transport_valid_subscriber_.reset();
+  transport_invalidation_client_.reset();
   reset_trial_service_.reset();
+  evaluation_publisher_.reset();
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
-  current_candidate_stop_velocities_.clear();
-  current_candidate_stop_states_.clear();
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
   planning_snapshot_.reset();
@@ -296,9 +334,26 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
   const geometry_msgs::msg::Twist & velocity,
   nav2_core::GoalChecker * goal_checker)
 {
+  (void)goal_checker;
   const auto planning_started_at = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
+  std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> evaluation;
+  if (should_publish_evaluation()) {
+    evaluation =
+      std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+  }
   try {
+    nav2_costmap_2d::Costmap2D * costmap =
+      costmap_ros_->getCostmap();
+    std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t>
+    certification_costmap_lock(*(costmap->getMutex()), std::defer_lock);
+    if (certification_enabled_) {
+      // The mutex is recursive; base DWB takes it again while scoring. Keeping
+      // this outer lock makes the committed-delay check, broadphase prefix,
+      // critic preparation, and candidate certification use one snapshot.
+      certification_costmap_lock.lock();
+      prepare_certified_footprint();
+    }
     planning_snapshot_ = build_planning_snapshot(pose);
     if (!planning_snapshot_->valid) {
       throw nav2_core::NoValidControl(
@@ -337,18 +392,24 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
     nav_2d_msgs::msg::Pose2DStamped activation_pose =
       nav_2d_utils::poseStampedToPose2D(pose);
     activation_pose.pose = planning_snapshot_->activation_state.pose;
-    const geometry_msgs::msg::Twist activation_velocity =
-      nav_2d_utils::twist2Dto3D(
-      planning_snapshot_->activation_state.velocity);
-    geometry_msgs::msg::TwistStamped command =
+    const nav_2d_msgs::msg::Twist2DStamped command_2d =
       dwb_core::DWBLocalPlanner::computeVelocityCommands(
-      nav_2d_utils::pose2DToPoseStamped(activation_pose),
-      activation_velocity, goal_checker);
+      activation_pose,
+      planning_snapshot_->activation_state.velocity,
+      evaluation);
+    publish_evaluation(evaluation);
+    geometry_msgs::msg::TwistStamped command;
+    command.twist =
+      nav_2d_utils::twist2Dto3D(command_2d.velocity);
+    if (certification_costmap_lock.owns_lock()) {
+      certification_costmap_lock.unlock();
+    }
     const rclcpp::Time issued_at = clock_->now();
     record_issued_command(command, issued_at);
     record_planning_duration(planning_started_at);
     return command;
   } catch (...) {
+    publish_evaluation(evaluation);
     record_planning_duration(planning_started_at);
     throw;
   }
@@ -361,6 +422,7 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
     !std::isfinite(message->command.linear.x) ||
     !std::isfinite(message->command.angular.z))
   {
+    request_transport_invalidation("invalid command-dispatch message");
     return;
   }
 
@@ -368,6 +430,7 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
   const nav_2d_msgs::msg::Twist2D dispatched =
     nav_2d_utils::twist3Dto2D(message->command);
   bool dispatch_is_valid = true;
+  bool ordered_external_stop = false;
   {
     std::lock_guard<std::mutex> command_lock(command_state_mutex_);
     if (!message->has_sequence) {
@@ -378,14 +441,27 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
         commands_match(dispatched, nav_2d_msgs::msg::Twist2D());
       dispatch_is_valid = command_ledger_valid_;
     } else {
-      dispatch_is_valid =
+      const bool sequence_is_valid =
         expected_dispatch_sequence_ready_ &&
-        message->sequence_id == expected_dispatch_sequence_ &&
+        message->sequence_id == expected_dispatch_sequence_;
+      const bool matches_pending_command =
         !pending_issued_commands_.empty() &&
-        commands_match(
-        pending_issued_commands_.front().command, dispatched);
+        commands_match(pending_issued_commands_.front().command, dispatched);
+      // Controller Server appends a normal zero-velocity stop after FollowPath
+      // succeeds. It is not produced by computeVelocityCommands(), so it has
+      // no pending ledger entry. Accept it only after every computed command
+      // has been dispatched and the transport sequence remains continuous.
+      const bool is_ordered_external_stop =
+        pending_issued_commands_.empty() &&
+        commands_match(dispatched, nav_2d_msgs::msg::Twist2D());
+      ordered_external_stop = is_ordered_external_stop;
+      dispatch_is_valid =
+        sequence_is_valid &&
+        (matches_pending_command || is_ordered_external_stop);
       if (dispatch_is_valid) {
-        pending_issued_commands_.pop_front();
+        if (matches_pending_command) {
+          pending_issued_commands_.pop_front();
+        }
         ++expected_dispatch_sequence_;
         command_ledger_valid_ = true;
       } else {
@@ -405,13 +481,24 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
       "Command dispatch ledger mismatch: has_sequence=%s sequence=%" PRIu64,
       message->has_sequence ? "true" : "false",
       message->sequence_id);
+    request_transport_invalidation("command-dispatch ledger mismatch");
     return;
   }
   auto native_generator =
     std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
     traj_generator_);
   if (native_generator) {
-    native_generator->observe_command_dispatch(*message);
+    if (ordered_external_stop) {
+      // Controller Server's normal completion zero is observable but has no
+      // native-input candidate metadata. Once every issued candidate has
+      // drained, treat this exact applied zero as the new observable dynamics
+      // origin so planning can resume if the post-drain pose check fails.
+      f_dwa_controller::msg::CommandDispatch stopped_dispatch = *message;
+      stopped_dispatch.has_sequence = false;
+      native_generator->observe_command_dispatch(stopped_dispatch);
+    } else {
+      native_generator->observe_command_dispatch(*message);
+    }
   }
 }
 
@@ -430,6 +517,23 @@ void CertifiedDWBLocalPlanner::transport_valid_callback(
     expected_dispatch_sequence_ready_ = false;
     pending_issued_commands_.clear();
   }
+}
+
+void CertifiedDWBLocalPlanner::request_transport_invalidation(
+  const char * reason)
+{
+  RCLCPP_ERROR(
+    logger_, "Requesting transport_invalid: %s", reason);
+  if (!transport_invalidation_client_ ||
+    !transport_invalidation_client_->service_is_ready())
+  {
+    RCLCPP_ERROR(
+      logger_,
+      "Transport invalidation service is unavailable");
+    return;
+  }
+  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  transport_invalidation_client_->async_send_request(request);
 }
 
 std::shared_ptr<const PlanningSnapshot>
@@ -508,17 +612,22 @@ void CertifiedDWBLocalPlanner::record_issued_command(
 {
   const nav_2d_msgs::msg::Twist2D command_2d =
     nav_2d_utils::twist3Dto2D(command.twist);
+  bool ledger_overflow = false;
   {
     std::lock_guard<std::mutex> command_lock(command_state_mutex_);
     constexpr std::size_t kMaximumPendingCommandCount = 256;
     if (pending_issued_commands_.size() >= kMaximumPendingCommandCount) {
       command_transport_valid_ = false;
       pending_issued_commands_.clear();
-      throw nav2_core::NoValidControl(
-              "Local command ledger overflow");
+      ledger_overflow = true;
+    } else {
+      pending_issued_commands_.push_back(
+        IssuedCommand{issued_at, command_2d});
     }
-    pending_issued_commands_.push_back(
-      IssuedCommand{issued_at, command_2d});
+  }
+  if (ledger_overflow) {
+    request_transport_invalidation("local command ledger overflow");
+    throw nav2_core::NoValidControl("Local command ledger overflow");
   }
   auto native_generator =
     std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
@@ -578,14 +687,58 @@ void CertifiedDWBLocalPlanner::report_planning_metrics(
     planning_deadline_miss_count_);
 }
 
+bool CertifiedDWBLocalPlanner::should_publish_evaluation()
+{
+  if (!publish_evaluation_) {
+    return false;
+  }
+  if (evaluation_publish_frequency_ <= 0.0) {
+    return true;
+  }
+  const rclcpp::Time current_time = clock_->now();
+  const double minimum_period = 1.0 / evaluation_publish_frequency_;
+  if (has_evaluation_publish_time_ &&
+    current_time >= last_evaluation_publish_time_ &&
+    (current_time - last_evaluation_publish_time_).seconds() <
+    minimum_period)
+  {
+    return false;
+  }
+  last_evaluation_publish_time_ = current_time;
+  has_evaluation_publish_time_ = true;
+  return true;
+}
+
+void CertifiedDWBLocalPlanner::publish_evaluation(
+  const std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & evaluation)
+{
+  if (evaluation && evaluation_publisher_ &&
+    evaluation_publisher_->is_activated())
+  {
+    evaluation_publisher_->publish(*evaluation);
+  }
+}
+
 void CertifiedDWBLocalPlanner::setPlan(const nav_msgs::msg::Path & path)
 {
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
-  current_candidate_stop_velocities_.clear();
-  current_candidate_stop_states_.clear();
+  has_evaluation_publish_time_ = false;
   dwb_core::DWBLocalPlanner::setPlan(path);
+}
+
+void CertifiedDWBLocalPlanner::reset()
+{
+  std::lock_guard<std::mutex> lock(controller_state_mutex_);
+  retained_backup_commands_.clear();
+  retained_backup_states_.clear();
+  planning_snapshot_.reset();
+  has_evaluation_publish_time_ = false;
+  for (dwb_core::TrajectoryCritic::Ptr & critic : critics_) {
+    critic->reset();
+  }
+  traj_generator_->reset();
 }
 
 dwb_msgs::msg::TrajectoryScore
@@ -594,55 +747,83 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   const nav_2d_msgs::msg::Twist2D velocity,
   std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & results)
 {
+  if (certification_enabled_) {
+    prepare_certification_broadphase(
+      *costmap_ros_->getCostmap(), certification_workspace_);
+  }
   if (!certification_enabled_) {
     return dwb_core::DWBLocalPlanner::coreScoringAlgorithm(
       pose, velocity, results);
   }
 
   dwb_msgs::msg::TrajectoryScore best;
-  dwb_msgs::msg::TrajectoryScore worst;
   best.total = -1.0;
-  worst.total = -1.0;
+  double worst_total = -1.0;
+  std::size_t best_canonical_index =
+    std::numeric_limits<std::size_t>::max();
   std::vector<nav_2d_msgs::msg::Twist2D> best_stop_velocities;
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
   best_stop_states;
   dwb_core::IllegalTrajectoryTracker tracker;
+  auto native_generator =
+    std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
+    traj_generator_);
+  std::size_t evaluation_index = 0u;
+  dwb_msgs::msg::Trajectory2D trajectory_scratch;
+  dwb_msgs::msg::TrajectoryScore score_scratch;
+  score_scratch.scores.reserve(critics_.size() + 1u);
 
   traj_generator_->startNewIteration(velocity);
   while (traj_generator_->hasMoreTwists()) {
     const nav_2d_msgs::msg::Twist2D twist =
       traj_generator_->nextTwist();
-    const dwb_msgs::msg::Trajectory2D trajectory =
-      traj_generator_->generateTrajectory(pose, velocity, twist);
+    if (native_generator) {
+      native_generator->generate_trajectory_into(
+        pose, twist, trajectory_scratch);
+    } else {
+      trajectory_scratch =
+        traj_generator_->generateTrajectory(pose, velocity, twist);
+    }
+    const std::size_t canonical_index =
+      native_generator ?
+      native_generator->active_candidate_canonical_index().value_or(
+      std::numeric_limits<std::size_t>::max()) :
+      evaluation_index;
+    ++evaluation_index;
     try {
-      const dwb_msgs::msg::TrajectoryScore score =
-        scoreTrajectory(trajectory, best.total);
+      score_trajectory_components(
+        trajectory_scratch, best.total, score_scratch);
+      const bool is_best =
+        best.total < 0.0 || score_scratch.total < best.total ||
+        (score_scratch.total == best.total &&
+        canonical_index < best_canonical_index);
+      bool is_worst = worst_total < 0.0;
+      if (!is_worst) {
+        is_worst = score_scratch.total > worst_total;
+      }
+      const double score_total = score_scratch.total;
       tracker.addLegalTrajectory();
       if (results) {
-        results->twists.push_back(score);
+        score_scratch.traj = trajectory_scratch;
+        results->twists.push_back(score_scratch);
       }
-      if (best.total < 0.0 || score.total < best.total) {
-        best = score;
-        best_stop_velocities = current_candidate_stop_velocities_;
-        best_stop_states = current_candidate_stop_states_;
-        if (best_stop_states.empty()) {
-          auto native_generator =
-            std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
-            traj_generator_);
-          if (native_generator) {
-            const auto active_state =
-              native_generator->active_candidate_command_state();
-            if (active_state) {
-              best_stop_states.push_back(*active_state);
-            }
-          }
+      if (is_best) {
+        if (results) {
+          best = score_scratch;
+        } else {
+          best.total = score_scratch.total;
+          best.scores.swap(score_scratch.scores);
+          best.traj.velocity = trajectory_scratch.velocity;
+          best.traj.poses.swap(trajectory_scratch.poses);
+          best.traj.time_offsets.swap(trajectory_scratch.time_offsets);
         }
+        best_canonical_index = canonical_index;
         if (results) {
           results->best_index = results->twists.size() - 1u;
         }
       }
-      if (worst.total < 0.0 || score.total > worst.total) {
-        worst = score;
+      if (is_worst) {
+        worst_total = score_total;
         if (results) {
           results->worst_index = results->twists.size() - 1u;
         }
@@ -650,34 +831,32 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
     } catch (const dwb_core::IllegalTrajectoryException & exception) {
       if (results) {
         dwb_msgs::msg::TrajectoryScore failed_score;
-        failed_score.traj = trajectory;
+        failed_score.traj = trajectory_scratch;
         dwb_msgs::msg::CriticScore critic_score;
         critic_score.name = exception.getCriticName();
         critic_score.raw_score = -1.0;
         failed_score.scores.push_back(critic_score);
         failed_score.total = -1.0;
-        results->twists.push_back(failed_score);
+        results->twists.push_back(std::move(failed_score));
       }
       tracker.addIllegalTrajectory(exception);
     }
   }
 
   if (best.total >= 0.0) {
+    std::vector<geometry_msgs::msg::Pose2D> best_stop_poses;
+    const std::optional<std::size_t> native_candidate_index =
+      native_generator ?
+      std::make_optional(best_canonical_index) : std::nullopt;
+    if (!build_stop_trajectory(
+        best.traj, best_stop_poses, &best_stop_velocities,
+        &best_stop_states, native_candidate_index))
+    {
+      throw nav2_core::NoValidControl(
+              "Certified best trajectory could not be materialized");
+    }
     retained_backup_commands_.clear();
     retained_backup_states_.clear();
-    if (best_stop_velocities.size() > 1u) {
-      retained_backup_commands_.assign(
-        best_stop_velocities.begin() + 1,
-        best_stop_velocities.end());
-    }
-    if (best_stop_states.size() > 1u) {
-      retained_backup_states_.assign(
-        best_stop_states.begin() + 1,
-        best_stop_states.end());
-    }
-    auto native_generator =
-      std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
-      traj_generator_);
     if (native_generator) {
       if (best_stop_states.empty()) {
         native_generator->select_command_for_dispatch(std::nullopt);
@@ -685,6 +864,16 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         native_generator->select_command_for_dispatch(
           best_stop_states.front());
       }
+    }
+    if (best_stop_velocities.size() > 1u) {
+      retained_backup_commands_.assign(
+        best_stop_velocities.begin() + 1,
+        best_stop_velocities.end());
+    }
+    if (best_stop_states.size() > 1u) {
+      retained_backup_states_.assign(
+        std::make_move_iterator(best_stop_states.begin() + 1),
+        std::make_move_iterator(best_stop_states.end()));
     }
     return best;
   }
@@ -722,21 +911,49 @@ CertifiedDWBLocalPlanner::scoreTrajectory(
   const dwb_msgs::msg::Trajectory2D & trajectory,
   const double best_score)
 {
-  current_candidate_stop_velocities_.clear();
-  current_candidate_stop_states_.clear();
-  dwb_msgs::msg::TrajectoryScore score =
-    dwb_core::DWBLocalPlanner::scoreTrajectory(
-    trajectory, best_score);
-  if (certification_enabled_) {
-    if (best_score >= 0.0 && score.total >= best_score) {
-      return score;
+  dwb_msgs::msg::TrajectoryScore score;
+  score.traj = trajectory;
+  score_trajectory_components(trajectory, best_score, score);
+  return score;
+}
+
+void CertifiedDWBLocalPlanner::score_trajectory_components(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  const double best_score,
+  dwb_msgs::msg::TrajectoryScore & score)
+{
+  score.total = 0.0;
+  score.scores.clear();
+  score.scores.reserve(
+    critics_.size() + (certification_enabled_ ? 1u : 0u));
+  for (dwb_core::TrajectoryCritic::Ptr & critic : critics_) {
+    dwb_msgs::msg::CriticScore critic_score;
+    critic_score.name = critic->getName();
+    critic_score.scale = critic->getScale();
+    if (critic_score.scale == 0.0) {
+      score.scores.push_back(critic_score);
+      continue;
     }
-    std::vector<geometry_msgs::msg::Pose2D> stop_poses;
-    std::vector<nav_2d_msgs::msg::Twist2D> stop_velocities;
-    std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
-    stop_states;
+
+    const double raw_score =
+      critic->scoreTrajectory(trajectory);
+    critic_score.raw_score = raw_score;
+    score.scores.push_back(critic_score);
+    score.total += raw_score * critic_score.scale;
+    if (short_circuit_trajectory_evaluation_ &&
+      best_score > 0.0 && score.total > best_score)
+    {
+      break;
+    }
+  }
+
+  if (certification_enabled_) {
+    if (best_score >= 0.0 && score.total > best_score) {
+      return;
+    }
+    stop_pose_scratch_.clear();
     if (!build_stop_trajectory(
-        trajectory, stop_poses, stop_velocities, &stop_states))
+        trajectory, stop_pose_scratch_, nullptr, nullptr))
     {
       throw dwb_core::IllegalTrajectoryException(
               "SafetyCertificate",
@@ -744,33 +961,36 @@ CertifiedDWBLocalPlanner::scoreTrajectory(
     }
 
     CertificationFailure failure = CertificationFailure::kInvalidInput;
-    if (!certify_stop_poses(stop_poses, failure)) {
+    if (!certify_stop_poses(stop_pose_scratch_, failure)) {
       throw dwb_core::IllegalTrajectoryException(
               "SafetyCertificate",
               certification_failure_name(failure));
     }
-    current_candidate_stop_velocities_ = std::move(stop_velocities);
-    current_candidate_stop_states_ = std::move(stop_states);
     dwb_msgs::msg::CriticScore certificate_score;
     certificate_score.name = "SafetyCertificate";
     certificate_score.scale = 1.0;
     certificate_score.raw_score = 0.0;
     score.scores.push_back(certificate_score);
   }
-  return score;
 }
 
 bool CertifiedDWBLocalPlanner::build_stop_trajectory(
   const dwb_msgs::msg::Trajectory2D & trajectory,
   std::vector<geometry_msgs::msg::Pose2D> & poses,
-  std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
+  std::vector<nav_2d_msgs::msg::Twist2D> * velocities,
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState> *
-  command_states)
+  command_states,
+  const std::optional<std::size_t> native_candidate_index)
 {
   poses.clear();
-  velocities.clear();
+  if (velocities) {
+    velocities->clear();
+  }
   if (command_states) {
     command_states->clear();
+  }
+  if (command_states && !velocities) {
+    return false;
   }
   if (trajectory.poses.empty()) {
     return false;
@@ -783,9 +1003,25 @@ bool CertifiedDWBLocalPlanner::build_stop_trajectory(
     std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
     traj_generator_);
   if (native_generator) {
+    if (native_candidate_index) {
+      if (!velocities && !command_states) {
+        return native_generator->generate_stop_poses_for_candidate(
+          *native_candidate_index, trajectory.poses.front(),
+          maximum_stop_steps, terminal_stop_velocity_threshold_, poses);
+      }
+      return native_generator->generate_stop_trajectory_for_candidate(
+        *native_candidate_index, trajectory.poses.front(),
+        maximum_stop_steps, terminal_stop_velocity_threshold_, poses,
+        *velocities, command_states);
+    }
+    if (!velocities && !command_states) {
+      return native_generator->generate_stop_poses(
+        trajectory.poses.front(), maximum_stop_steps,
+        terminal_stop_velocity_threshold_, poses);
+    }
     return native_generator->generate_stop_trajectory(
       trajectory.poses.front(), maximum_stop_steps,
-      terminal_stop_velocity_threshold_, poses, velocities,
+      terminal_stop_velocity_threshold_, poses, *velocities,
       command_states);
   }
 
@@ -818,7 +1054,9 @@ bool CertifiedDWBLocalPlanner::build_stop_trajectory(
   {
     pose = integrate_pose(
       pose, trajectory.velocity, certification_control_period_);
-    velocities.push_back(trajectory.velocity);
+    if (velocities) {
+      velocities->push_back(trajectory.velocity);
+    }
     poses.push_back(pose);
   }
   const std::size_t stop_step_count =
@@ -835,11 +1073,15 @@ bool CertifiedDWBLocalPlanner::build_stop_trajectory(
     }
     pose = integrate_pose(
       pose, stop_velocity, certification_control_period_);
-    velocities.push_back(stop_velocity);
+    if (velocities) {
+      velocities->push_back(stop_velocity);
+    }
     poses.push_back(pose);
   }
   nav_2d_msgs::msg::Twist2D zero_velocity;
-  velocities.push_back(zero_velocity);
+  if (velocities) {
+    velocities->push_back(zero_velocity);
+  }
   poses.push_back(pose);
   return true;
 }
@@ -900,16 +1142,20 @@ bool CertifiedDWBLocalPlanner::certify_stop_poses(
   const std::vector<geometry_msgs::msg::Pose2D> & stop_poses,
   CertificationFailure & failure) const
 {
-  std::vector<geometry_msgs::msg::Point> certified_footprint =
-    costmap_ros_->getRobotFootprint();
-  nav2_costmap_2d::padFootprint(
-    certified_footprint, minimum_certified_margin_);
   const CertificationResult result =
     certify_pose_sequence(
-    *costmap_ros_->getCostmap(), certified_footprint, stop_poses,
-    maximum_swept_distance_);
+      *costmap_ros_->getCostmap(), certified_footprint_, stop_poses,
+      maximum_swept_distance_, &certification_workspace_);
   failure = result.failure;
   return result.safe;
+}
+
+void CertifiedDWBLocalPlanner::prepare_certified_footprint()
+{
+  invalidate_certification_broadphase(certification_workspace_);
+  certified_footprint_ = costmap_ros_->getRobotFootprint();
+  nav2_costmap_2d::padFootprint(
+    certified_footprint_, minimum_certified_margin_);
 }
 
 AxisLimits CertifiedDWBLocalPlanner::linear_limits() const
@@ -938,8 +1184,6 @@ void CertifiedDWBLocalPlanner::reset_trial_callback(
   planning_cycle_count_ = 0;
   planning_deadline_miss_count_ = 0;
   maximum_planning_duration_seconds_ = 0.0;
-  current_candidate_stop_velocities_.clear();
-  current_candidate_stop_states_.clear();
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
   global_plan_.poses.clear();
@@ -959,16 +1203,19 @@ void CertifiedDWBLocalPlanner::reset_trial_callback(
     std::lock_guard<std::mutex> command_lock(command_state_mutex_);
     pending_issued_commands_.clear();
     dispatched_command_ = nav_2d_msgs::msg::Twist2D();
-    command_dispatch_observed_ = true;
-    command_transport_valid_ = true;
-    command_ledger_valid_ = true;
-    expected_dispatch_sequence_ready_ = true;
+    // The transport reset service is called after this controller reset. Do
+    // not certify a new epoch until its observable reset dispatch and valid
+    // state have both arrived.
+    command_dispatch_observed_ = false;
+    command_transport_valid_ = false;
+    command_ledger_valid_ = false;
+    expected_dispatch_sequence_ready_ = false;
     expected_dispatch_sequence_ = 0;
   }
 
   response->success = true;
   response->message =
-    "controller trial state reset to zero; configured FIR coefficients retained";
+    "controller trial state cleared; awaiting observable transport reset";
   RCLCPP_INFO(logger_, "%s", response->message.c_str());
 }
 

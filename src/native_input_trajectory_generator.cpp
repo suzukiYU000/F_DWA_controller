@@ -118,6 +118,9 @@ void NativeInputTrajectoryGenerator::initialize(
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".require_applied_command_state",
     rclcpp::ParameterValue(input_order_ != NativeInputOrder::kAcceleration));
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".prefer_previous_selected_candidate",
+    rclcpp::ParameterValue(false));
 
   node->get_parameter(
     plugin_name + ".native_input_control_period", control_period_);
@@ -145,8 +148,20 @@ void NativeInputTrajectoryGenerator::initialize(
   node->get_parameter(
     plugin_name + ".require_applied_command_state",
     require_applied_command_state_);
+  node->get_parameter(
+    plugin_name + ".prefer_previous_selected_candidate",
+    prefer_previous_selected_candidate_);
   validate_parameters();
+  fixed_time_steps_ = getTimeSteps(nav_2d_msgs::msg::Twist2D());
   if (input_order_ == NativeInputOrder::kFir) {
+    fir_stop_coefficient_response_ =
+      prepare_fir_stop_coefficient_response(
+      fir_coefficients_, control_period_);
+    if (!fir_stop_coefficient_response_.valid) {
+      throw std::invalid_argument(
+              plugin_name_ +
+              " FIR terminal-stop coefficient response is invalid");
+    }
     applied_native_state_.linear_fir_history.assign(
       fir_coefficients_.size() - 1u, 0.0);
     applied_native_state_.angular_fir_history.assign(
@@ -221,8 +236,9 @@ void NativeInputTrajectoryGenerator::validate_parameters() const
 void NativeInputTrajectoryGenerator::reset()
 {
   candidates_.clear();
+  candidate_order_.clear();
   candidate_index_ = 0;
-  has_active_candidate_ = false;
+  active_candidate_ = nullptr;
 }
 
 void NativeInputTrajectoryGenerator::reset_trial_state()
@@ -241,6 +257,7 @@ void NativeInputTrajectoryGenerator::reset_trial_state()
   applied_native_state_.valid = true;
   pending_native_commands_.clear();
   selected_command_state_.reset();
+  previous_selected_velocity_.reset();
   planning_snapshot_.reset();
   applied_command_state_ready_ = true;
 }
@@ -381,12 +398,28 @@ void NativeInputTrajectoryGenerator::observe_command_dispatch(
 std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
 NativeInputTrajectoryGenerator::active_candidate_command_state() const
 {
-  if (!has_active_candidate_ ||
-    !active_candidate_.first_command_state.valid)
+  if (active_candidate_ == nullptr ||
+    !active_candidate_->first_command_state.valid)
   {
     return std::nullopt;
   }
-  return active_candidate_.first_command_state;
+  NativeCommandState command_state = active_candidate_->first_command_state;
+  if (input_order_ == NativeInputOrder::kFir) {
+    command_state.linear_fir_history =
+      active_candidate_->linear_rollout->first_fir_history;
+    command_state.angular_fir_history =
+      active_candidate_->angular_rollout->first_fir_history;
+  }
+  return command_state;
+}
+
+std::optional<std::size_t>
+NativeInputTrajectoryGenerator::active_candidate_canonical_index() const
+{
+  if (active_candidate_ == nullptr) {
+    return std::nullopt;
+  }
+  return active_candidate_->canonical_index;
 }
 
 void NativeInputTrajectoryGenerator::select_command_for_dispatch(
@@ -394,6 +427,9 @@ void NativeInputTrajectoryGenerator::select_command_for_dispatch(
 {
   std::lock_guard<std::mutex> lock(applied_command_mutex_);
   selected_command_state_ = command_state;
+  if (command_state && command_state->valid) {
+    previous_selected_velocity_ = command_state->command_velocity;
+  }
 }
 
 void NativeInputTrajectoryGenerator::commit_selected_command(
@@ -428,6 +464,7 @@ void NativeInputTrajectoryGenerator::startNewIteration(
   double initial_angular_acceleration = 0.0;
   std::vector<double> initial_linear_fir_history;
   std::vector<double> initial_angular_fir_history;
+  std::optional<nav_2d_msgs::msg::Twist2D> preferred_velocity;
   {
     std::lock_guard<std::mutex> lock(applied_command_mutex_);
     if (planning_snapshot_) {
@@ -462,6 +499,9 @@ void NativeInputTrajectoryGenerator::startNewIteration(
       initial_angular_fir_history =
         applied_native_state_.angular_fir_history;
     }
+    if (prefer_previous_selected_candidate_) {
+      preferred_velocity = previous_selected_velocity_;
+    }
   }
 
   const AxisState linear_state{
@@ -470,20 +510,33 @@ void NativeInputTrajectoryGenerator::startNewIteration(
     initial_velocity.theta, initial_angular_acceleration};
   const AxisLimits linear_axis_limits = linear_limits();
   const AxisLimits angular_axis_limits = angular_limits();
+  iteration_initial_linear_velocity_ = initial_velocity.x;
+  iteration_initial_angular_velocity_ = initial_velocity.theta;
+  iteration_initial_linear_acceleration_ = initial_linear_acceleration;
+  iteration_initial_angular_acceleration_ = initial_angular_acceleration;
+  iteration_initial_linear_fir_history_ = initial_linear_fir_history;
+  iteration_initial_angular_fir_history_ = initial_angular_fir_history;
   const int rollout_step_count =
-    static_cast<int>(std::ceil(sim_time_ / time_granularity_));
-  const FeasibleInterval linear_interval =
-    input_order_ == NativeInputOrder::kFir ?
-    held_fir_input_interval(
-    linear_state, linear_axis_limits, fir_coefficients_,
-    initial_linear_fir_history, control_period_, rollout_step_count) :
-    input_interval(linear_state, linear_axis_limits, control_period_);
-  const FeasibleInterval angular_interval =
-    input_order_ == NativeInputOrder::kFir ?
-    held_fir_input_interval(
-    angular_state, angular_axis_limits, fir_coefficients_,
-    initial_angular_fir_history, control_period_, rollout_step_count) :
-    input_interval(angular_state, angular_axis_limits, control_period_);
+    static_cast<int>(fixed_time_steps_.size());
+  HeldFirAffineResponse linear_fir_response;
+  HeldFirAffineResponse angular_fir_response;
+  FeasibleInterval linear_interval;
+  FeasibleInterval angular_interval;
+  if (input_order_ == NativeInputOrder::kFir) {
+    linear_fir_response = prepare_held_fir_affine_response(
+      linear_state, linear_axis_limits, fir_coefficients_,
+      initial_linear_fir_history, control_period_, rollout_step_count);
+    angular_fir_response = prepare_held_fir_affine_response(
+      angular_state, angular_axis_limits, fir_coefficients_,
+      initial_angular_fir_history, control_period_, rollout_step_count);
+    linear_interval = linear_fir_response.input_interval;
+    angular_interval = angular_fir_response.input_interval;
+  } else {
+    linear_interval =
+      input_interval(linear_state, linear_axis_limits, control_period_);
+    angular_interval =
+      input_interval(angular_state, angular_axis_limits, control_period_);
+  }
   const std::vector<double> linear_inputs =
     uniform_samples(linear_interval, linear_samples_);
   const std::vector<double> angular_inputs =
@@ -493,45 +546,39 @@ void NativeInputTrajectoryGenerator::startNewIteration(
     const std::vector<double> & inputs,
     const AxisState & initial_state,
     const AxisLimits & limits,
-    const std::vector<double> & initial_fir_history)
+    const std::vector<double> & initial_fir_history,
+    const HeldFirAffineResponse * fir_response)
     {
       std::vector<std::shared_ptr<const AxisRollout>> rollouts;
       rollouts.reserve(inputs.size());
       for (const double input : inputs) {
         auto rollout = std::make_shared<AxisRollout>();
         rollout->native_input = input;
-        rollout->states.reserve(
-          static_cast<std::size_t>(rollout_step_count));
         if (input_order_ == NativeInputOrder::kFir) {
-          rollout->fir_histories.reserve(
+          if (fir_response == nullptr ||
+            !sample_held_fir_affine_response(
+              *fir_response, limits, input, rollout->states))
+          {
+            continue;
+          }
+          rollout->first_fir_history = initial_fir_history;
+          push_fir_input(rollout->first_fir_history, input);
+        } else {
+          rollout->states.reserve(
             static_cast<std::size_t>(rollout_step_count));
-        }
-        AxisState state = initial_state;
-        std::vector<double> fir_history = initial_fir_history;
-        for (int step_index = 0;
-          step_index < rollout_step_count; ++step_index)
-        {
-          ProjectedAxisStep step;
-          if (input_order_ == NativeInputOrder::kFir) {
-            const ProjectedFirStep fir_step =
-              apply_projected_fir_step(
-              state, limits, fir_coefficients_, fir_history,
-              input, control_period_);
-            step.state = fir_step.state;
-            step.feasible = fir_step.feasible;
-            fir_history = fir_step.history;
-          } else {
-            step = project_axis(
+          AxisState state = initial_state;
+          for (int step_index = 0;
+            step_index < rollout_step_count; ++step_index)
+          {
+            const ProjectedAxisStep step =
+              project_axis(
               state, limits, input, control_period_,
               rollout_step_count - step_index);
-          }
-          if (!step.feasible) {
-            break;
-          }
-          state = step.state;
-          rollout->states.push_back(state);
-          if (input_order_ == NativeInputOrder::kFir) {
-            rollout->fir_histories.push_back(fir_history);
+            if (!step.feasible) {
+              break;
+            }
+            state = step.state;
+            rollout->states.push_back(state);
           }
         }
         rollout->valid =
@@ -543,19 +590,26 @@ void NativeInputTrajectoryGenerator::startNewIteration(
       }
       return rollouts;
     };
+  const HeldFirAffineResponse * linear_fir_response_pointer =
+    input_order_ == NativeInputOrder::kFir ?
+    &linear_fir_response : nullptr;
+  const HeldFirAffineResponse * angular_fir_response_pointer =
+    input_order_ == NativeInputOrder::kFir ?
+    &angular_fir_response : nullptr;
   const auto linear_rollouts =
     build_axis_rollouts(
     linear_inputs, linear_state, linear_axis_limits,
-    initial_linear_fir_history);
+    initial_linear_fir_history, linear_fir_response_pointer);
   const auto angular_rollouts =
     build_axis_rollouts(
     angular_inputs, angular_state, angular_axis_limits,
-    initial_angular_fir_history);
+    initial_angular_fir_history, angular_fir_response_pointer);
 
   candidates_.reserve(linear_rollouts.size() * angular_rollouts.size());
   for (const auto & linear_rollout : linear_rollouts) {
     for (const auto & angular_rollout : angular_rollouts) {
       Candidate candidate;
+      candidate.canonical_index = candidates_.size();
       candidate.command_velocity.x =
         linear_rollout->states.front().velocity;
       candidate.command_velocity.y = 0.0;
@@ -563,37 +617,46 @@ void NativeInputTrajectoryGenerator::startNewIteration(
         angular_rollout->states.front().velocity;
       candidate.linear_native_input = linear_rollout->native_input;
       candidate.angular_native_input = angular_rollout->native_input;
-      candidate.initial_linear_velocity = initial_velocity.x;
-      candidate.initial_angular_velocity = initial_velocity.theta;
-      candidate.initial_linear_acceleration = initial_linear_acceleration;
-      candidate.initial_angular_acceleration = initial_angular_acceleration;
-      candidate.initial_linear_fir_history =
-        initial_linear_fir_history;
-      candidate.initial_angular_fir_history =
-        initial_angular_fir_history;
       candidate.first_command_state.command_velocity =
         candidate.command_velocity;
       candidate.first_command_state.linear_state =
         linear_rollout->states.front();
       candidate.first_command_state.angular_state =
         angular_rollout->states.front();
-      if (input_order_ == NativeInputOrder::kFir) {
-        candidate.first_command_state.linear_fir_history =
-          linear_rollout->fir_histories.front();
-        candidate.first_command_state.angular_fir_history =
-          angular_rollout->fir_histories.front();
-      }
       candidate.first_command_state.valid = true;
       candidate.linear_rollout = linear_rollout;
       candidate.angular_rollout = angular_rollout;
       candidates_.push_back(std::move(candidate));
     }
   }
+  candidate_order_.resize(candidates_.size());
+  std::iota(candidate_order_.begin(), candidate_order_.end(), 0u);
+  if (preferred_velocity && !candidates_.empty()) {
+    const auto preferred = std::min_element(
+      candidate_order_.begin(), candidate_order_.end(),
+      [this, &preferred_velocity](
+        const std::size_t first, const std::size_t second)
+      {
+        const auto squared_distance =
+        [this, &preferred_velocity](const std::size_t index)
+        {
+          const auto & velocity = candidates_[index].command_velocity;
+          return std::pow(velocity.x - preferred_velocity->x, 2) +
+                 std::pow(
+              velocity.theta - preferred_velocity->theta, 2);
+        };
+        return squared_distance(first) < squared_distance(second);
+      });
+    if (preferred != candidate_order_.end()) {
+      std::rotate(
+        candidate_order_.begin(), preferred, std::next(preferred));
+    }
+  }
 }
 
 bool NativeInputTrajectoryGenerator::hasMoreTwists()
 {
-  return candidate_index_ < candidates_.size();
+  return candidate_index_ < candidate_order_.size();
 }
 
 nav_2d_msgs::msg::Twist2D NativeInputTrajectoryGenerator::nextTwist()
@@ -601,10 +664,9 @@ nav_2d_msgs::msg::Twist2D NativeInputTrajectoryGenerator::nextTwist()
   if (!hasMoreTwists()) {
     throw std::out_of_range("No native-input trajectory candidates remain");
   }
-  active_candidate_ = candidates_[candidate_index_];
-  has_active_candidate_ = true;
+  active_candidate_ = &candidates_[candidate_order_[candidate_index_]];
   ++candidate_index_;
-  return active_candidate_.command_velocity;
+  return active_candidate_->command_velocity;
 }
 
 dwb_msgs::msg::Trajectory2D
@@ -613,40 +675,61 @@ NativeInputTrajectoryGenerator::generateTrajectory(
   const nav_2d_msgs::msg::Twist2D & /*start_velocity*/,
   const nav_2d_msgs::msg::Twist2D & command_velocity)
 {
-  if (!has_active_candidate_) {
+  dwb_msgs::msg::Trajectory2D trajectory;
+  generate_trajectory_into(start_pose, command_velocity, trajectory);
+  return trajectory;
+}
+
+void NativeInputTrajectoryGenerator::generate_trajectory_into(
+  const geometry_msgs::msg::Pose2D & start_pose,
+  const nav_2d_msgs::msg::Twist2D & command_velocity,
+  dwb_msgs::msg::Trajectory2D & trajectory)
+{
+  if (active_candidate_ == nullptr) {
     throw dwb_core::IllegalTrajectoryException(
             "NativeInputDynamics",
             "generateTrajectory called without an active native-input candidate");
   }
 
-  dwb_msgs::msg::Trajectory2D trajectory;
   trajectory.velocity = command_velocity;
+  const std::vector<double> & time_steps = fixed_time_steps_;
+  trajectory.poses.clear();
+  trajectory.time_offsets.clear();
+  trajectory.poses.reserve(
+    time_steps.size() + (include_last_point_ ? 2u : 1u));
+  trajectory.time_offsets.reserve(
+    time_steps.size() + (include_last_point_ ? 1u : 0u));
   trajectory.poses.push_back(start_pose);
 
   geometry_msgs::msg::Pose2D pose = start_pose;
   double running_time = 0.0;
-  const std::vector<double> time_steps = getTimeSteps(command_velocity);
-  if (!active_candidate_.linear_rollout ||
-    !active_candidate_.angular_rollout ||
-    active_candidate_.linear_rollout->states.size() != time_steps.size() ||
-    active_candidate_.angular_rollout->states.size() != time_steps.size())
+  if (!active_candidate_->linear_rollout ||
+    !active_candidate_->angular_rollout ||
+    active_candidate_->linear_rollout->states.size() != time_steps.size() ||
+    active_candidate_->angular_rollout->states.size() != time_steps.size())
   {
     throw dwb_core::IllegalTrajectoryException(
             "NativeInputDynamics",
             "precomputed axis rollout does not match the trajectory horizon");
   }
+  const auto & angular_pose_steps =
+    angular_pose_integration_steps(
+    *active_candidate_->angular_rollout, start_pose.theta, time_steps);
   for (std::size_t step_index = 0;
     step_index < time_steps.size(); ++step_index)
   {
     const double time_step = time_steps[step_index];
+    const auto & angular_pose_step = angular_pose_steps[step_index];
 
-    nav_2d_msgs::msg::Twist2D velocity;
-    velocity.x =
-      active_candidate_.linear_rollout->states[step_index].velocity;
-    velocity.y = 0.0;
-    velocity.theta =
-      active_candidate_.angular_rollout->states[step_index].velocity;
-    pose = computeNewPosition(pose, velocity, time_step);
+    const double linear_velocity =
+      active_candidate_->linear_rollout->states[step_index].velocity;
+    pose.x = pose.x +
+      linear_velocity * angular_pose_step.heading_cosine *
+      time_step;
+    pose.y = pose.y +
+      linear_velocity * angular_pose_step.heading_sine *
+      time_step;
+    pose.theta = angular_pose_step.theta_after_step;
     trajectory.poses.push_back(pose);
     trajectory.time_offsets.push_back(
       rclcpp::Duration::from_seconds(running_time));
@@ -657,7 +740,99 @@ NativeInputTrajectoryGenerator::generateTrajectory(
     trajectory.time_offsets.push_back(
       rclcpp::Duration::from_seconds(running_time));
   }
-  return trajectory;
+}
+
+const std::vector<
+  NativeInputTrajectoryGenerator::AngularPoseIntegrationStep> &
+NativeInputTrajectoryGenerator::angular_pose_integration_steps(
+  const AxisRollout & angular_rollout,
+  const double start_theta,
+  const std::vector<double> & time_steps) const
+{
+  auto & cache = angular_rollout.pose_integration_cache;
+  // Time discretization is required by validate_parameters(), so every
+  // candidate in an iteration has the same time-step sequence.
+  if (cache.valid &&
+    cache.start_theta == start_theta &&
+    std::signbit(cache.start_theta) == std::signbit(start_theta) &&
+    cache.steps.size() == time_steps.size())
+  {
+    return cache.steps;
+  }
+
+  cache.valid = false;
+  cache.steps.clear();
+  cache.steps.reserve(time_steps.size());
+  double theta = start_theta;
+  for (std::size_t step_index = 0;
+    step_index < time_steps.size(); ++step_index)
+  {
+    AngularPoseIntegrationStep step;
+    step.heading_cosine = std::cos(theta);
+    step.heading_sine = std::sin(theta);
+    theta = theta +
+      angular_rollout.states[step_index].velocity *
+      time_steps[step_index];
+    step.theta_after_step = theta;
+    cache.steps.push_back(step);
+  }
+  cache.start_theta = start_theta;
+  cache.valid = true;
+  return cache.steps;
+}
+
+const std::vector<
+  NativeInputTrajectoryGenerator::AngularPoseIntegrationStep> &
+NativeInputTrajectoryGenerator::angular_stop_pose_integration_steps(
+  const AxisRollout & angular_rollout,
+  const AxisStopCache & angular_stop_cache,
+  const double start_theta,
+  const std::size_t stop_step_count) const
+{
+  auto & cache = angular_rollout.stop_pose_integration_cache;
+  if (!cache.valid ||
+    cache.start_theta != start_theta ||
+    std::signbit(cache.start_theta) != std::signbit(start_theta))
+  {
+    cache.valid = false;
+    cache.steps.clear();
+    cache.start_theta = start_theta;
+  }
+
+  const std::size_t delayed_step_count =
+    angular_stop_cache.delayed_states.size();
+  const std::size_t required_step_count =
+    delayed_step_count + stop_step_count;
+  double theta =
+    cache.steps.empty() ?
+    start_theta : cache.steps.back().theta_after_step;
+  cache.steps.reserve(required_step_count);
+  for (std::size_t step_index = cache.steps.size();
+    step_index < required_step_count; ++step_index)
+  {
+    double angular_velocity = 0.0;
+    if (step_index < delayed_step_count) {
+      angular_velocity =
+        angular_stop_cache.delayed_states[step_index].velocity;
+    } else {
+      const std::size_t stop_index =
+        step_index - delayed_step_count;
+      if (stop_index <
+        angular_stop_cache.stop_sequence.states.size())
+      {
+        angular_velocity =
+          angular_stop_cache.stop_sequence.states[stop_index].velocity;
+      }
+    }
+    AngularPoseIntegrationStep step;
+    step.heading_cosine = std::cos(theta);
+    step.heading_sine = std::sin(theta);
+    theta += angular_velocity * control_period_;
+    step.theta_after_step = theta;
+    cache.steps.push_back(step);
+  }
+  cache.valid = true;
+  return cache.steps;
 }
 
 bool NativeInputTrajectoryGenerator::generate_stop_trajectory(
@@ -668,12 +843,166 @@ bool NativeInputTrajectoryGenerator::generate_stop_trajectory(
   std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
   std::vector<NativeCommandState> * command_states)
 {
+  if (active_candidate_ == nullptr) {
+    poses.clear();
+    velocities.clear();
+    if (command_states) {
+      command_states->clear();
+    }
+    return false;
+  }
+  return generate_candidate_stop_trajectory(
+    *active_candidate_, start_pose, maximum_stop_steps,
+    stop_velocity_threshold, poses, &velocities, command_states);
+}
+
+bool NativeInputTrajectoryGenerator::generate_stop_trajectory_for_candidate(
+  const std::size_t canonical_index,
+  const geometry_msgs::msg::Pose2D & start_pose,
+  const int maximum_stop_steps,
+  const double stop_velocity_threshold,
+  std::vector<geometry_msgs::msg::Pose2D> & poses,
+  std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
+  std::vector<NativeCommandState> * command_states)
+{
+  if (canonical_index >= candidates_.size() ||
+    candidates_[canonical_index].canonical_index != canonical_index)
+  {
+    poses.clear();
+    velocities.clear();
+    if (command_states) {
+      command_states->clear();
+    }
+    return false;
+  }
+  return generate_candidate_stop_trajectory(
+    candidates_[canonical_index], start_pose, maximum_stop_steps,
+    stop_velocity_threshold, poses, &velocities, command_states);
+}
+
+bool NativeInputTrajectoryGenerator::generate_stop_poses(
+  const geometry_msgs::msg::Pose2D & start_pose,
+  const int maximum_stop_steps,
+  const double stop_velocity_threshold,
+  std::vector<geometry_msgs::msg::Pose2D> & poses)
+{
+  if (active_candidate_ == nullptr) {
+    poses.clear();
+    return false;
+  }
+  return generate_candidate_stop_trajectory(
+    *active_candidate_, start_pose, maximum_stop_steps,
+    stop_velocity_threshold, poses, nullptr, nullptr);
+}
+
+bool NativeInputTrajectoryGenerator::generate_stop_poses_for_candidate(
+  const std::size_t canonical_index,
+  const geometry_msgs::msg::Pose2D & start_pose,
+  const int maximum_stop_steps,
+  const double stop_velocity_threshold,
+  std::vector<geometry_msgs::msg::Pose2D> & poses)
+{
+  if (canonical_index >= candidates_.size() ||
+    candidates_[canonical_index].canonical_index != canonical_index)
+  {
+    poses.clear();
+    return false;
+  }
+  return generate_candidate_stop_trajectory(
+    candidates_[canonical_index], start_pose, maximum_stop_steps,
+    stop_velocity_threshold, poses, nullptr, nullptr);
+}
+
+const NativeInputTrajectoryGenerator::AxisStopCache &
+NativeInputTrajectoryGenerator::get_axis_stop_cache(
+  const AxisRollout & rollout,
+  const AxisState & initial_state,
+  const AxisLimits & limits,
+  const std::vector<double> & initial_fir_history,
+  const int rollout_step_count,
+  const int command_delay_steps,
+  const int maximum_stop_steps,
+  const double stop_velocity_threshold)
+{
+  AxisStopCache & cache = rollout.stop_cache;
+  if (cache.computed &&
+    cache.maximum_stop_steps == maximum_stop_steps &&
+    cache.stop_velocity_threshold == stop_velocity_threshold)
+  {
+    return cache;
+  }
+
+  rollout.stop_pose_integration_cache.valid = false;
+  rollout.stop_pose_integration_cache.steps.clear();
+  cache = AxisStopCache();
+  cache.computed = true;
+  cache.maximum_stop_steps = maximum_stop_steps;
+  cache.stop_velocity_threshold = stop_velocity_threshold;
+  cache.delayed_states.reserve(
+    static_cast<std::size_t>(command_delay_steps));
+
+  AxisState state = initial_state;
+  std::vector<double> fir_history = initial_fir_history;
+  for (int step_index = 0;
+    step_index < command_delay_steps; ++step_index)
+  {
+    bool feasible = false;
+    if (input_order_ == NativeInputOrder::kFir) {
+      feasible = apply_projected_fir_step_in_place(
+        state, limits, fir_coefficients_, fir_history,
+        rollout.native_input, control_period_);
+    } else {
+      const ProjectedAxisStep step =
+        project_axis(
+        state, limits, rollout.native_input, control_period_,
+        std::max(1, rollout_step_count - step_index));
+      feasible = step.feasible;
+      state = step.state;
+    }
+    if (!feasible) {
+      return cache;
+    }
+    cache.delayed_states.push_back(state);
+  }
+
+  if (input_order_ == NativeInputOrder::kAcceleration) {
+    cache.stop_sequence = generate_acceleration_stop_sequence(
+      state, limits, control_period_, maximum_stop_steps,
+      stop_velocity_threshold);
+  } else if (input_order_ == NativeInputOrder::kJerk) {
+    cache.stop_sequence = generate_jerk_stop_sequence(
+      state, limits, control_period_, maximum_stop_steps,
+      stop_velocity_threshold);
+  } else {
+    cache.stop_sequence = generate_fir_stop_sequence(
+      state, limits, fir_coefficients_, fir_history, control_period_,
+      maximum_stop_steps, stop_velocity_threshold, false,
+      &fir_stop_coefficient_response_);
+  }
+  cache.valid =
+    cache.stop_sequence.feasible &&
+    cache.stop_sequence.terminal_state_cleared;
+  return cache;
+}
+
+bool NativeInputTrajectoryGenerator::generate_candidate_stop_trajectory(
+  const Candidate & candidate,
+  const geometry_msgs::msg::Pose2D & start_pose,
+  const int maximum_stop_steps,
+  const double stop_velocity_threshold,
+  std::vector<geometry_msgs::msg::Pose2D> & poses,
+  std::vector<nav_2d_msgs::msg::Twist2D> * velocities,
+  std::vector<NativeCommandState> * command_states)
+{
   poses.clear();
-  velocities.clear();
+  if (velocities) {
+    velocities->clear();
+  }
   if (command_states) {
     command_states->clear();
   }
-  if (!has_active_candidate_ || maximum_stop_steps <= 0 ||
+  if (!candidate.linear_rollout || !candidate.angular_rollout ||
+    maximum_stop_steps <= 0 ||
     !std::isfinite(stop_velocity_threshold) ||
     stop_velocity_threshold <= 0.0)
   {
@@ -683,125 +1012,105 @@ bool NativeInputTrajectoryGenerator::generate_stop_trajectory(
   const AxisLimits linear_axis_limits = linear_limits();
   const AxisLimits angular_axis_limits = angular_limits();
   const AxisState initial_linear_state{
-    active_candidate_.initial_linear_velocity,
-    active_candidate_.initial_linear_acceleration};
+    iteration_initial_linear_velocity_,
+    iteration_initial_linear_acceleration_};
   const AxisState initial_angular_state{
-    active_candidate_.initial_angular_velocity,
-    active_candidate_.initial_angular_acceleration};
+    iteration_initial_angular_velocity_,
+    iteration_initial_angular_acceleration_};
   const int rollout_step_count =
     static_cast<int>(std::ceil(sim_time_ / time_granularity_));
   const int command_delay_steps = std::max(
     1, static_cast<int>(
       std::ceil(stop_command_delay_seconds_ / control_period_)));
-  AxisState delayed_linear_state = initial_linear_state;
-  AxisState delayed_angular_state = initial_angular_state;
-  std::vector<double> delayed_linear_fir_history =
-    active_candidate_.initial_linear_fir_history;
-  std::vector<double> delayed_angular_fir_history =
-    active_candidate_.initial_angular_fir_history;
-  std::vector<NativeCommandState> delayed_command_states;
-  delayed_command_states.reserve(
-    static_cast<std::size_t>(command_delay_steps));
-  for (int step_index = 0;
-    step_index < command_delay_steps; ++step_index)
-  {
-    ProjectedAxisStep linear_step;
-    ProjectedAxisStep angular_step;
-    if (input_order_ == NativeInputOrder::kFir) {
-      const ProjectedFirStep linear_fir_step =
-        apply_projected_fir_step(
-        delayed_linear_state, linear_axis_limits, fir_coefficients_,
-        delayed_linear_fir_history,
-        active_candidate_.linear_native_input, control_period_);
-      const ProjectedFirStep angular_fir_step =
-        apply_projected_fir_step(
-        delayed_angular_state, angular_axis_limits, fir_coefficients_,
-        delayed_angular_fir_history,
-        active_candidate_.angular_native_input, control_period_);
-      linear_step.state = linear_fir_step.state;
-      linear_step.feasible = linear_fir_step.feasible;
-      angular_step.state = angular_fir_step.state;
-      angular_step.feasible = angular_fir_step.feasible;
-      delayed_linear_fir_history = linear_fir_step.history;
-      delayed_angular_fir_history = angular_fir_step.history;
-    } else {
-      const int remaining_steps =
-        std::max(1, rollout_step_count - step_index);
-      linear_step = project_axis(
-        delayed_linear_state, linear_axis_limits,
-        active_candidate_.linear_native_input, control_period_,
-        remaining_steps);
-      angular_step = project_axis(
-        delayed_angular_state, angular_axis_limits,
-        active_candidate_.angular_native_input, control_period_,
-        remaining_steps);
-    }
-    if (!linear_step.feasible || !angular_step.feasible) {
-      return false;
-    }
-    delayed_linear_state = linear_step.state;
-    delayed_angular_state = angular_step.state;
-    NativeCommandState delayed_state;
-    delayed_state.command_velocity.x = delayed_linear_state.velocity;
-    delayed_state.command_velocity.theta =
-      delayed_angular_state.velocity;
-    delayed_state.linear_state = delayed_linear_state;
-    delayed_state.angular_state = delayed_angular_state;
-    delayed_state.linear_fir_history = delayed_linear_fir_history;
-    delayed_state.angular_fir_history = delayed_angular_fir_history;
-    delayed_state.valid = true;
-    delayed_command_states.push_back(std::move(delayed_state));
-  }
-
-  StopSequence linear_stop;
-  StopSequence angular_stop;
-  if (input_order_ == NativeInputOrder::kAcceleration) {
-    linear_stop = generate_acceleration_stop_sequence(
-      delayed_linear_state, linear_axis_limits, control_period_,
-      maximum_stop_steps, stop_velocity_threshold);
-    angular_stop = generate_acceleration_stop_sequence(
-      delayed_angular_state, angular_axis_limits, control_period_,
-      maximum_stop_steps, stop_velocity_threshold);
-  } else if (input_order_ == NativeInputOrder::kJerk) {
-    linear_stop = generate_jerk_stop_sequence(
-      delayed_linear_state, linear_axis_limits, control_period_,
-      maximum_stop_steps, stop_velocity_threshold);
-    angular_stop = generate_jerk_stop_sequence(
-      delayed_angular_state, angular_axis_limits, control_period_,
-      maximum_stop_steps, stop_velocity_threshold);
-  } else {
-    linear_stop = generate_fir_stop_sequence(
-      delayed_linear_state, linear_axis_limits, fir_coefficients_,
-      delayed_linear_fir_history, control_period_, maximum_stop_steps,
-      stop_velocity_threshold);
-    angular_stop = generate_fir_stop_sequence(
-      delayed_angular_state, angular_axis_limits, fir_coefficients_,
-      delayed_angular_fir_history, control_period_, maximum_stop_steps,
-      stop_velocity_threshold);
-  }
-  if (!linear_stop.feasible || !angular_stop.feasible ||
-    !linear_stop.terminal_state_cleared ||
-    !angular_stop.terminal_state_cleared)
+  const AxisStopCache & linear_cache =
+    get_axis_stop_cache(
+    *candidate.linear_rollout, initial_linear_state, linear_axis_limits,
+    iteration_initial_linear_fir_history_, rollout_step_count,
+    command_delay_steps, maximum_stop_steps, stop_velocity_threshold);
+  const AxisStopCache & angular_cache =
+    get_axis_stop_cache(
+    *candidate.angular_rollout, initial_angular_state, angular_axis_limits,
+    iteration_initial_angular_fir_history_, rollout_step_count,
+    command_delay_steps, maximum_stop_steps, stop_velocity_threshold);
+  if (!linear_cache.valid || !angular_cache.valid ||
+    linear_cache.delayed_states.size() !=
+    static_cast<std::size_t>(command_delay_steps) ||
+    angular_cache.delayed_states.size() !=
+    static_cast<std::size_t>(command_delay_steps))
   {
     return false;
   }
+  const StopSequence & linear_stop = linear_cache.stop_sequence;
+  const StopSequence & angular_stop = angular_cache.stop_sequence;
+
+  std::vector<double> linear_fir_history;
+  std::vector<double> angular_fir_history;
+  if (command_states && input_order_ == NativeInputOrder::kFir) {
+    linear_fir_history = iteration_initial_linear_fir_history_;
+    angular_fir_history = iteration_initial_angular_fir_history_;
+  }
 
   geometry_msgs::msg::Pose2D pose = start_pose;
-  poses.push_back(pose);
-  for (const NativeCommandState & delayed_state :
-    delayed_command_states)
+  const std::size_t stop_step_count =
+    std::max(linear_stop.states.size(), angular_stop.states.size());
+  const std::size_t trajectory_step_count =
+    linear_cache.delayed_states.size() + stop_step_count + 1u;
+  const auto & angular_pose_steps =
+    angular_stop_pose_integration_steps(
+    *candidate.angular_rollout, angular_cache, start_pose.theta,
+    stop_step_count);
+  if (angular_pose_steps.size() <
+    linear_cache.delayed_states.size() + stop_step_count)
   {
-    pose = computeNewPosition(
-      pose, delayed_state.command_velocity, control_period_);
-    velocities.push_back(delayed_state.command_velocity);
+    return false;
+  }
+  poses.reserve(trajectory_step_count + 1u);
+  if (velocities) {
+    velocities->reserve(trajectory_step_count);
+  }
+  if (command_states) {
+    command_states->reserve(trajectory_step_count);
+  }
+  poses.push_back(pose);
+  std::size_t pose_step_index = 0u;
+  for (std::size_t step_index = 0;
+    step_index < linear_cache.delayed_states.size(); ++step_index)
+  {
+    NativeCommandState delayed_state;
+    delayed_state.linear_state = linear_cache.delayed_states[step_index];
+    delayed_state.angular_state = angular_cache.delayed_states[step_index];
+    delayed_state.command_velocity.x =
+      delayed_state.linear_state.velocity;
+    delayed_state.command_velocity.theta =
+      delayed_state.angular_state.velocity;
+    if (command_states && input_order_ == NativeInputOrder::kFir) {
+      push_fir_input(
+        linear_fir_history, candidate.linear_native_input);
+      push_fir_input(
+        angular_fir_history, candidate.angular_native_input);
+      delayed_state.linear_fir_history = linear_fir_history;
+      delayed_state.angular_fir_history = angular_fir_history;
+    }
+    delayed_state.valid = true;
+    const AngularPoseIntegrationStep & angular_pose_step =
+      angular_pose_steps[pose_step_index];
+    pose.x +=
+      delayed_state.command_velocity.x *
+      angular_pose_step.heading_cosine * control_period_;
+    pose.y +=
+      delayed_state.command_velocity.x *
+      angular_pose_step.heading_sine * control_period_;
+    pose.theta = angular_pose_step.theta_after_step;
+    ++pose_step_index;
+    if (velocities) {
+      velocities->push_back(delayed_state.command_velocity);
+    }
     poses.push_back(pose);
     if (command_states) {
       command_states->push_back(delayed_state);
     }
   }
 
-  const std::size_t stop_step_count =
-    std::max(linear_stop.states.size(), angular_stop.states.size());
   for (std::size_t step_index = 0;
     step_index < stop_step_count; ++step_index)
   {
@@ -812,8 +1121,19 @@ bool NativeInputTrajectoryGenerator::generate_stop_trajectory(
     if (step_index < angular_stop.states.size()) {
       stop_velocity.theta = angular_stop.states[step_index].velocity;
     }
-    pose = computeNewPosition(pose, stop_velocity, control_period_);
-    velocities.push_back(stop_velocity);
+    const AngularPoseIntegrationStep & angular_pose_step =
+      angular_pose_steps[pose_step_index];
+    pose.x +=
+      stop_velocity.x *
+      angular_pose_step.heading_cosine * control_period_;
+    pose.y +=
+      stop_velocity.x *
+      angular_pose_step.heading_sine * control_period_;
+    pose.theta = angular_pose_step.theta_after_step;
+    ++pose_step_index;
+    if (velocities) {
+      velocities->push_back(stop_velocity);
+    }
     poses.push_back(pose);
     if (command_states) {
       NativeCommandState stop_state;
@@ -825,16 +1145,18 @@ bool NativeInputTrajectoryGenerator::generate_stop_trajectory(
         stop_state.angular_state = angular_stop.states[step_index];
       }
       if (input_order_ == NativeInputOrder::kFir) {
-        if (step_index < linear_stop.fir_histories.size()) {
-          stop_state.linear_fir_history =
-            linear_stop.fir_histories[step_index];
+        if (step_index < linear_stop.native_inputs.size()) {
+          push_fir_input(
+            linear_fir_history, linear_stop.native_inputs[step_index]);
+          stop_state.linear_fir_history = linear_fir_history;
         } else {
           stop_state.linear_fir_history.assign(
             fir_coefficients_.size() - 1u, 0.0);
         }
-        if (step_index < angular_stop.fir_histories.size()) {
-          stop_state.angular_fir_history =
-            angular_stop.fir_histories[step_index];
+        if (step_index < angular_stop.native_inputs.size()) {
+          push_fir_input(
+            angular_fir_history, angular_stop.native_inputs[step_index]);
+          stop_state.angular_fir_history = angular_fir_history;
         } else {
           stop_state.angular_fir_history.assign(
             fir_coefficients_.size() - 1u, 0.0);
@@ -845,7 +1167,9 @@ bool NativeInputTrajectoryGenerator::generate_stop_trajectory(
     }
   }
   nav_2d_msgs::msg::Twist2D zero_velocity;
-  velocities.push_back(zero_velocity);
+  if (velocities) {
+    velocities->push_back(zero_velocity);
+  }
   poses.push_back(pose);
   if (command_states) {
     NativeCommandState zero_state;

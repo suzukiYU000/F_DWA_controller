@@ -3,6 +3,7 @@ project(f_dwa_controller)
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
+find_package(angles REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(dwb_core REQUIRED)
@@ -44,10 +45,12 @@ add_library(${library_name} SHARED
   src/certified_dwb_local_planner.cpp
   src/dwa_controllers.cpp
   src/fir_input_dynamics.cpp
+  src/hysteresis_rotate_to_goal_critic.cpp
   src/native_input_dynamics.cpp
   src/native_input_trajectory_generator.cpp
   src/terminal_stop_dynamics.cpp
   src/trajectory_certifier.cpp
+  src/v_dwb_trajectory_generators.cpp
 )
 
 add_library(${transport_library_name} SHARED
@@ -77,6 +80,7 @@ target_include_directories(${transport_library_name}
 )
 
 ament_target_dependencies(${library_name}
+  angles
   dwb_core
   dwb_msgs
   dwb_plugins
@@ -112,16 +116,23 @@ pluginlib_export_plugin_description_file(nav2_core f_dwa_controller.xml)
 pluginlib_export_plugin_description_file(
   dwb_core f_dwa_trajectory_generators.xml
 )
+pluginlib_export_plugin_description_file(
+  dwb_core f_dwa_critics.xml
+)
 
 install(
   TARGETS
     ${library_name}
     ${transport_library_name}
-    command_delay_transport
   EXPORT export_${library_name}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
+)
+
+# ROS 2 launch resolves package executables from lib/${PROJECT_NAME}.
+install(
+  TARGETS command_delay_transport
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
 install(
@@ -171,6 +182,21 @@ if(BUILD_TESTING)
     target_include_directories(test_native_input_dynamics
       PRIVATE
         include
+    )
+  endif()
+
+  ament_add_gtest(test_hysteresis_rotate_to_goal_critic
+    test/test_hysteresis_rotate_to_goal_critic.cpp
+  )
+  if(TARGET test_hysteresis_rotate_to_goal_critic)
+    target_link_libraries(
+      test_hysteresis_rotate_to_goal_critic ${library_name}
+    )
+    ament_target_dependencies(test_hysteresis_rotate_to_goal_critic
+      dwb_core
+      nav2_costmap_2d
+      nav2_util
+      rclcpp
     )
   endif()
 
@@ -268,6 +294,7 @@ ament_export_include_directories(include)
 ament_export_libraries(${library_name} ${transport_library_name})
 ament_export_targets(export_${library_name} HAS_LIBRARY_TARGET)
 ament_export_dependencies(
+  angles
   builtin_interfaces
   diagnostic_msgs
   dwb_core

@@ -36,6 +36,13 @@ struct ProjectedFirStep
   bool feasible{false};
 };
 
+struct HeldFirAffineResponse
+{
+  FeasibleInterval input_interval;
+  std::vector<AxisState> free_states;
+  std::vector<AxisState> unit_states;
+};
+
 double fir_acceleration(
   const std::vector<double> & coefficients,
   const std::vector<double> & history,
@@ -44,6 +51,20 @@ double fir_acceleration(
 void push_fir_input(
   std::vector<double> & history,
   double native_input);
+
+HeldFirAffineResponse prepare_held_fir_affine_response(
+  const AxisState & state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history,
+  double time_step,
+  int remaining_steps);
+
+bool sample_held_fir_affine_response(
+  const HeldFirAffineResponse & response,
+  const AxisLimits & limits,
+  double held_native_input,
+  std::vector<AxisState> & states);
 
 FeasibleInterval held_fir_input_interval(
   const AxisState & state,
@@ -70,6 +91,16 @@ ProjectedFirStep apply_projected_fir_step(
   const AxisLimits & limits,
   const std::vector<double> & coefficients,
   const std::vector<double> & history,
+  double projected_native_input,
+  double time_step);
+
+// Hot-loop variant of apply_projected_fir_step. The FIR history is updated only
+// after a feasible step, avoiding two history copies per rollout sample.
+bool apply_projected_fir_step_in_place(
+  AxisState & state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  std::vector<double> & history,
   double projected_native_input,
   double time_step);
 

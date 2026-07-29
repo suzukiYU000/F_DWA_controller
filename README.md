@@ -6,6 +6,8 @@ DWA (A-DWA), jerk-constrained DWA (J-DWA), and FIR-constrained DWA (F-DWA).
 The package derives from Nav2 `dwb_core::DWBLocalPlanner` so that plan handling,
 trajectory critics, costmap access, lifecycle behavior, and controller-server
 integration remain common across the compared methods.
+Research-specific goal-window hysteresis and 10 Hz evaluation throttling are
+implemented in this package. The pinned Navigation2 source remains unmodified.
 
 ## Current status
 
@@ -65,21 +67,23 @@ old FollowPath action, then pause and reset the simulated robot. Call these
 services in order:
 
 ```text
-/command_delay_transport/reset_trial_state
 /controller_server/FollowPath/reset_trial_state
+/command_delay_transport/reset_trial_state
 ```
 
 Both use `std_srvs/srv/Trigger`. The controller reset clears the current
 candidates, retained stop backup, critic state, global path, and A/J/F native
 state, while retaining the configured FIR coefficients. The transport reset
-clears its FIFO, last applied command and sequence, restores transport validity,
-reseeds the delay generator from its current `random_seed` parameter, and
-immediately publishes a zero applied command. Submit the next saved Path only
-after both calls succeed.
+service schedules its FIFO, last-applied command, sequence, validity, and random
+generator reset for the next command Timer tick. At that boundary it publishes
+the robot-facing zero, applied zero, no-sequence reset dispatch, valid=true, and
+stopped=true together. Service success means "scheduled"; wait for those fresh
+Timer-boundary states before resetting the Gazebo pose or submitting the next
+saved Path.
 
-The order is intentional. The Controller reset is last and establishes the
-A/J/F applied state as a known zero, avoiding a race between the transport's
-zero publication and the first control cycle of the next FollowPath action.
+The order is intentional. The Controller ledger is cleared before the
+transport establishes the next applied-state epoch, avoiding a stale reset
+dispatch being interpreted as part of the previous ledger.
 Calling the Controller reset while the old action or robot is still moving
 violates this trial-boundary precondition.
 

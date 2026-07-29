@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<library path="f_dwa_controller_core">
+  <class
+    type="f_dwa_controller::HysteresisRotateToGoalCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Rotate-to-goal critic with a configurable outer release window for
+      delayed-command recovery.
+    </description>
+  </class>
+</library>

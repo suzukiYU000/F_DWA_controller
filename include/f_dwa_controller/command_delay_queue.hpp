@@ -26,6 +26,7 @@
 #include <deque>
 #include <optional>
 #include <random>
+#include <vector>
 
 #include "geometry_msgs/msg/twist.hpp"
 #include "rclcpp/time.hpp"
@@ -49,7 +50,9 @@ struct CommandDelayParameters
   double mean_delay_ms{70.0};
   double delay_stddev_ms{3.333333333333333};
   double zero_threshold{0.0};
-  std::size_t max_queue_depth{4};
+  // Three bounded-delay entries, one normal callback-order entry, and one
+  // delayed-timer scheduling slot. A further backlog is transport_invalid.
+  std::size_t max_queue_depth{5};
   uint64_t random_seed{0};
 };
 
@@ -66,6 +69,7 @@ public:
   [[nodiscard]] std::size_t size() const;
   [[nodiscard]] bool empty() const;
   [[nodiscard]] const DelayedCommand * front() const;
+  [[nodiscard]] std::vector<DelayedCommand> snapshot() const;
   [[nodiscard]] uint64_t next_sequence() const;
 
   void clear();

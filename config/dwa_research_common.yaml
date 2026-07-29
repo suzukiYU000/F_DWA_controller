@@ -2,12 +2,23 @@ controller_server:
   ros__parameters:
     controller_frequency: 33.333333333333333
     enable_stamped_cmd_vel: false
+    odom_topic: "/whill/odom"
+    # Keep Nav2 Controller Server unmodified. The robot-facing transport owns
+    # the 33.333 Hz Timer, rejects producer catch-up intervals below 30 ms,
+    # and the experiment runner validates FIFO-empty/applied-zero after the
+    # standard FollowPath result.
+    publish_zero_velocity: true
     controller_plugins: ["FollowPath"]
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
     FollowPath:
       debug_trajectory_details: true
+      # Enter DWB's rotate-only phase inside the 0.25 m GoalChecker window.
+      # This leaves room to restore translation after actuator-delay drift
+      # without relaxing the pose accepted as goal success.
+      xy_goal_tolerance: 0.20
+      trans_stopped_velocity: 0.01
       min_vel_x: 0.0
       min_vel_y: 0.0
       max_vel_x: 1.2  # 0.6 for the initial real-robot limit
@@ -37,9 +48,12 @@ controller_server:
       # knowledge of the internal motor actuation instant.
       command_dispatch_topic: "/controller/command_dispatch"
       transport_valid_topic: "/dwa_experiment/transport_valid"
+      transport_invalidation_service: "/command_delay_transport/invalidate_trial"
       require_command_dispatch_state: true
       certification_control_period: 0.03
       terminal_stop_maximum_time: 8.0
+      # The same capture magnitude applies to internally tracked acceleration
+      # and F-DWA raw-input history before terminal state is cleared.
       terminal_stop_velocity_threshold: 0.01
       stop_capture_velocity: 0.01
       # Certification rounds this upward to complete 30 ms command ticks
@@ -59,20 +73,35 @@ controller_server:
       # All configured critic scores are non-negative. This only skips critic
       # work for candidates that cannot beat the best certified candidate.
       short_circuit_trajectory_evaluation: true
+      # Keep canonical candidate order for the primary fair comparison.
+      prefer_previous_selected_candidate: false
+      # prefer_previous_selected_candidate: true  # performance-only ablation
       planning_metrics_enabled: true
       planning_metrics_report_interval: 1000
       planning_deadline_seconds: 0.03
+      # Candidate evaluation is diagnostic output, not a control input.
+      # Recording at 10 Hz preserves animation detail without serializing a
+      # roughly 330 KiB evaluation message on every 30 ms control tick.
+      publish_evaluation: true
+      evaluation_publish_frequency: 10.0
+      publish_trajectories: false
       stateful: true
       critics:
         - RotateToGoal
         - Oscillation
-        - ObstacleFootprint
         - GoalAlign
         - PathAlign
         - PathDist
         - GoalDist
+        # All earlier critic costs are non-negative. Expensive swept-footprint
+        # scoring last lets the existing best-score short circuit reject most
+        # noncompetitive candidates without changing the selected optimum.
+        - ObstacleFootprint
       ObstacleFootprint.scale: 0.10
-      ObstacleFootprint.sum_scores: true
+      # Every pose is still checked for lethal/unknown cost. Keep the upstream
+      # endpoint-score behavior so a longer rollout does not multiply soft
+      # inflation cost and make stopping artificially preferable.
+      ObstacleFootprint.sum_scores: false
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.325
       GoalAlign.scale: 24.0
@@ -80,8 +109,16 @@ controller_server:
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
       RotateToGoal.scale: 32.0
+      RotateToGoal.class: "f_dwa_controller::HysteresisRotateToGoalCritic"
       RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
+      # Keep 0.03 m hysteresis against localization noise, but restore
+      # translation at 0.23 m, before the 0.25 m GoalChecker boundary.
+      # Set to -1.0 for the upstream Nav2 permanently latched behavior.
+      RotateToGoal.xy_goal_tolerance_release_margin: 0.03
+      # Score terminal-heading progress at the 1.25 s evaluation horizon.
+      # The full 2.4 s rollout and the recursively feasible stop certificate
+      # remain unchanged.
+      RotateToGoal.lookahead_time: 1.25
 
 velocity_smoother:
   ros__parameters:
@@ -108,12 +145,16 @@ local_costmap:
   local_costmap:
     ros__parameters:
       resolution: 0.05
-      width: 10.0
-      height: 10.0
+      width: 10
+      height: 10
       # Rectangle is the default research footprint. The 0.10 m padding is
       # the planning margin and is not treated as physical contact.
       footprint: "[[-0.2, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.2, 0.3]]"
       footprint_padding: 0.10
+      inflation_layer:
+        # Covers the padded rectangle's 0.984886 m circumscribed radius, so
+        # footprint collision checks cannot be skipped from a free center cell.
+        inflation_radius: 1.0
 
 global_costmap:
   global_costmap:
@@ -121,3 +162,5 @@ global_costmap:
       resolution: 0.05
       footprint: "[[-0.2, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.2, 0.3]]"
       footprint_padding: 0.10
+      inflation_layer:
+        inflation_radius: 1.0

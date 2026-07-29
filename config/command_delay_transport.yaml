@@ -6,9 +6,15 @@ command_delay_transport:
     applied_topic: "/controller/applied_cmd_vel"
     dispatch_topic: "/controller/command_dispatch"
     transport_valid_topic: "/dwa_experiment/transport_valid"
+    transport_stopped_topic: "/dwa_experiment/transport_stopped"
     diagnostics_topic: "/diagnostics"
     reset_trial_service_name: "~/reset_trial_state"
+    invalidate_trial_service_name: "~/invalidate_trial"
     publish_frequency_hz: 33.333333333333333
+    # Any Controller Server catch-up burst invalidates the run instead of
+    # silently changing the compared controller's command sequence.
+    minimum_input_interval_ms: 30.0
+    stopped_velocity_threshold: 0.01
     min_delay_ms: 60.0
     max_delay_ms: 80.0
     mean_delay_ms: 70.0
@@ -16,5 +22,7 @@ command_delay_transport:
     # Keep command quantization separate from the 0.01 m/s stop-capture tube.
     # F-8's first valid increment is smaller than 0.01 m/s.
     command_zero_threshold: 0.0
-    max_queue_depth: 4
+    # ceil(80/30)=3 delayed commands, one normal arrival-before-timer slot,
+    # and one delayed-timer scheduling slot. Further growth is invalid.
+    max_queue_depth: 5
     random_seed: 0

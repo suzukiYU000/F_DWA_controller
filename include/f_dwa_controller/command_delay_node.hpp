@@ -21,9 +21,12 @@
 #ifndef F_DWA_CONTROLLER__COMMAND_DELAY_NODE_HPP_
 #define F_DWA_CONTROLLER__COMMAND_DELAY_NODE_HPP_
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
 #include "f_dwa_controller/command_delay_queue.hpp"
@@ -47,14 +50,23 @@ private:
   void reset_trial_callback(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
-  void invalidate_transport(const rclcpp::Time & detected_at);
+  void invalidate_trial_callback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  [[nodiscard]] bool observe_time_locked(const rclcpp::Time & observed_at);
+  void invalidate_transport(
+    const rclcpp::Time & detected_at,
+    const std::string & reason);
   void publish_transport_valid(bool is_valid);
+  void publish_transport_stopped(bool is_stopped);
+  [[nodiscard]] bool is_transport_stopped_locked() const;
   void publish_diagnostic(
     uint8_t level,
     const std::string & message,
     const rclcpp::Time & stamp,
     std::size_t queue_depth,
-    uint64_t next_sequence);
+    uint64_t next_sequence,
+    const std::vector<DelayedCommand> & queued_commands);
 
   std::mutex mutex_;
   std::unique_ptr<CommandDelayQueue> delay_queue_;
@@ -62,6 +74,18 @@ private:
   uint64_t last_applied_sequence_{0};
   bool has_applied_sequence_{false};
   bool transport_valid_{true};
+  bool reset_publication_pending_{false};
+  uint64_t pending_reset_seed_{0};
+  std::chrono::steady_clock::time_point pending_reset_requested_at_;
+  double stopped_velocity_threshold_{0.01};
+  double minimum_input_interval_seconds_{0.0};
+  int64_t publish_period_nanoseconds_{30000000};
+  rclcpp::Time last_robot_publish_time_{0, 0, RCL_ROS_TIME};
+  bool has_robot_publish_time_{false};
+  rclcpp::Time last_observed_time_{0, 0, RCL_ROS_TIME};
+  bool has_observed_time_{false};
+  rclcpp::Time last_command_received_time_{0, 0, RCL_ROS_TIME};
+  bool has_command_received_time_{false};
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_subscriber_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr command_publisher_;
@@ -69,8 +93,10 @@ private:
   rclcpp::Publisher<f_dwa_controller::msg::CommandDispatch>::SharedPtr
     command_dispatch_publisher_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr transport_valid_publisher_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr transport_stopped_publisher_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_trial_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr invalidate_trial_service_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
 };
 

@@ -34,6 +34,7 @@
 #include "f_dwa_controller/msg/command_dispatch.hpp"
 #include "f_dwa_controller/native_input_dynamics.hpp"
 #include "f_dwa_controller/planning_snapshot.hpp"
+#include "f_dwa_controller/terminal_stop_dynamics.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 namespace f_dwa_controller
@@ -77,6 +78,8 @@ public:
     const f_dwa_controller::msg::CommandDispatch & dispatch);
   [[nodiscard]] std::optional<NativeCommandState>
   active_candidate_command_state() const;
+  [[nodiscard]] std::optional<std::size_t>
+  active_candidate_canonical_index() const;
   void select_command_for_dispatch(
     const std::optional<NativeCommandState> & command_state);
   void commit_selected_command(
@@ -90,6 +93,10 @@ public:
     const geometry_msgs::msg::Pose2D & start_pose,
     const nav_2d_msgs::msg::Twist2D & start_velocity,
     const nav_2d_msgs::msg::Twist2D & command_velocity) override;
+  void generate_trajectory_into(
+    const geometry_msgs::msg::Pose2D & start_pose,
+    const nav_2d_msgs::msg::Twist2D & command_velocity,
+    dwb_msgs::msg::Trajectory2D & trajectory);
   bool generate_stop_trajectory(
     const geometry_msgs::msg::Pose2D & start_pose,
     int maximum_stop_steps,
@@ -97,27 +104,68 @@ public:
     std::vector<geometry_msgs::msg::Pose2D> & poses,
     std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
     std::vector<NativeCommandState> * command_states = nullptr);
+  bool generate_stop_trajectory_for_candidate(
+    std::size_t canonical_index,
+    const geometry_msgs::msg::Pose2D & start_pose,
+    int maximum_stop_steps,
+    double stop_velocity_threshold,
+    std::vector<geometry_msgs::msg::Pose2D> & poses,
+    std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
+    std::vector<NativeCommandState> * command_states = nullptr);
+  bool generate_stop_poses(
+    const geometry_msgs::msg::Pose2D & start_pose,
+    int maximum_stop_steps,
+    double stop_velocity_threshold,
+    std::vector<geometry_msgs::msg::Pose2D> & poses);
+  bool generate_stop_poses_for_candidate(
+    std::size_t canonical_index,
+    const geometry_msgs::msg::Pose2D & start_pose,
+    int maximum_stop_steps,
+    double stop_velocity_threshold,
+    std::vector<geometry_msgs::msg::Pose2D> & poses);
 
 protected:
+  struct AxisStopCache
+  {
+    int maximum_stop_steps{0};
+    double stop_velocity_threshold{0.0};
+    std::vector<AxisState> delayed_states;
+    StopSequence stop_sequence;
+    bool computed{false};
+    bool valid{false};
+  };
+
+  struct AngularPoseIntegrationStep
+  {
+    double heading_cosine{0.0};
+    double heading_sine{0.0};
+    double theta_after_step{0.0};
+  };
+
+  struct AngularPoseIntegrationCache
+  {
+    double start_theta{0.0};
+    std::vector<AngularPoseIntegrationStep> steps;
+    bool valid{false};
+  };
+
   struct AxisRollout
   {
     std::vector<AxisState> states;
-    std::vector<std::vector<double>> fir_histories;
+    std::vector<double> first_fir_history;
     double native_input{0.0};
     bool valid{false};
+    mutable AxisStopCache stop_cache;
+    mutable AngularPoseIntegrationCache pose_integration_cache;
+    mutable AngularPoseIntegrationCache stop_pose_integration_cache;
   };
 
   struct Candidate
   {
+    std::size_t canonical_index{0};
     nav_2d_msgs::msg::Twist2D command_velocity;
     double linear_native_input{0.0};
     double angular_native_input{0.0};
-    double initial_linear_velocity{0.0};
-    double initial_angular_velocity{0.0};
-    double initial_linear_acceleration{0.0};
-    double initial_angular_acceleration{0.0};
-    std::vector<double> initial_linear_fir_history;
-    std::vector<double> initial_angular_fir_history;
     NativeCommandState first_command_state;
     std::shared_ptr<const AxisRollout> linear_rollout;
     std::shared_ptr<const AxisRollout> angular_rollout;
@@ -144,6 +192,34 @@ private:
   AxisLimits linear_limits() const;
   AxisLimits angular_limits() const;
   void validate_parameters() const;
+  const std::vector<AngularPoseIntegrationStep> &
+  angular_pose_integration_steps(
+    const AxisRollout & angular_rollout,
+    double start_theta,
+    const std::vector<double> & time_steps) const;
+  const std::vector<AngularPoseIntegrationStep> &
+  angular_stop_pose_integration_steps(
+    const AxisRollout & angular_rollout,
+    const AxisStopCache & angular_stop_cache,
+    double start_theta,
+    std::size_t stop_step_count) const;
+  const AxisStopCache & get_axis_stop_cache(
+    const AxisRollout & rollout,
+    const AxisState & initial_state,
+    const AxisLimits & limits,
+    const std::vector<double> & initial_fir_history,
+    int rollout_step_count,
+    int command_delay_steps,
+    int maximum_stop_steps,
+    double stop_velocity_threshold);
+  bool generate_candidate_stop_trajectory(
+    const Candidate & candidate,
+    const geometry_msgs::msg::Pose2D & start_pose,
+    int maximum_stop_steps,
+    double stop_velocity_threshold,
+    std::vector<geometry_msgs::msg::Pose2D> & poses,
+    std::vector<nav_2d_msgs::msg::Twist2D> * velocities,
+    std::vector<NativeCommandState> * command_states);
 
   NativeInputOrder input_order_;
   std::string plugin_name_;
@@ -158,20 +234,30 @@ private:
   int angular_samples_{11};
   bool fir_coefficients_generated_{false};
   bool require_applied_command_state_{false};
+  bool prefer_previous_selected_candidate_{false};
+  std::vector<double> fixed_time_steps_;
 
   std::vector<Candidate> candidates_;
+  std::vector<std::size_t> candidate_order_;
   std::size_t candidate_index_{0};
-  Candidate active_candidate_;
-  bool has_active_candidate_{false};
+  const Candidate * active_candidate_{nullptr};
+  double iteration_initial_linear_velocity_{0.0};
+  double iteration_initial_angular_velocity_{0.0};
+  double iteration_initial_linear_acceleration_{0.0};
+  double iteration_initial_angular_acceleration_{0.0};
+  std::vector<double> iteration_initial_linear_fir_history_;
+  std::vector<double> iteration_initial_angular_fir_history_;
 
   mutable std::mutex applied_command_mutex_;
   nav_2d_msgs::msg::Twist2D latest_applied_command_;
   rclcpp::Time applied_dispatch_time_;
   NativeCommandState applied_native_state_;
   std::vector<double> fir_coefficients_;
+  FirStopCoefficientResponse fir_stop_coefficient_response_;
   bool applied_command_state_ready_{false};
   std::deque<PendingNativeCommand> pending_native_commands_;
   std::optional<NativeCommandState> selected_command_state_;
+  std::optional<nav_2d_msgs::msg::Twist2D> previous_selected_velocity_;
   std::shared_ptr<const PlanningSnapshot> planning_snapshot_;
 };
 

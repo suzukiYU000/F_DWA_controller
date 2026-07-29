@@ -20,6 +20,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <random>
 #include <vector>
 
 #include "f_dwa_controller/trajectory_certifier.hpp"
@@ -43,6 +45,15 @@ std::vector<geometry_msgs::msg::Point> rectangle_footprint()
   footprint[3].x = -0.5;
   footprint[3].y = 0.3;
   return footprint;
+}
+
+void expect_same_certification(
+  const CertificationResult & reference,
+  const CertificationResult & broadphase)
+{
+  EXPECT_EQ(broadphase.safe, reference.safe);
+  EXPECT_EQ(broadphase.failure, reference.failure);
+  EXPECT_EQ(broadphase.checked_pose_count, reference.checked_pose_count);
 }
 
 }  // namespace
@@ -72,12 +83,45 @@ TEST(TrajectoryCertifier, RejectsObstacleInsideFootprintInterior)
     obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
   std::vector<geometry_msgs::msg::Pose2D> poses(1);
 
-  const CertificationResult result =
+  const CertificationResult reference =
     certify_pose_sequence(
     costmap, rectangle_footprint(), poses, 0.025);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  const CertificationResult broadphase =
+    certify_pose_sequence(
+    costmap, rectangle_footprint(), poses, 0.025, &workspace);
 
-  EXPECT_FALSE(result.safe);
-  EXPECT_EQ(result.failure, CertificationFailure::kLethalObstacle);
+  expect_same_certification(reference, broadphase);
+  EXPECT_FALSE(broadphase.safe);
+  EXPECT_EQ(
+    broadphase.failure, CertificationFailure::kLethalObstacle);
+}
+
+TEST(TrajectoryCertifier, RejectsObstacleCrossingSweptBoundary)
+{
+  nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
+  unsigned int obstacle_x = 0;
+  unsigned int obstacle_y = 0;
+  ASSERT_TRUE(costmap.worldToMap(0.75, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  std::vector<geometry_msgs::msg::Pose2D> poses(2);
+  poses[1].x = 1.0;
+
+  const CertificationResult reference =
+    certify_pose_sequence(
+    costmap, rectangle_footprint(), poses, 0.025);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  const CertificationResult broadphase =
+    certify_pose_sequence(
+    costmap, rectangle_footprint(), poses, 0.025, &workspace);
+
+  expect_same_certification(reference, broadphase);
+  EXPECT_FALSE(broadphase.safe);
+  EXPECT_EQ(
+    broadphase.failure, CertificationFailure::kLethalObstacle);
 }
 
 TEST(TrajectoryCertifier, RejectsUnknownAndOffCostmap)
@@ -101,6 +145,281 @@ TEST(TrajectoryCertifier, RejectsUnknownAndOffCostmap)
     costmap, rectangle_footprint(), poses, 0.025);
   EXPECT_FALSE(result.safe);
   EXPECT_EQ(result.failure, CertificationFailure::kOffCostmap);
+}
+
+TEST(TrajectoryCertifier, ReusedWorkspacePreservesCertificationResult)
+{
+  nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].x = 0.15;
+  poses[1].theta = 0.12;
+  poses[2].x = 0.35;
+  poses[2].theta = 0.25;
+  const std::vector<geometry_msgs::msg::Point> footprint =
+    rectangle_footprint();
+  const CertificationResult expected =
+    certify_pose_sequence(costmap, footprint, poses, 0.025);
+  CertificationWorkspace workspace;
+
+  const CertificationResult first =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+  const CertificationResult second =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+
+  EXPECT_EQ(first.safe, expected.safe);
+  EXPECT_EQ(first.failure, expected.failure);
+  EXPECT_EQ(first.checked_pose_count, expected.checked_pose_count);
+  EXPECT_EQ(second.safe, expected.safe);
+  EXPECT_EQ(second.failure, expected.failure);
+  EXPECT_EQ(second.checked_pose_count, expected.checked_pose_count);
+}
+
+TEST(TrajectoryCertifier, WholeSequenceBroadphasePreservesDensifiedResult)
+{
+  nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
+  const std::vector<geometry_msgs::msg::Point> footprint =
+    rectangle_footprint();
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].x = 0.15;
+  poses[1].y = 0.05;
+  poses[1].theta = 0.20;
+  poses[2].x = 0.35;
+  poses[2].y = 0.12;
+  poses[2].theta = 0.45;
+
+  const CertificationResult reference =
+    certify_pose_sequence(costmap, footprint, poses, 0.025);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  const CertificationResult broadphase =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+
+  expect_same_certification(reference, broadphase);
+  EXPECT_TRUE(broadphase.safe);
+  EXPECT_GT(broadphase.checked_pose_count, poses.size());
+}
+
+TEST(TrajectoryCertifier, CircleBoundOffMapFallsBackToExactRectangle)
+{
+  nav2_costmap_2d::Costmap2D costmap(80, 16, 0.05, -2.0, -0.4);
+  const std::vector<geometry_msgs::msg::Point> footprint =
+    rectangle_footprint();
+  const std::vector<geometry_msgs::msg::Pose2D> poses(1);
+
+  const CertificationResult reference =
+    certify_pose_sequence(costmap, footprint, poses, 0.025);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  const CertificationResult broadphase =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+
+  expect_same_certification(reference, broadphase);
+  EXPECT_TRUE(broadphase.safe);
+}
+
+TEST(TrajectoryCertifier, SequenceBoundHazardOutsideSweepUsesExactFallback)
+{
+  nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
+  const std::vector<geometry_msgs::msg::Point> footprint =
+    rectangle_footprint();
+  std::vector<geometry_msgs::msg::Pose2D> poses(2);
+  poses[1].x = 0.2;
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.1, 0.55, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const CertificationResult reference =
+    certify_pose_sequence(costmap, footprint, poses, 0.025);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  const CertificationResult broadphase =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+
+  expect_same_certification(reference, broadphase);
+  EXPECT_TRUE(broadphase.safe);
+}
+
+TEST(TrajectoryCertifier, ExactBroadphasePreservesFallbackAndInflation)
+{
+  nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
+  const std::vector<geometry_msgs::msg::Point> footprint =
+    rectangle_footprint();
+  std::vector<geometry_msgs::msg::Pose2D> poses(1);
+  poses.front().theta = 0.25 * std::acos(-1.0);
+  unsigned int map_x = 0;
+  unsigned int map_y = 0;
+
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.0, map_x, map_y));
+  costmap.setCost(
+    map_x, map_y, nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  const CertificationResult inflation_reference =
+    certify_pose_sequence(costmap, footprint, poses, 0.025);
+  const CertificationResult inflation_broadphase =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+  expect_same_certification(
+    inflation_reference, inflation_broadphase);
+  EXPECT_TRUE(inflation_broadphase.safe);
+
+  // This lethal cell is inside the rotated footprint's map AABB but outside
+  // the polygon. The broadphase must fall back to the exact full fill rather
+  // than rejecting from the AABB alone.
+  ASSERT_TRUE(costmap.worldToMap(0.5, 0.5, map_x, map_y));
+  costmap.setCost(
+    map_x, map_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  const CertificationResult fallback_reference =
+    certify_pose_sequence(costmap, footprint, poses, 0.025);
+  const CertificationResult fallback_broadphase =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+  expect_same_certification(
+    fallback_reference, fallback_broadphase);
+  EXPECT_TRUE(fallback_broadphase.safe);
+}
+
+TEST(TrajectoryCertifier, ExactBroadphaseMatchesRandomCostmaps)
+{
+  constexpr double kResolution = 0.05;
+  const std::vector<geometry_msgs::msg::Point> footprint =
+    rectangle_footprint();
+  std::mt19937 generator(20260728u);
+  std::uniform_int_distribution<unsigned int> cell_distribution(0u, 79u);
+  std::uniform_int_distribution<int> cost_distribution(0, 3);
+  std::uniform_real_distribution<double> position_distribution(-1.2, 1.2);
+  std::uniform_real_distribution<double> angle_distribution(
+    -std::acos(-1.0), std::acos(-1.0));
+
+  for (int trial_index = 0; trial_index < 200; ++trial_index) {
+    nav2_costmap_2d::Costmap2D costmap(
+      80, 80, kResolution, -2.0, -2.0);
+    for (int cell_index = 0; cell_index < 16; ++cell_index) {
+      const int selection = cost_distribution(generator);
+      unsigned char cost = nav2_costmap_2d::FREE_SPACE;
+      if (selection == 1) {
+        cost = nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE;
+      } else if (selection == 2) {
+        cost = nav2_costmap_2d::LETHAL_OBSTACLE;
+      } else if (selection == 3) {
+        cost = nav2_costmap_2d::NO_INFORMATION;
+      }
+      costmap.setCost(
+        cell_distribution(generator),
+        cell_distribution(generator), cost);
+    }
+    std::vector<geometry_msgs::msg::Pose2D> poses(3);
+    for (geometry_msgs::msg::Pose2D & pose : poses) {
+      pose.x = position_distribution(generator);
+      pose.y = position_distribution(generator);
+      pose.theta = angle_distribution(generator);
+    }
+
+    const CertificationResult reference =
+      certify_pose_sequence(costmap, footprint, poses, 0.025);
+    CertificationWorkspace workspace;
+    ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+    const CertificationResult broadphase =
+      certify_pose_sequence(
+      costmap, footprint, poses, 0.025, &workspace);
+
+    SCOPED_TRACE(trial_index);
+    expect_same_certification(reference, broadphase);
+  }
+}
+
+TEST(TrajectoryCertifier, StaleBroadphaseFallsBackAfterOriginChange)
+{
+  nav2_costmap_2d::Costmap2D costmap(80, 80, 0.05, -2.0, -2.0);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  costmap.updateOrigin(-1.5, -1.5);
+  std::vector<geometry_msgs::msg::Pose2D> poses(2);
+  poses[1].x = 0.1;
+  poses[1].theta = 0.1;
+  const std::vector<geometry_msgs::msg::Point> footprint =
+    rectangle_footprint();
+
+  const CertificationResult reference =
+    certify_pose_sequence(costmap, footprint, poses, 0.025);
+  const CertificationResult stale_workspace =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+
+  expect_same_certification(reference, stale_workspace);
+}
+
+TEST(TrajectoryCertifier, ReusedBroadphaseAllocationMatchesCostmapUpdates)
+{
+  nav2_costmap_2d::Costmap2D costmap(80, 80, 0.05, -2.0, -2.0);
+  const std::vector<geometry_msgs::msg::Point> footprint =
+    rectangle_footprint();
+  const std::vector<geometry_msgs::msg::Pose2D> poses(1);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  const std::size_t * const allocation =
+    workspace.hazard_prefix_sum.data();
+
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  EXPECT_EQ(workspace.hazard_prefix_sum.data(), allocation);
+  expect_same_certification(
+    certify_pose_sequence(costmap, footprint, poses, 0.025),
+    certify_pose_sequence(
+      costmap, footprint, poses, 0.025, &workspace));
+
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::FREE_SPACE);
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  EXPECT_EQ(workspace.hazard_prefix_sum.data(), allocation);
+  const CertificationResult reference =
+    certify_pose_sequence(costmap, footprint, poses, 0.025);
+  const CertificationResult reused =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+  expect_same_certification(reference, reused);
+  EXPECT_TRUE(reused.safe);
+}
+
+TEST(TrajectoryCertifier, MalformedBroadphaseFallsBackToExactCheck)
+{
+  nav2_costmap_2d::Costmap2D costmap(80, 80, 0.05, -2.0, -2.0);
+  unsigned int obstacle_x = 0;
+  unsigned int obstacle_y = 0;
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  const std::vector<geometry_msgs::msg::Point> footprint =
+    rectangle_footprint();
+  const std::vector<geometry_msgs::msg::Pose2D> poses(1);
+  const CertificationResult reference =
+    certify_pose_sequence(costmap, footprint, poses, 0.025);
+
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  ASSERT_FALSE(workspace.hazard_prefix_sum.empty());
+  workspace.hazard_prefix_sum.pop_back();
+  const CertificationResult malformed_workspace =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+
+  expect_same_certification(reference, malformed_workspace);
+  EXPECT_FALSE(malformed_workspace.safe);
+  EXPECT_EQ(
+    malformed_workspace.failure,
+    CertificationFailure::kLethalObstacle);
 }
 
 }  // namespace f_dwa_controller

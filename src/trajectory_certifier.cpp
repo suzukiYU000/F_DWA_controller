@@ -22,6 +22,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <limits>
 #include <vector>
 
 #include "nav2_costmap_2d/cost_values.hpp"
@@ -32,15 +34,74 @@ namespace f_dwa_controller
 namespace
 {
 
+bool query_hazard_count(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  const CertificationWorkspace & workspace,
+  const unsigned int minimum_x,
+  const unsigned int minimum_y,
+  const unsigned int maximum_x,
+  const unsigned int maximum_y,
+  std::size_t & hazard_count)
+{
+  const std::size_t size_x = costmap.getSizeInCellsX();
+  const std::size_t size_y = costmap.getSizeInCellsY();
+  if (size_x == 0u || size_y == 0u ||
+    minimum_x > maximum_x || minimum_y > maximum_y ||
+    maximum_x >= size_x || maximum_y >= size_y ||
+    size_x == std::numeric_limits<std::size_t>::max())
+  {
+    return false;
+  }
+  const std::size_t stride = size_x + 1u;
+  if (size_y + 1u > std::numeric_limits<std::size_t>::max() / stride) {
+    return false;
+  }
+  const std::size_t expected_prefix_size = stride * (size_y + 1u);
+  const bool matching_broadphase =
+    workspace.hazard_prefix_valid &&
+    workspace.hazard_size_x == costmap.getSizeInCellsX() &&
+    workspace.hazard_size_y == costmap.getSizeInCellsY() &&
+    workspace.hazard_origin_x == costmap.getOriginX() &&
+    workspace.hazard_origin_y == costmap.getOriginY() &&
+    workspace.hazard_resolution == costmap.getResolution() &&
+    workspace.hazard_prefix_sum.size() == expected_prefix_size;
+  if (!matching_broadphase) {
+    return false;
+  }
+
+  const auto prefix_at =
+    [&workspace, stride](const std::size_t x, const std::size_t y)
+    {
+      return workspace.hazard_prefix_sum[y * stride + x];
+    };
+  const std::size_t lower_x = minimum_x;
+  const std::size_t lower_y = minimum_y;
+  const std::size_t upper_x = static_cast<std::size_t>(maximum_x) + 1u;
+  const std::size_t upper_y = static_cast<std::size_t>(maximum_y) + 1u;
+  hazard_count =
+    prefix_at(upper_x, upper_y) -
+    prefix_at(lower_x, upper_y) -
+    prefix_at(upper_x, lower_y) +
+    prefix_at(lower_x, lower_y);
+  return true;
+}
+
 CertificationResult check_pose(
   nav2_costmap_2d::Costmap2D & costmap,
   const std::vector<geometry_msgs::msg::Point> & footprint,
-  const geometry_msgs::msg::Pose2D & pose)
+  const geometry_msgs::msg::Pose2D & pose,
+  std::vector<nav2_costmap_2d::MapLocation> & map_footprint,
+  std::vector<nav2_costmap_2d::MapLocation> & footprint_cells,
+  const CertificationWorkspace & workspace)
 {
   CertificationResult result;
   result.checked_pose_count = 1;
-  std::vector<nav2_costmap_2d::MapLocation> map_footprint;
+  map_footprint.clear();
   map_footprint.reserve(footprint.size());
+  unsigned int minimum_x = std::numeric_limits<unsigned int>::max();
+  unsigned int minimum_y = std::numeric_limits<unsigned int>::max();
+  unsigned int maximum_x = 0;
+  unsigned int maximum_y = 0;
   const double cosine = std::cos(pose.theta);
   const double sine = std::sin(pose.theta);
   for (const geometry_msgs::msg::Point & point : footprint) {
@@ -56,9 +117,24 @@ CertificationResult check_pose(
       return result;
     }
     map_footprint.push_back(map_point);
+    minimum_x = std::min(minimum_x, map_point.x);
+    minimum_y = std::min(minimum_y, map_point.y);
+    maximum_x = std::max(maximum_x, map_point.x);
+    maximum_y = std::max(maximum_y, map_point.y);
   }
 
-  std::vector<nav2_costmap_2d::MapLocation> footprint_cells;
+  std::size_t hazard_count = 0u;
+  if (query_hazard_count(
+      costmap, workspace, minimum_x, minimum_y, maximum_x, maximum_y,
+      hazard_count) &&
+    hazard_count == 0u)
+  {
+    result.safe = true;
+    result.failure = CertificationFailure::kNone;
+    return result;
+  }
+
+  footprint_cells.clear();
   costmap.convexFillCells(map_footprint, footprint_cells);
   for (const nav2_costmap_2d::MapLocation & cell : footprint_cells) {
     const unsigned char cost = costmap.getCost(cell.x, cell.y);
@@ -83,13 +159,162 @@ double normalized_angle_difference(
   return std::atan2(std::sin(to - from), std::cos(to - from));
 }
 
+bool certify_hazard_free_sequence_bounds(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  const double maximum_footprint_radius,
+  const double maximum_swept_distance,
+  const CertificationWorkspace & workspace,
+  std::size_t & checked_pose_count)
+{
+  double minimum_x = std::numeric_limits<double>::infinity();
+  double minimum_y = std::numeric_limits<double>::infinity();
+  double maximum_x = -std::numeric_limits<double>::infinity();
+  double maximum_y = -std::numeric_limits<double>::infinity();
+  for (const geometry_msgs::msg::Pose2D & pose : poses) {
+    if (!std::isfinite(pose.x) || !std::isfinite(pose.y) ||
+      !std::isfinite(pose.theta))
+    {
+      return false;
+    }
+    minimum_x = std::min(minimum_x, pose.x);
+    minimum_y = std::min(minimum_y, pose.y);
+    maximum_x = std::max(maximum_x, pose.x);
+    maximum_y = std::max(maximum_y, pose.y);
+  }
+
+  // Every translated or rotated footprint point lies inside this circle-based
+  // world AABB, including all interpolated poses between trajectory samples.
+  // An empty hazard query therefore certifies the complete swept trajectory.
+  unsigned int minimum_map_x = 0u;
+  unsigned int minimum_map_y = 0u;
+  unsigned int maximum_map_x = 0u;
+  unsigned int maximum_map_y = 0u;
+  const double coordinate_scale =
+    std::max(
+    {1.0, std::abs(minimum_x), std::abs(minimum_y),
+      std::abs(maximum_x), std::abs(maximum_y),
+      maximum_footprint_radius});
+  const double outward_rounding_margin = 1.0e-12 * coordinate_scale;
+  if (!costmap.worldToMap(
+      minimum_x - maximum_footprint_radius - outward_rounding_margin,
+      minimum_y - maximum_footprint_radius - outward_rounding_margin,
+      minimum_map_x, minimum_map_y) ||
+    !costmap.worldToMap(
+      maximum_x + maximum_footprint_radius + outward_rounding_margin,
+      maximum_y + maximum_footprint_radius + outward_rounding_margin,
+      maximum_map_x, maximum_map_y))
+  {
+    return false;
+  }
+
+  std::size_t hazard_count = 0u;
+  if (!query_hazard_count(
+      costmap, workspace, minimum_map_x, minimum_map_y,
+      maximum_map_x, maximum_map_y, hazard_count) ||
+    hazard_count != 0u)
+  {
+    return false;
+  }
+
+  checked_pose_count = 1u;
+  for (std::size_t pose_index = 1u;
+    pose_index < poses.size(); ++pose_index)
+  {
+    const geometry_msgs::msg::Pose2D & previous = poses[pose_index - 1u];
+    const geometry_msgs::msg::Pose2D & next = poses[pose_index];
+    const double angle_difference =
+      normalized_angle_difference(previous.theta, next.theta);
+    const double swept_distance =
+      std::hypot(next.x - previous.x, next.y - previous.y) +
+      maximum_footprint_radius * std::abs(angle_difference);
+    checked_pose_count += static_cast<std::size_t>(
+      std::max(
+        1, static_cast<int>(
+          std::ceil(swept_distance / maximum_swept_distance))));
+  }
+  return true;
+}
+
 }  // namespace
+
+bool prepare_certification_broadphase(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  CertificationWorkspace & workspace)
+{
+  invalidate_certification_broadphase(workspace);
+  const unsigned int size_x = costmap.getSizeInCellsX();
+  const unsigned int size_y = costmap.getSizeInCellsY();
+  if (size_x == 0u || size_y == 0u) {
+    return false;
+  }
+  const std::size_t stride = static_cast<std::size_t>(size_x) + 1u;
+  if (static_cast<std::size_t>(size_y) + 1u >
+    std::numeric_limits<std::size_t>::max() / stride)
+  {
+    return false;
+  }
+
+  const std::size_t prefix_size =
+    stride * (static_cast<std::size_t>(size_y) + 1u);
+  if (workspace.hazard_prefix_sum.size() != prefix_size) {
+    workspace.hazard_prefix_sum.assign(prefix_size, 0u);
+  } else {
+    // Every interior entry is overwritten below. Only the integral-image
+    // border must be cleared when reusing the allocation.
+    std::fill(
+      workspace.hazard_prefix_sum.begin(),
+      workspace.hazard_prefix_sum.begin() +
+      static_cast<std::ptrdiff_t>(stride), 0u);
+    for (std::size_t y = 1u;
+      y <= static_cast<std::size_t>(size_y); ++y)
+    {
+      workspace.hazard_prefix_sum[y * stride] = 0u;
+    }
+  }
+  for (unsigned int y = 0; y < size_y; ++y) {
+    std::size_t row_hazard_count = 0u;
+    for (unsigned int x = 0; x < size_x; ++x) {
+      const unsigned char cost = costmap.getCost(x, y);
+      if (cost == nav2_costmap_2d::NO_INFORMATION ||
+        cost >= nav2_costmap_2d::LETHAL_OBSTACLE)
+      {
+        ++row_hazard_count;
+      }
+      const std::size_t index =
+        (static_cast<std::size_t>(y) + 1u) * stride +
+        (static_cast<std::size_t>(x) + 1u);
+      workspace.hazard_prefix_sum[index] =
+        workspace.hazard_prefix_sum[index - stride] +
+        row_hazard_count;
+    }
+  }
+  workspace.hazard_size_x = size_x;
+  workspace.hazard_size_y = size_y;
+  workspace.hazard_origin_x = costmap.getOriginX();
+  workspace.hazard_origin_y = costmap.getOriginY();
+  workspace.hazard_resolution = costmap.getResolution();
+  workspace.hazard_prefix_valid = true;
+  return true;
+}
+
+void invalidate_certification_broadphase(
+  CertificationWorkspace & workspace)
+{
+  workspace.hazard_size_x = 0u;
+  workspace.hazard_size_y = 0u;
+  workspace.hazard_origin_x = 0.0;
+  workspace.hazard_origin_y = 0.0;
+  workspace.hazard_resolution = 0.0;
+  workspace.hazard_prefix_valid = false;
+}
 
 CertificationResult certify_pose_sequence(
   nav2_costmap_2d::Costmap2D & costmap,
   const std::vector<geometry_msgs::msg::Point> & footprint,
   const std::vector<geometry_msgs::msg::Pose2D> & poses,
-  const double maximum_swept_distance)
+  const double maximum_swept_distance,
+  CertificationWorkspace * workspace)
 {
   CertificationResult result;
   if (footprint.size() < 3u || poses.empty() ||
@@ -108,8 +333,23 @@ CertificationResult certify_pose_sequence(
       std::max(maximum_footprint_radius, std::hypot(point.x, point.y));
   }
 
+  CertificationWorkspace local_workspace;
+  CertificationWorkspace & active_workspace =
+    workspace ? *workspace : local_workspace;
+  if (certify_hazard_free_sequence_bounds(
+      costmap, poses, maximum_footprint_radius,
+      maximum_swept_distance, active_workspace,
+      result.checked_pose_count))
+  {
+    result.safe = true;
+    result.failure = CertificationFailure::kNone;
+    return result;
+  }
   CertificationResult pose_result =
-    check_pose(costmap, footprint, poses.front());
+    check_pose(
+    costmap, footprint, poses.front(),
+    active_workspace.map_footprint,
+    active_workspace.footprint_cells, active_workspace);
   result.checked_pose_count += pose_result.checked_pose_count;
   if (!pose_result.safe) {
     result.failure = pose_result.failure;
@@ -147,7 +387,10 @@ CertificationResult certify_pose_sequence(
       interpolated.x = previous.x + ratio * (next.x - previous.x);
       interpolated.y = previous.y + ratio * (next.y - previous.y);
       interpolated.theta = previous.theta + ratio * angle_difference;
-      pose_result = check_pose(costmap, footprint, interpolated);
+      pose_result = check_pose(
+        costmap, footprint, interpolated,
+        active_workspace.map_footprint,
+        active_workspace.footprint_cells, active_workspace);
       result.checked_pose_count += pose_result.checked_pose_count;
       if (!pose_result.safe) {
         result.failure = pose_result.failure;
