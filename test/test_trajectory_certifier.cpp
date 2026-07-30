@@ -54,6 +54,21 @@ void expect_same_certification(
   EXPECT_EQ(broadphase.safe, reference.safe);
   EXPECT_EQ(broadphase.failure, reference.failure);
   EXPECT_EQ(broadphase.checked_pose_count, reference.checked_pose_count);
+  EXPECT_EQ(broadphase.has_failure_pose, reference.has_failure_pose);
+  EXPECT_EQ(
+    broadphase.failure_source_pose_index,
+    reference.failure_source_pose_index);
+  EXPECT_EQ(
+    broadphase.failure_interpolation_index,
+    reference.failure_interpolation_index);
+  if (reference.has_failure_pose) {
+    EXPECT_DOUBLE_EQ(
+      broadphase.failure_pose.x, reference.failure_pose.x);
+    EXPECT_DOUBLE_EQ(
+      broadphase.failure_pose.y, reference.failure_pose.y);
+    EXPECT_DOUBLE_EQ(
+      broadphase.failure_pose.theta, reference.failure_pose.theta);
+  }
 }
 
 }  // namespace
@@ -96,6 +111,8 @@ TEST(TrajectoryCertifier, RejectsObstacleInsideFootprintInterior)
   EXPECT_FALSE(broadphase.safe);
   EXPECT_EQ(
     broadphase.failure, CertificationFailure::kLethalObstacle);
+  EXPECT_TRUE(broadphase.has_failure_pose);
+  EXPECT_EQ(broadphase.failure_source_pose_index, 0u);
 }
 
 TEST(TrajectoryCertifier, RejectsObstacleCrossingSweptBoundary)
@@ -122,6 +139,8 @@ TEST(TrajectoryCertifier, RejectsObstacleCrossingSweptBoundary)
   EXPECT_FALSE(broadphase.safe);
   EXPECT_EQ(
     broadphase.failure, CertificationFailure::kLethalObstacle);
+  EXPECT_TRUE(broadphase.has_failure_pose);
+  EXPECT_EQ(broadphase.failure_source_pose_index, 1u);
 }
 
 TEST(TrajectoryCertifier, RejectsUnknownAndOffCostmap)

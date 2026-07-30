@@ -69,6 +69,13 @@ def test_named_f8_is_generated_before_controller_start():
     assert report.requested_taps == 91
     assert report.effective_taps == 46
     assert report.sample_frequency_hz == pytest.approx(20.0)
+    assert report.mode == 'lowpass'
+    assert report.cutoff_hz == pytest.approx(1.2)
+    assert report.attenuation_bands_hz == ()
+    assert report.step_response_rise_time_seconds == pytest.approx(0.35)
+    assert report.step_response_overshoot_percent == pytest.approx(
+        14.872788936733,
+    )
     assert len(coefficients) == 46
     assert sum(coefficients) == pytest.approx(1.0, abs=1.0e-12)
     assert follow_path['fir_coefficients_generated'] is True
@@ -87,6 +94,27 @@ def test_named_ros1_profiles_have_unit_dc_gain(profile_name):
     assert len(coefficients) == 46
     assert sum(coefficients) == pytest.approx(1.0, abs=1.0e-12)
     assert abs(coefficients[0]) > 1.0e-12
+
+
+def test_f9_open_loop_step_response_is_faster_but_overshoots_more():
+    f8_parameters = _load_f_dwa_parameters()
+    f8_report = inject_fir_coefficients(f8_parameters)
+    f9_parameters = _load_f_dwa_parameters()
+    f9_parameters['controller_server']['ros__parameters']['FollowPath'][
+        'fir_design_profile'
+    ] = 'f9'
+    f9_report = inject_fir_coefficients(f9_parameters)
+
+    assert f8_report is not None
+    assert f9_report is not None
+    assert (
+        f9_report.step_response_rise_time_seconds
+        < f8_report.step_response_rise_time_seconds
+    )
+    assert (
+        f9_report.step_response_overshoot_percent
+        > f8_report.step_response_overshoot_percent
+    )
 
 
 def test_attenuation_bands_can_be_defined_in_python():

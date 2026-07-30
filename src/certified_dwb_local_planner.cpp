@@ -26,6 +26,7 @@
 #include <cmath>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -380,12 +381,48 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
       !planning_snapshot_->delay_trajectory.empty())
     {
       CertificationFailure failure = CertificationFailure::kInvalidInput;
+      CertificationResult certification_result;
       if (!certify_stop_poses(
-          planning_snapshot_->delay_trajectory, failure))
+          planning_snapshot_->delay_trajectory, failure,
+          &certification_result))
       {
+        const geometry_msgs::msg::Pose2D & start_pose =
+          planning_snapshot_->delay_trajectory.front();
+        std::string diagnostic =
+          std::string("Committed delay trajectory is unsafe: ") +
+          certification_failure_name(failure) +
+          "; committed_commands=" +
+          std::to_string(planning_snapshot_->committed_commands.size()) +
+          "; delay_poses=" +
+          std::to_string(planning_snapshot_->delay_trajectory.size()) +
+          "; activation_velocity=(" +
+          std::to_string(planning_snapshot_->activation_state.velocity.x) +
+          "," +
+          std::to_string(
+          planning_snapshot_->activation_state.velocity.theta) +
+          ")";
+        if (certification_result.has_failure_pose) {
+          const geometry_msgs::msg::Pose2D & failure_pose =
+            certification_result.failure_pose;
+          diagnostic +=
+            "; failure_source_pose_index=" +
+            std::to_string(
+            certification_result.failure_source_pose_index) +
+            "; failure_interpolation_index=" +
+            std::to_string(
+            certification_result.failure_interpolation_index) +
+            "; failure_pose=(" +
+            std::to_string(failure_pose.x) + "," +
+            std::to_string(failure_pose.y) + "," +
+            std::to_string(failure_pose.theta) + ")" +
+            "; failure_travel_m=" +
+            std::to_string(
+            std::hypot(
+              failure_pose.x - start_pose.x,
+              failure_pose.y - start_pose.y));
+        }
         throw nav2_core::NoValidControl(
-                std::string("Committed delay trajectory is unsafe: ") +
-                certification_failure_name(failure));
+                diagnostic);
       }
     }
 
@@ -431,6 +468,13 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
     nav_2d_utils::twist3Dto2D(message->command);
   bool dispatch_is_valid = true;
   bool ordered_external_stop = false;
+  bool sequence_was_ready = false;
+  bool sequence_was_valid = false;
+  bool command_was_matched = false;
+  uint64_t expected_sequence = 0;
+  std::size_t pending_command_count = 0;
+  double nearest_command_error = std::numeric_limits<double>::infinity();
+  nav_2d_msgs::msg::Twist2D nearest_pending_command;
   {
     std::lock_guard<std::mutex> command_lock(command_state_mutex_);
     if (!message->has_sequence) {
@@ -441,18 +485,38 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
         commands_match(dispatched, nav_2d_msgs::msg::Twist2D());
       dispatch_is_valid = command_ledger_valid_;
     } else {
+      sequence_was_ready = expected_dispatch_sequence_ready_;
+      expected_sequence = expected_dispatch_sequence_;
       const bool sequence_is_valid =
         expected_dispatch_sequence_ready_ &&
         message->sequence_id == expected_dispatch_sequence_;
+      sequence_was_valid = sequence_is_valid;
+      pending_command_count = pending_issued_commands_.size();
+      for (const IssuedCommand & issued_command : pending_issued_commands_) {
+        const double command_error = std::max({
+            std::abs(issued_command.command.x - dispatched.x),
+            std::abs(issued_command.command.y - dispatched.y),
+            std::abs(issued_command.command.theta - dispatched.theta)});
+        if (command_error < nearest_command_error) {
+          nearest_command_error = command_error;
+          nearest_pending_command = issued_command.command;
+        }
+      }
+      const auto matching_pending_command = std::find_if(
+        pending_issued_commands_.begin(),
+        pending_issued_commands_.end(),
+        [&dispatched](const IssuedCommand & issued_command) {
+          return commands_match(issued_command.command, dispatched);
+        });
       const bool matches_pending_command =
-        !pending_issued_commands_.empty() &&
-        commands_match(pending_issued_commands_.front().command, dispatched);
-      // Controller Server appends a normal zero-velocity stop after FollowPath
-      // succeeds. It is not produced by computeVelocityCommands(), so it has
-      // no pending ledger entry. Accept it only after every computed command
-      // has been dispatched and the transport sequence remains continuous.
+        matching_pending_command != pending_issued_commands_.end();
+      command_was_matched = matches_pending_command;
+      // Controller Server may emit an exact zero without calling the plugin
+      // while it applies control-failure patience or completes an action.
+      // A plugin-selected zero still has native-input metadata and is matched
+      // normally.
       const bool is_ordered_external_stop =
-        pending_issued_commands_.empty() &&
+        !matches_pending_command &&
         commands_match(dispatched, nav_2d_msgs::msg::Twist2D());
       ordered_external_stop = is_ordered_external_stop;
       dispatch_is_valid =
@@ -460,8 +524,15 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
         (matches_pending_command || is_ordered_external_stop);
       if (dispatch_is_valid) {
         if (matches_pending_command) {
-          pending_issued_commands_.pop_front();
+          pending_issued_commands_.erase(
+            pending_issued_commands_.begin(),
+            std::next(matching_pending_command));
         }
+        // Do not clear pending entries for an unmatched Controller Server
+        // zero. Its delayed dispatch callback can run after a later plugin
+        // command has already been computed and recorded. FIFO guarantees
+        // that commands preceding the zero were dispatched first; therefore
+        // any remaining entries belong after this external zero.
         ++expected_dispatch_sequence_;
         command_ledger_valid_ = true;
       } else {
@@ -478,9 +549,24 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
   if (!dispatch_is_valid) {
     RCLCPP_ERROR(
       logger_,
-      "Command dispatch ledger mismatch: has_sequence=%s sequence=%" PRIu64,
+      "Command dispatch ledger mismatch: has_sequence=%s sequence=%" PRIu64
+      " expected=%" PRIu64 " sequence_ready=%s sequence_valid=%s"
+      " matched=%s pending=%zu dispatched=(%.17g, %.17g, %.17g)"
+      " nearest=(%.17g, %.17g, %.17g) max_error=%.17g",
       message->has_sequence ? "true" : "false",
-      message->sequence_id);
+      message->sequence_id,
+      expected_sequence,
+      sequence_was_ready ? "true" : "false",
+      sequence_was_valid ? "true" : "false",
+      command_was_matched ? "true" : "false",
+      pending_command_count,
+      dispatched.x,
+      dispatched.y,
+      dispatched.theta,
+      nearest_pending_command.x,
+      nearest_pending_command.y,
+      nearest_pending_command.theta,
+      nearest_command_error);
     request_transport_invalidation("command-dispatch ledger mismatch");
     return;
   }
@@ -1140,12 +1226,16 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
 
 bool CertifiedDWBLocalPlanner::certify_stop_poses(
   const std::vector<geometry_msgs::msg::Pose2D> & stop_poses,
-  CertificationFailure & failure) const
+  CertificationFailure & failure,
+  CertificationResult * output_result) const
 {
   const CertificationResult result =
     certify_pose_sequence(
       *costmap_ros_->getCostmap(), certified_footprint_, stop_poses,
       maximum_swept_distance_, &certification_workspace_);
+  if (output_result) {
+    *output_result = result;
+  }
   failure = result.failure;
   return result.safe;
 }

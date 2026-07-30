@@ -29,7 +29,7 @@ The common dispatch-state parameters are:
   velocity, controller-internal acceleration, and F-DWA raw-input history;
   internal state is cleared only after every applicable value is within it
 - `stop_capture_velocity`: planned-stop completion threshold
-- `planning_deadline_seconds`: 0.03 s deadline at 33.333 Hz
+- `planning_deadline_seconds`: 0.05 s deadline at the common 20 Hz control rate
 
 The unmodified Nav2 goal checker first requires measured translational and
 angular velocity to be at or below 0.01. Standard Controller Server then sends
@@ -56,14 +56,18 @@ robot-facing command and dispatch are published only by the Timer callback,
 which re-anchors its next period immediately after the robot-facing handoff.
 An early callback less than 30 ms after the previous handoff neither consumes
 the FIFO nor publishes.
+Upstream Controller Server arrival intervals are not used to certify this
+robot-facing boundary: an early producer callback is retained in the bounded
+FIFO, while queue overflow still invalidates the trial.
 
 Simulation uses `command_zero_threshold: 0.0` in the transport. The legacy
 `zero_threshold` parameter remains a deprecated compatibility alias. It must
 not be set to the 0.01 stop-capture value for the F-8 main comparison.
-The 70 ms stop-command delay is conservatively rounded upward to three complete
-30 ms command ticks for V/A/J/F certification.
+The 70 ms stop-command delay is conservatively rounded upward to two complete
+50 ms controller ticks for V/A/J/F certification. The independent
+robot-facing transport still publishes at no more than 33.333 Hz.
 
-`mppi.yaml` keeps the common 33.333 Hz, 2.4 s horizon, velocity and
+`mppi.yaml` keeps the common 20 Hz, 2.4 s horizon, velocity and
 acceleration limits, footprint, costmaps, and delayed command transport. Its
 sampling distribution and critics are method-specific. MPPI does not inherit
 the DWB terminal-stop certificate, so certification comparisons must report
@@ -74,12 +78,16 @@ coefficient vector. Before Nav2 starts, the research launch asks
 `f_dwa_controller.fir_filter_design` to generate the coefficients and inserts
 them only into its temporary runtime parameter file. A direct coefficient
 vector in source YAML is rejected.
+`max_linear_raw_input` bounds the FIR input, which has acceleration units.
+Increasing it does not bypass the per-step velocity and acceleration
+projection. In the ground-truth Env2 diagnostic, 1.8 and 2.4 did not produce a
+repeatable valid improvement over 1.2, so 1.2 remains the comparison default.
 
 The Python design registry is the single place to set the tap count, design
 sample frequency, low-pass cutoff or attenuation bands, window, and
 minimum-phase conversion. The named F-7/F-8/F-9 profiles deliberately retain
 the 20 Hz sample frequency used to generate the ROS 1 vectors. The ROS 2
-controller still runs at 33.333 Hz; changing the design frequency defines a
+Controller Server also runs at 20 Hz; changing the design frequency defines a
 new profile rather than silently changing F-8.
 
 The paper-design profile-name pattern is kept as comments in `f_dwa.yaml`.
@@ -93,7 +101,7 @@ performance-only warm-start ablation and must be reported separately.
 
 The runtime optimizations are exact reuse, not candidate pruning. F-DWA
 prepares one free/unit held-FIR response per axis and forms all 11 axis
-rollouts by affine composition. The fixed 80-element time-step vector is
+rollouts by affine composition. The fixed 48-element time-step vector is
 created once, and nominal and terminal-stop heading trigonometry is cached per
 angular rollout and shared by the 11 linear rollouts. Candidate count and
 order, integration steps, critics, certification, and command-selection

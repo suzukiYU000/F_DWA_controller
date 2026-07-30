@@ -45,6 +45,10 @@ struct CertificationResult
   bool safe{false};
   CertificationFailure failure{CertificationFailure::kInvalidInput};
   std::size_t checked_pose_count{0};
+  bool has_failure_pose{false};
+  std::size_t failure_source_pose_index{0};
+  std::size_t failure_interpolation_index{0};
+  geometry_msgs::msg::Pose2D failure_pose;
 };
 
 struct CertificationWorkspace

@@ -45,9 +45,9 @@ class FirFilterDesign:
 
 
 # These profiles intentionally retain the 20 Hz design sampling frequency used
-# to generate the named ROS 1 F-7/F-8/F-9 coefficient sets. The ROS 2 controller
-# runs at 33.333 Hz; changing the design rate to that value defines a different
-# filter and must therefore use a new profile name.
+# to generate the named ROS 1 F-7/F-8/F-9 coefficient sets. The ROS 2 research
+# controller also runs at 20 Hz. A different control/design rate defines a
+# different filter and must therefore use a new profile name.
 FIR_FILTER_DESIGNS = {
     'f7': FirFilterDesign(
         num_taps=91,
@@ -85,6 +85,11 @@ class DesignReport:
     requested_taps: int
     effective_taps: int
     sample_frequency_hz: float
+    mode: str
+    cutoff_hz: Optional[float]
+    attenuation_bands_hz: Tuple[Tuple[float, float], ...]
+    step_response_rise_time_seconds: float
+    step_response_overshoot_percent: float
     fingerprint: str
 
 
@@ -203,6 +208,24 @@ def coefficient_fingerprint(coefficients: Sequence[float]) -> str:
     return hashlib.sha256(canonical.encode('ascii')).hexdigest()
 
 
+def _step_response_metrics(
+    coefficients: Sequence[float],
+    sample_frequency_hz: float,
+) -> tuple[float, float]:
+    """Return first-crossing 10--90% rise time and positive overshoot."""
+    step_response = np.cumsum(np.asarray(coefficients, dtype=float))
+    ten_percent_index = int(np.flatnonzero(step_response >= 0.1)[0])
+    ninety_percent_index = int(np.flatnonzero(step_response >= 0.9)[0])
+    rise_time_seconds = (
+        ninety_percent_index - ten_percent_index
+    ) / sample_frequency_hz
+    overshoot_percent = max(
+        0.0,
+        (float(np.max(step_response)) - 1.0) * 100.0,
+    )
+    return rise_time_seconds, overshoot_percent
+
+
 def inject_fir_coefficients(
     parameters: MutableMapping[str, Any],
     controller_name: str = 'controller_server',
@@ -240,6 +263,13 @@ def inject_fir_coefficients(
 
     coefficients = design_fir_coefficients(profile_name)
     design = FIR_FILTER_DESIGNS[profile_name]
+    (
+        step_response_rise_time_seconds,
+        step_response_overshoot_percent,
+    ) = _step_response_metrics(
+        coefficients,
+        design.sample_frequency_hz,
+    )
     plugin_parameters['fir_coefficients'] = coefficients
     plugin_parameters['fir_coefficients_generated'] = True
     return DesignReport(
@@ -247,5 +277,14 @@ def inject_fir_coefficients(
         requested_taps=design.num_taps,
         effective_taps=len(coefficients),
         sample_frequency_hz=design.sample_frequency_hz,
+        mode=design.mode,
+        cutoff_hz=design.cutoff_hz,
+        attenuation_bands_hz=design.attenuation_bands_hz,
+        step_response_rise_time_seconds=(
+            step_response_rise_time_seconds
+        ),
+        step_response_overshoot_percent=(
+            step_response_overshoot_percent
+        ),
         fingerprint=coefficient_fingerprint(coefficients),
     )

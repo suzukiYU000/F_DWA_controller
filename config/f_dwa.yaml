@@ -4,7 +4,7 @@ controller_server:
       plugin: "f_dwa_controller::FDwaController"
       trajectory_generator_name: "f_dwa_controller::FirTrajectoryGenerator"
       enable_certification: true
-      native_input_control_period: 0.03
+      native_input_control_period: 0.05
       require_applied_command_state: true
       max_linear_raw_input: 1.2
       max_angular_raw_input: 1.57
@@ -13,9 +13,11 @@ controller_server:
       # preserves the ROS 1 profile, including its 20 Hz design sample rate.
       fir_design_profile: "f8"
 
-      # Existing ROS 1 design-family change patterns:
-      # fir_design_profile: "f7"  # 0.5 Hz low-pass cutoff
-      # fir_design_profile: "f9"  # 2.0 Hz low-pass cutoff
+      # Existing ROS 1 design-family change patterns. A wider allowed motion
+      # band remains an ablation rather than an assumed agility improvement.
+      # In the 2026-07-30 ground-truth Env2 diagnostic, f9 was slower than f8.
+      # fir_design_profile: "f7"  # 0.5 Hz: strongest smoothing
+      # fir_design_profile: "f9"  # 2.0 Hz: widest-band profile
       #
       # Paper-design change pattern:
       # fir_design_profile: "paper"

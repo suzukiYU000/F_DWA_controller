@@ -3,9 +3,9 @@ controller_server:
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
 
-      # Match the common 33.333 Hz controller period and 2.4 s horizon.
-      model_dt: 0.03
-      time_steps: 80
+      # Match the common 20 Hz controller period and 2.4 s horizon.
+      model_dt: 0.05
+      time_steps: 48
 
       # Keep Nav2's representative MPPI sampling scale as the baseline.
       # batch_size: 1000  # Lower-compute change pattern
@@ -32,12 +32,13 @@ controller_server:
       prune_distance: 3.0
       transform_tolerance: 0.2
 
-      # Visualization is disabled in the timed comparison. Enable only in a
-      # separate visualization run because it changes controller load.
-      visualize: false
+      # Publish a representative 50/2000 candidate subset for headless
+      # analysis. Candidate/time downsampling affects visualization only, not
+      # optimization or the selected command. Use false for a timing ablation.
+      visualize: true  # false
       TrajectoryVisualizer:
-        trajectory_step: 5
-        time_step: 3
+        trajectory_step: 40  # 20 publishes 100/2000 candidates
+        time_step: 4  # 3 publishes 16/48 points per displayed candidate
 
       critics:
         - ConstraintCritic

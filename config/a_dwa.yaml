@@ -4,5 +4,5 @@ controller_server:
       plugin: "f_dwa_controller::ADwaController"
       trajectory_generator_name: "f_dwa_controller::AccelerationTrajectoryGenerator"
       enable_certification: true
-      native_input_control_period: 0.03
+      native_input_control_period: 0.05
       require_applied_command_state: false

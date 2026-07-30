@@ -49,9 +49,9 @@ patterns in `config/f_dwa.yaml`.
 
 The design registry in `python/f_dwa_controller/fir_filter_design.py` owns the
 tap count, design sample frequency, cutoff or attenuation bands, window, and
-minimum-phase conversion. F-8 retains its historical 20 Hz design frequency
-even though this controller executes at 33.333 Hz. A design using the controller
-frequency must receive a new name for experiment traceability.
+minimum-phase conversion. F-8 retains its historical 20 Hz design frequency,
+which also matches the common Nav2 Controller Server frequency. A design using
+a different frequency must receive a new name for experiment traceability.
 
 Every F-DWA research-launch startup regenerates the selected profile. No
 coefficient cache or previous temporary parameter file is reused. Coefficients
@@ -112,7 +112,7 @@ invalidate the candidate rather than clipping its velocity. Critics run before
 the terminal-stop certificate, and only candidates capable of improving the
 best certified score receive that expensive certificate. Every configured
 number of cycles, `planning_timing` logs p50/p95/p99/maximum and the cumulative
-30 ms deadline-miss count using a steady clock. Trial reset emits the final
+50 ms deadline-miss count using a steady clock. Trial reset emits the final
 run summary before clearing these metrics.
 
 ## Planned hierarchy

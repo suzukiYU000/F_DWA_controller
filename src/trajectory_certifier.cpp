@@ -353,6 +353,8 @@ CertificationResult certify_pose_sequence(
   result.checked_pose_count += pose_result.checked_pose_count;
   if (!pose_result.safe) {
     result.failure = pose_result.failure;
+    result.has_failure_pose = true;
+    result.failure_pose = poses.front();
     return result;
   }
 
@@ -394,6 +396,11 @@ CertificationResult certify_pose_sequence(
       result.checked_pose_count += pose_result.checked_pose_count;
       if (!pose_result.safe) {
         result.failure = pose_result.failure;
+        result.has_failure_pose = true;
+        result.failure_source_pose_index = pose_index;
+        result.failure_interpolation_index =
+          static_cast<std::size_t>(interpolation_index);
+        result.failure_pose = interpolated;
         return result;
       }
     }

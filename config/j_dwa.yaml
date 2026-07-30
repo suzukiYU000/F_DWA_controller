@@ -4,7 +4,7 @@ controller_server:
       plugin: "f_dwa_controller::JDwaController"
       trajectory_generator_name: "f_dwa_controller::JerkTrajectoryGenerator"
       enable_certification: true
-      native_input_control_period: 0.03
+      native_input_control_period: 0.05
       require_applied_command_state: true
       max_linear_jerk: 1.57  # 0.758 for J-7; 3.14 for J-9
       max_angular_jerk: 1.57  # 0.758 for J-7; 3.14 for J-9

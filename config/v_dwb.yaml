@@ -4,4 +4,5 @@ controller_server:
       plugin: "f_dwa_controller::CertifiedDWBLocalPlanner"
       trajectory_generator_name: "f_dwa_controller::VLimitedAccelTrajectoryGenerator"
       enable_certification: true
-      sim_period: 0.03
+      # Match the common Nav2 Controller Server frequency.
+      sim_period: 0.05

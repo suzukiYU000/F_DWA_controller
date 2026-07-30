@@ -1,12 +1,14 @@
 controller_server:
   ros__parameters:
-    controller_frequency: 33.333333333333333
+    # Nav2 Controller Server's upstream default is 20 Hz. Keep every
+    # comparison controller at this rate; the delayed robot-facing transport
+    # has its own faster 33.333 Hz Timer.
+    controller_frequency: 20.0
     enable_stamped_cmd_vel: false
     odom_topic: "/whill/odom"
     # Keep Nav2 Controller Server unmodified. The robot-facing transport owns
-    # the 33.333 Hz Timer, rejects producer catch-up intervals below 30 ms,
-    # and the experiment runner validates FIFO-empty/applied-zero after the
-    # standard FollowPath result.
+    # the 33.333 Hz Timer, preserves upstream commands in a bounded FIFO, and
+    # validates FIFO-empty/applied-zero after the standard FollowPath result.
     publish_zero_velocity: true
     controller_plugins: ["FollowPath"]
     min_x_velocity_threshold: 0.001
@@ -35,10 +37,13 @@ controller_server:
       decel_lim_theta: -1.57
       vx_samples: 11
       vy_samples: 1
-      vtheta_samples: 11
+      # Use the same angular candidate count for every DWB-derived method.
+      # Fifteen improves steering resolution without changing the upstream
+      # generator algorithms or introducing a method-specific advantage.
+      vtheta_samples: 15
       sim_time: 2.4
       discretize_by_time: true
-      time_granularity: 0.03
+      time_granularity: 0.05
       linear_granularity: 0.05
       angular_granularity: 0.025
       include_last_point: true
@@ -50,14 +55,14 @@ controller_server:
       transport_valid_topic: "/dwa_experiment/transport_valid"
       transport_invalidation_service: "/command_delay_transport/invalidate_trial"
       require_command_dispatch_state: true
-      certification_control_period: 0.03
+      certification_control_period: 0.05
       terminal_stop_maximum_time: 8.0
       # The same capture magnitude applies to internally tracked acceleration
       # and F-DWA raw-input history before terminal state is cleared.
       terminal_stop_velocity_threshold: 0.01
       stop_capture_velocity: 0.01
-      # Certification rounds this upward to complete 30 ms command ticks
-      # (70 ms -> 3 ticks) for every DWB-derived method.
+      # Certification rounds this upward to complete 50 ms controller ticks
+      # (70 ms -> 2 ticks) for every DWB-derived method.
       terminal_stop_command_delay_seconds: 0.07
       # This is an additional certificate reserve outside the common 0.10 m
       # planning footprint padding. Recovery from reserve intrusion is off by
@@ -78,17 +83,16 @@ controller_server:
       # prefer_previous_selected_candidate: true  # performance-only ablation
       planning_metrics_enabled: true
       planning_metrics_report_interval: 1000
-      planning_deadline_seconds: 0.03
+      planning_deadline_seconds: 0.05
       # Candidate evaluation is diagnostic output, not a control input.
       # Recording at 10 Hz preserves animation detail without serializing a
-      # roughly 330 KiB evaluation message on every 30 ms control tick.
+      # roughly 330 KiB evaluation message on every 50 ms control tick.
       publish_evaluation: true
       evaluation_publish_frequency: 10.0
       publish_trajectories: false
       stateful: true
       critics:
         - RotateToGoal
-        - Oscillation
         - GoalAlign
         - PathAlign
         - PathDist
@@ -97,6 +101,8 @@ controller_server:
         # scoring last lets the existing best-score short circuit reject most
         # noncompetitive candidates without changing the selected optimum.
         - ObstacleFootprint
+      # Six-critic ground-truth corridor screening compared 0.10/0.15/0.20.
+      # Endpoint clearance at 0.10 gave the longest rollout.
       ObstacleFootprint.scale: 0.10
       # Every pose is still checked for lethal/unknown cost. Keep the upstream
       # endpoint-score behavior so a longer rollout does not multiply soft
@@ -123,7 +129,7 @@ controller_server:
 velocity_smoother:
   ros__parameters:
     enable_stamped_cmd_vel: false
-    smoothing_frequency: 33.333333333333333
+    smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
     max_velocity: [1.2, 0.0, 1.57]  # [0.6, 0.0, 1.57] on the real robot
@@ -144,6 +150,11 @@ collision_monitor:
 local_costmap:
   local_costmap:
     ros__parameters:
+      # Match the 20 Hz controller so a newly marked obstacle is not held for
+      # an additional 100 ms before committed-delay revalidation.
+      update_frequency: 20.0
+      # Record the same snapshots used by the controller for failure analysis.
+      publish_frequency: 10.0
       resolution: 0.05
       width: 10
       height: 10
@@ -155,6 +166,13 @@ local_costmap:
         # Covers the padded rectangle's 0.984886 m circumscribed radius, so
         # footprint collision checks cannot be skipped from a free center cell.
         inflation_radius: 1.0
+      voxel_layer:
+        scan:
+          # Keep newly observed Corridor posts out of the static map. The
+          # 5 m robot-observable LiDAR horizon leaves planning time before the
+          # 70 ms command FIFO and terminal-stop trajectory reach an obstacle.
+          obstacle_max_range: 5.0
+          raytrace_max_range: 5.5
 
 global_costmap:
   global_costmap:
@@ -162,5 +180,9 @@ global_costmap:
       resolution: 0.05
       footprint: "[[-0.2, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.2, 0.3]]"
       footprint_padding: 0.10
+      # Corridor posts are deliberately local-LiDAR obstacles. Generated
+      # global paths therefore remain independent of post observations.
+      obstacle_layer:
+        enabled: false
       inflation_layer:
         inflation_radius: 1.0

@@ -341,6 +341,12 @@ void CommandDelayNode::timer_callback()
     has_robot_publish_time_ = true;
   }
 
+  // Re-anchor at the Timer-owned robot handoff epoch before DDS and status
+  // work. In accelerated simulation, adding that work to every period makes
+  // an equally rated upstream producer slowly fill the bounded FIFO.
+  // The strict last_robot_publish_time_ gate above still prevents catch-up.
+  publish_timer_->reset();
+
   command_publisher_->publish(command_to_publish);
   applied_command_publisher_->publish(command_to_publish);
   if (reset_applied) {
@@ -357,12 +363,6 @@ void CommandDelayNode::timer_callback()
     dispatch.has_sequence = has_applied_sequence;
     command_dispatch_publisher_->publish(dispatch);
   }
-
-  // Anchor the next Timer period immediately after every pacing-relevant
-  // publication. Measuring from callback completion would add status/DDS
-  // work to every period, while a fixed phase plus a strict handoff gate can
-  // skip alternate ticks when pre-publication runtimes differ.
-  publish_timer_->reset();
 
   if (reset_applied) {
     publish_transport_valid(true);
@@ -435,6 +435,16 @@ void CommandDelayNode::invalidate_transport(
   const std::vector<DelayedCommand> queued_commands =
     delay_queue_->snapshot();
   const std::string last_applied = command_to_string(last_applied_command_);
+  std::ostringstream queued_timing;
+  for (std::size_t index = 0; index < queued_commands.size(); ++index) {
+    const DelayedCommand & queued = queued_commands[index];
+    if (index != 0) {
+      queued_timing << ";";
+    }
+    queued_timing << queued.sequence << "@" <<
+      queued.received_at.seconds() << "->" <<
+      queued.eligible_at.seconds();
+  }
 
   transport_valid_ = false;
   delay_queue_->clear();
@@ -442,12 +452,13 @@ void CommandDelayNode::invalidate_transport(
   RCLCPP_ERROR(
     get_logger(),
     "transport_invalid: %s at %.9f s; queue_depth=%zu; "
-    "next_sequence=%" PRIu64 "; last_applied=%s",
+    "next_sequence=%" PRIu64 "; last_applied=%s; queued_timing=%s",
     reason.c_str(),
     detected_at.seconds(),
     queue_depth,
     next_sequence,
-    last_applied.c_str());
+    last_applied.c_str(),
+    queued_timing.str().c_str());
   publish_transport_valid(false);
   publish_transport_stopped(false);
   publish_diagnostic(

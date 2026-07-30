@@ -65,7 +65,7 @@ nav2_util::LifecycleNode::SharedPtr make_node(
     rclcpp::Parameter("FollowPath.decel_lim_theta", -1.57),
     rclcpp::Parameter("FollowPath.vx_samples", 11),
     rclcpp::Parameter("FollowPath.vy_samples", 1),
-    rclcpp::Parameter("FollowPath.vtheta_samples", 11),
+    rclcpp::Parameter("FollowPath.vtheta_samples", 15),
     rclcpp::Parameter("FollowPath.sim_time", 2.4),
     rclcpp::Parameter("FollowPath.discretize_by_time", true),
     rclcpp::Parameter("FollowPath.time_granularity", 0.03),
@@ -129,7 +129,7 @@ void expect_finite_trajectory(
     generator.nextTwist();
     ++candidate_count;
   }
-  EXPECT_EQ(candidate_count, 121u);
+  EXPECT_EQ(candidate_count, 165u);
 }
 
 PlanningSnapshot make_observable_zero_snapshot(
@@ -248,7 +248,7 @@ protected:
   }
 };
 
-TEST_F(NativeInputTrajectoryGeneratorTest, AccelerationGeneratorRollsOut121Candidates)
+TEST_F(NativeInputTrajectoryGeneratorTest, AccelerationGeneratorRollsOut165Candidates)
 {
   const auto node = make_node("acceleration_generator_test");
   AccelerationTrajectoryGenerator generator;
@@ -258,7 +258,7 @@ TEST_F(NativeInputTrajectoryGeneratorTest, AccelerationGeneratorRollsOut121Candi
   expect_finite_trajectory(generator);
 }
 
-TEST_F(NativeInputTrajectoryGeneratorTest, JerkGeneratorRollsOut121Candidates)
+TEST_F(NativeInputTrajectoryGeneratorTest, JerkGeneratorRollsOut165Candidates)
 {
   const auto node = make_node("jerk_generator_test");
   JerkTrajectoryGenerator generator;
@@ -268,7 +268,7 @@ TEST_F(NativeInputTrajectoryGeneratorTest, JerkGeneratorRollsOut121Candidates)
   expect_finite_trajectory(generator);
 }
 
-TEST_F(NativeInputTrajectoryGeneratorTest, FirGeneratorRollsOut121Candidates)
+TEST_F(NativeInputTrajectoryGeneratorTest, FirGeneratorRollsOut165Candidates)
 {
   const auto node = make_node("fir_generator_test");
   FirTrajectoryGenerator generator;
@@ -312,7 +312,7 @@ TEST_F(
     ++candidate_count;
   }
   EXPECT_FALSE(reused_generator.hasMoreTwists());
-  EXPECT_EQ(candidate_count, 121u);
+  EXPECT_EQ(candidate_count, 165u);
 }
 
 TEST_F(
@@ -379,7 +379,8 @@ TEST_F(
   AngularPoseCacheMatchesLegacyReferenceForAllFirCandidates)
 {
   constexpr int kRolloutStepCount = 80;
-  constexpr int kSampleCount = 11;
+  constexpr int kLinearSampleCount = 11;
+  constexpr int kAngularSampleCount = 15;
   constexpr double kTimeStep = 0.03;
   const std::vector<double> fir_coefficients{0.5, 0.3, 0.2};
   const std::vector<double> initial_history(
@@ -441,9 +442,9 @@ TEST_F(
   ASSERT_TRUE(linear_interval.feasible);
   ASSERT_TRUE(angular_interval.feasible);
   const std::vector<double> linear_inputs =
-    uniform_samples(linear_interval, kSampleCount);
+    uniform_samples(linear_interval, kLinearSampleCount);
   const std::vector<double> angular_inputs =
-    uniform_samples(angular_interval, kSampleCount);
+    uniform_samples(angular_interval, kAngularSampleCount);
   const auto linear_rollouts =
     build_rollouts(linear_limits, linear_inputs);
   const auto angular_rollouts =
@@ -518,9 +519,9 @@ TEST_F(
       trajectory.time_offsets.size(),
       static_cast<std::size_t>(kRolloutStepCount) + 1u);
     const std::size_t linear_index =
-      *canonical_index / static_cast<std::size_t>(kSampleCount);
+      *canonical_index / static_cast<std::size_t>(kAngularSampleCount);
     const std::size_t angular_index =
-      *canonical_index % static_cast<std::size_t>(kSampleCount);
+      *canonical_index % static_cast<std::size_t>(kAngularSampleCount);
     double reference_running_time = 0.0;
     EXPECT_NEAR(
       command.x, linear_rollouts[linear_index].front().velocity, 1.0e-12);
@@ -594,7 +595,7 @@ TEST_F(
     }
     ++expected_canonical_index;
   }
-  EXPECT_EQ(expected_canonical_index, 121u);
+  EXPECT_EQ(expected_canonical_index, 165u);
   EXPECT_EQ(affine_best_index, reference_best_index);
 }
 
@@ -753,7 +754,7 @@ TEST_F(
     }
     ++candidate_count;
   }
-  EXPECT_EQ(candidate_count, 121u);
+  EXPECT_EQ(candidate_count, 165u);
 }
 
 TEST_F(

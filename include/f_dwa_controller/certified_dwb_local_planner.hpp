@@ -112,7 +112,8 @@ private:
     dwb_msgs::msg::TrajectoryScore & backup_score);
   bool certify_stop_poses(
     const std::vector<geometry_msgs::msg::Pose2D> & stop_poses,
-    CertificationFailure & failure) const;
+    CertificationFailure & failure,
+    CertificationResult * result = nullptr) const;
   AxisLimits linear_limits() const;
   AxisLimits angular_limits() const;
   void reset_trial_callback(
