@@ -837,7 +837,12 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
     prepare_certification_broadphase(
       *costmap_ros_->getCostmap(), certification_workspace_);
   }
-  if (!certification_enabled_) {
+  auto native_generator =
+    std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
+    traj_generator_);
+  // Native generators must retain the selected candidate's internal state
+  // even when terminal-stop certification is disabled for an ablation.
+  if (!certification_enabled_ && !native_generator) {
     return dwb_core::DWBLocalPlanner::coreScoringAlgorithm(
       pose, velocity, results);
   }
@@ -847,13 +852,12 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   double worst_total = -1.0;
   std::size_t best_canonical_index =
     std::numeric_limits<std::size_t>::max();
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
+  best_command_state;
   std::vector<nav_2d_msgs::msg::Twist2D> best_stop_velocities;
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
   best_stop_states;
   dwb_core::IllegalTrajectoryTracker tracker;
-  auto native_generator =
-    std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
-    traj_generator_);
   std::size_t evaluation_index = 0u;
   dwb_msgs::msg::Trajectory2D trajectory_scratch;
   dwb_msgs::msg::TrajectoryScore score_scratch;
@@ -894,6 +898,10 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         results->twists.push_back(score_scratch);
       }
       if (is_best) {
+        if (native_generator) {
+          best_command_state =
+            native_generator->active_candidate_command_state();
+        }
         if (results) {
           best = score_scratch;
         } else {
@@ -930,6 +938,12 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   }
 
   if (best.total >= 0.0) {
+    if (!certification_enabled_) {
+      retained_backup_commands_.clear();
+      retained_backup_states_.clear();
+      native_generator->select_command_for_dispatch(best_command_state);
+      return best;
+    }
     std::vector<geometry_msgs::msg::Pose2D> best_stop_poses;
     const std::optional<std::size_t> native_candidate_index =
       native_generator ?

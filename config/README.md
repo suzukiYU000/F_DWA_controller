@@ -7,7 +7,10 @@ Method files should contain only the plugin and native-dynamics differences.
 `enable_certification: true` adds the common terminal-stop certificate and
 retained-backup revalidation. It can be disabled through the research launch
 for an ablation, while the common 70 ms nominal command-history rollout remains
-enabled.
+enabled. DWB-derived native-input generators keep the selected candidate's
+internal acceleration, jerk, or FIR state correlated with the observable
+dispatch ledger in either mode; disabling certification changes neither the
+candidate dynamics nor state ownership.
 `v_dwb.yaml` selects a behavior-preserving adapter for Nav2's
 `LimitedAccelGenerator`; the separate `v_dwb_standard.yaml` selects the
 corresponding `StandardTrajectoryGenerator` adapter. The adapters add no
