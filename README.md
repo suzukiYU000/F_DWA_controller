@@ -112,8 +112,10 @@ invalidate the candidate rather than clipping its velocity. Critics run before
 the terminal-stop certificate, and only candidates capable of improving the
 best certified score receive that expensive certificate. Every configured
 number of cycles, `planning_timing` logs p50/p95/p99/maximum and the cumulative
-50 ms deadline-miss count using a steady clock. Trial reset emits the final
-run summary before clearing these metrics.
+50 ms deadline-miss count using a steady clock. `certificate_rejections`
+separates terminal-stop infeasibility from invalid-input, off-costmap,
+lethal-obstacle, and unknown-space failures. Trial reset emits the final run
+summary before clearing these metrics.
 
 ## Planned hierarchy
 

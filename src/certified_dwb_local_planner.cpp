@@ -747,6 +747,27 @@ void CertifiedDWBLocalPlanner::record_planning_duration(
   report_planning_metrics("periodic");
 }
 
+void CertifiedDWBLocalPlanner::record_certification_rejection(
+  const CertificationFailure failure)
+{
+  switch (failure) {
+    case CertificationFailure::kInvalidInput:
+      ++certification_rejections_.invalid_input;
+      break;
+    case CertificationFailure::kOffCostmap:
+      ++certification_rejections_.off_costmap;
+      break;
+    case CertificationFailure::kLethalObstacle:
+      ++certification_rejections_.lethal_obstacle;
+      break;
+    case CertificationFailure::kUnknownSpace:
+      ++certification_rejections_.unknown_space;
+      break;
+    case CertificationFailure::kNone:
+      break;
+  }
+}
+
 void CertifiedDWBLocalPlanner::report_planning_metrics(
   const char * scope)
 {
@@ -771,6 +792,19 @@ void CertifiedDWBLocalPlanner::report_planning_metrics(
     maximum_planning_duration_seconds_,
     planning_deadline_seconds_,
     planning_deadline_miss_count_);
+  if (certification_enabled_) {
+    RCLCPP_INFO(
+      logger_,
+      "certificate_rejections scope=%s terminal_stop_infeasible=%" PRIu64
+      " invalid_input=%" PRIu64 " off_costmap=%" PRIu64
+      " lethal_obstacle=%" PRIu64 " unknown_space=%" PRIu64,
+      scope,
+      certification_rejections_.terminal_stop_infeasible,
+      certification_rejections_.invalid_input,
+      certification_rejections_.off_costmap,
+      certification_rejections_.lethal_obstacle,
+      certification_rejections_.unknown_space);
+  }
 }
 
 bool CertifiedDWBLocalPlanner::should_publish_evaluation()
@@ -1055,6 +1089,7 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     if (!build_stop_trajectory(
         trajectory, stop_pose_scratch_, nullptr, nullptr))
     {
+      ++certification_rejections_.terminal_stop_infeasible;
       throw dwb_core::IllegalTrajectoryException(
               "SafetyCertificate",
               "No dynamically feasible terminal stop sequence");
@@ -1062,6 +1097,7 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
 
     CertificationFailure failure = CertificationFailure::kInvalidInput;
     if (!certify_stop_poses(stop_pose_scratch_, failure)) {
+      record_certification_rejection(failure);
       throw dwb_core::IllegalTrajectoryException(
               "SafetyCertificate",
               certification_failure_name(failure));
@@ -1288,6 +1324,7 @@ void CertifiedDWBLocalPlanner::reset_trial_callback(
   planning_cycle_count_ = 0;
   planning_deadline_miss_count_ = 0;
   maximum_planning_duration_seconds_ = 0.0;
+  certification_rejections_ = CertificationRejectionCounters();
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
   global_plan_.poses.clear();

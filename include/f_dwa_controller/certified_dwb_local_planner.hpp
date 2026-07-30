@@ -22,6 +22,7 @@
 #define F_DWA_CONTROLLER__CERTIFIED_DWB_LOCAL_PLANNER_HPP_
 
 #include <chrono>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -79,6 +80,15 @@ private:
     nav_2d_msgs::msg::Twist2D command;
   };
 
+  struct CertificationRejectionCounters
+  {
+    uint64_t terminal_stop_infeasible{0};
+    uint64_t invalid_input{0};
+    uint64_t off_costmap{0};
+    uint64_t lethal_obstacle{0};
+    uint64_t unknown_space{0};
+  };
+
   void command_dispatch_callback(
     const f_dwa_controller::msg::CommandDispatch::SharedPtr message);
   void transport_valid_callback(
@@ -91,6 +101,7 @@ private:
     const rclcpp::Time & issued_at);
   void record_planning_duration(
     std::chrono::steady_clock::time_point started_at);
+  void record_certification_rejection(CertificationFailure failure);
   void report_planning_metrics(const char * scope);
   bool should_publish_evaluation();
   void publish_evaluation(
@@ -167,6 +178,7 @@ private:
   uint64_t planning_cycle_count_{0};
   uint64_t planning_deadline_miss_count_{0};
   double maximum_planning_duration_seconds_{0.0};
+  CertificationRejectionCounters certification_rejections_;
   std::vector<nav_2d_msgs::msg::Twist2D> retained_backup_commands_;
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
   retained_backup_states_;

@@ -31,8 +31,16 @@ The common dispatch-state parameters are:
 - `terminal_stop_velocity_threshold`: common numerical capture threshold for
   velocity, controller-internal acceleration, and F-DWA raw-input history;
   internal state is cleared only after every applicable value is within it
+- `terminal_stop_maximum_time`: upper bound for constructing a certified stop,
+  not a commanded stop duration; the common 12 s bound accommodates the F-8
+  filter-history drain and each sequence ends as soon as capture is reached
 - `stop_capture_velocity`: planned-stop completion threshold
 - `planning_deadline_seconds`: 0.05 s deadline at the common 20 Hz control rate
+
+`forward_prune_distance` is 4 m for every DWB-derived method. This exceeds the
+maximum nominal travel of a 1.2 m/s, 2.4 s candidate (2.88 m) while remaining
+inside the 10 m square local costmap. The path critics therefore see a real
+Path segment rather than an artificial 2 m transformed-Path endpoint.
 
 The unmodified Nav2 goal checker first requires measured translational and
 angular velocity to be at or below 0.01. Standard Controller Server then sends
