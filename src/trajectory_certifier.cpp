@@ -411,6 +411,103 @@ CertificationResult certify_pose_sequence(
   return result;
 }
 
+bool certify_reserve_recovery_sequence(
+  nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & certified_footprint,
+  const std::vector<geometry_msgs::msg::Point> & planning_footprint,
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  const double maximum_swept_distance,
+  const bool require_clear_suffix,
+  CertificationWorkspace * workspace)
+{
+  if (poses.size() < 2u) {
+    return false;
+  }
+  const CertificationResult planning_result =
+    certify_pose_sequence(
+    costmap, planning_footprint, poses, maximum_swept_distance,
+    workspace);
+  if (!planning_result.safe) {
+    return false;
+  }
+
+  const std::vector<geometry_msgs::msg::Pose2D> initial_pose{
+    poses.front()};
+  const CertificationResult initial_result =
+    certify_pose_sequence(
+    costmap, certified_footprint, initial_pose,
+    maximum_swept_distance, workspace);
+  if (initial_result.safe ||
+    initial_result.failure != CertificationFailure::kLethalObstacle)
+  {
+    return false;
+  }
+
+  std::size_t clearance_index = poses.size();
+  for (std::size_t reverse_index = poses.size();
+    reverse_index > 1u; --reverse_index)
+  {
+    const std::size_t pose_index = reverse_index - 1u;
+    const std::vector<geometry_msgs::msg::Pose2D> single_pose{
+      poses[pose_index]};
+    const CertificationResult pose_result =
+      certify_pose_sequence(
+      costmap, certified_footprint, single_pose,
+      maximum_swept_distance, workspace);
+    if (!pose_result.safe) {
+      break;
+    }
+    clearance_index = pose_index;
+    if (!require_clear_suffix) {
+      break;
+    }
+  }
+  if (clearance_index >= poses.size()) {
+    return false;
+  }
+
+  if (require_clear_suffix) {
+    const std::vector<geometry_msgs::msg::Pose2D> clear_suffix(
+      poses.begin() + static_cast<std::ptrdiff_t>(clearance_index),
+      poses.end());
+    if (!certify_pose_sequence(
+        costmap, certified_footprint, clear_suffix,
+        maximum_swept_distance, workspace).safe)
+    {
+      return false;
+    }
+  }
+
+  double footprint_radius = 0.0;
+  for (const geometry_msgs::msg::Point & point : certified_footprint) {
+    footprint_radius =
+      std::max(footprint_radius, std::hypot(point.x, point.y));
+  }
+  const geometry_msgs::msg::Pose2D & clear_pose = poses[clearance_index];
+  const auto distance_to_clear_pose =
+    [&clear_pose, footprint_radius](
+    const geometry_msgs::msg::Pose2D & pose)
+    {
+      return std::hypot(
+        clear_pose.x - pose.x, clear_pose.y - pose.y) +
+             footprint_radius * std::abs(
+        normalized_angle_difference(pose.theta, clear_pose.theta));
+    };
+  double previous_distance = distance_to_clear_pose(poses.front());
+  const double monotonic_tolerance =
+    std::max(1.0e-9, maximum_swept_distance * 1.0e-6);
+  for (std::size_t pose_index = 1u;
+    pose_index <= clearance_index; ++pose_index)
+  {
+    const double distance = distance_to_clear_pose(poses[pose_index]);
+    if (distance > previous_distance + monotonic_tolerance) {
+      return false;
+    }
+    previous_distance = distance;
+  }
+  return true;
+}
+
 const char * certification_failure_name(
   const CertificationFailure failure)
 {

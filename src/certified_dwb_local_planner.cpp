@@ -175,6 +175,12 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".maximum_swept_distance",
     rclcpp::ParameterValue(0.025));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".enable_reserve_recovery",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".reserve_recovery_hysteresis",
+    rclcpp::ParameterValue(true));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".trial_reset_service_name",
     rclcpp::ParameterValue("~/" + name + "/reset_trial_state"));
   nav2_util::declare_parameter_if_not_declared(
@@ -227,6 +233,12 @@ void CertifiedDWBLocalPlanner::configure(
   node->get_parameter(
     name + ".maximum_swept_distance",
     maximum_swept_distance_);
+  node->get_parameter(
+    name + ".enable_reserve_recovery",
+    enable_reserve_recovery_);
+  node->get_parameter(
+    name + ".reserve_recovery_hysteresis",
+    reserve_recovery_hysteresis_);
   node->get_parameter(
     name + ".planning_metrics_enabled", planning_metrics_enabled_);
   node->get_parameter(
@@ -415,43 +427,61 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
           planning_snapshot_->delay_trajectory, failure,
           &certification_result))
       {
-        const geometry_msgs::msg::Pose2D & start_pose =
-          planning_snapshot_->delay_trajectory.front();
-        std::string diagnostic =
-          std::string("Committed delay trajectory is unsafe: ") +
-          certification_failure_name(failure) +
-          "; committed_commands=" +
-          std::to_string(planning_snapshot_->committed_commands.size()) +
-          "; delay_poses=" +
-          std::to_string(planning_snapshot_->delay_trajectory.size()) +
-          "; activation_velocity=(" +
-          std::to_string(planning_snapshot_->activation_state.velocity.x) +
-          "," +
-          std::to_string(
-          planning_snapshot_->activation_state.velocity.theta) +
-          ")";
-        if (certification_result.has_failure_pose) {
-          const geometry_msgs::msg::Pose2D & failure_pose =
-            certification_result.failure_pose;
-          diagnostic +=
-            "; failure_source_pose_index=" +
+        const CertificationResult planning_footprint_result =
+          certify_pose_sequence(
+          *costmap, costmap_ros_->getRobotFootprint(),
+          planning_snapshot_->delay_trajectory,
+          maximum_swept_distance_);
+        if (enable_reserve_recovery_ &&
+          failure == CertificationFailure::kLethalObstacle &&
+          planning_footprint_result.safe)
+        {
+          RCLCPP_WARN_THROTTLE(
+            logger_, *clock_, 1000,
+            "Committed delay prefix is inside only the additional "
+            "certificate reserve; evaluating outward recovery candidates");
+        } else {
+          const geometry_msgs::msg::Pose2D & start_pose =
+            planning_snapshot_->delay_trajectory.front();
+          std::string diagnostic =
+            std::string("Committed delay trajectory is unsafe: ") +
+            certification_failure_name(failure) +
+            "; committed_commands=" +
+            std::to_string(planning_snapshot_->committed_commands.size()) +
+            "; delay_poses=" +
+            std::to_string(planning_snapshot_->delay_trajectory.size()) +
+            "; activation_velocity=(" +
+            std::to_string(planning_snapshot_->activation_state.velocity.x) +
+            "," +
             std::to_string(
-            certification_result.failure_source_pose_index) +
-            "; failure_interpolation_index=" +
-            std::to_string(
-            certification_result.failure_interpolation_index) +
-            "; failure_pose=(" +
-            std::to_string(failure_pose.x) + "," +
-            std::to_string(failure_pose.y) + "," +
-            std::to_string(failure_pose.theta) + ")" +
-            "; failure_travel_m=" +
-            std::to_string(
-            std::hypot(
-              failure_pose.x - start_pose.x,
-              failure_pose.y - start_pose.y));
+            planning_snapshot_->activation_state.velocity.theta) +
+            "); planning_footprint_safe=" +
+            (planning_footprint_result.safe ? "true" : "false") +
+            "; planning_footprint_failure=" +
+            certification_failure_name(planning_footprint_result.failure);
+          if (certification_result.has_failure_pose) {
+            const geometry_msgs::msg::Pose2D & failure_pose =
+              certification_result.failure_pose;
+            diagnostic +=
+              "; failure_source_pose_index=" +
+              std::to_string(
+              certification_result.failure_source_pose_index) +
+              "; failure_interpolation_index=" +
+              std::to_string(
+              certification_result.failure_interpolation_index) +
+              "; failure_pose=(" +
+              std::to_string(failure_pose.x) + "," +
+              std::to_string(failure_pose.y) + "," +
+              std::to_string(failure_pose.theta) + ")" +
+              "; failure_travel_m=" +
+              std::to_string(
+              std::hypot(
+                failure_pose.x - start_pose.x,
+                failure_pose.y - start_pose.y));
+          }
+          throw nav2_core::NoValidControl(
+                  diagnostic);
         }
-        throw nav2_core::NoValidControl(
-                diagnostic);
       }
     }
 
@@ -962,6 +992,7 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
     std::numeric_limits<std::size_t>::max();
   std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
   best_command_state;
+  bool best_uses_reserve_recovery = false;
   std::vector<nav_2d_msgs::msg::Twist2D> best_stop_velocities;
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
   best_stop_states;
@@ -989,12 +1020,20 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       evaluation_index;
     ++evaluation_index;
     try {
+      bool candidate_uses_reserve_recovery = false;
       score_trajectory_components(
-        trajectory_scratch, best.total, score_scratch);
+        trajectory_scratch,
+        best_uses_reserve_recovery ? -1.0 : best.total,
+        score_scratch, &candidate_uses_reserve_recovery);
       const bool is_best =
-        best.total < 0.0 || score_scratch.total < best.total ||
+        best.total < 0.0 ||
+        (!candidate_uses_reserve_recovery &&
+        best_uses_reserve_recovery) ||
+        (candidate_uses_reserve_recovery ==
+        best_uses_reserve_recovery &&
+        (score_scratch.total < best.total ||
         (score_scratch.total == best.total &&
-        canonical_index < best_canonical_index);
+        canonical_index < best_canonical_index)));
       bool is_worst = worst_total < 0.0;
       if (!is_worst) {
         is_worst = score_scratch.total > worst_total;
@@ -1020,6 +1059,8 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           best.traj.time_offsets.swap(trajectory_scratch.time_offsets);
         }
         best_canonical_index = canonical_index;
+        best_uses_reserve_recovery =
+          candidate_uses_reserve_recovery;
         if (results) {
           results->best_index = results->twists.size() - 1u;
         }
@@ -1145,15 +1186,19 @@ CertifiedDWBLocalPlanner::scoreTrajectory(
 {
   dwb_msgs::msg::TrajectoryScore score;
   score.traj = trajectory;
-  score_trajectory_components(trajectory, best_score, score);
+  score_trajectory_components(trajectory, best_score, score, nullptr);
   return score;
 }
 
 void CertifiedDWBLocalPlanner::score_trajectory_components(
   const dwb_msgs::msg::Trajectory2D & trajectory,
   const double best_score,
-  dwb_msgs::msg::TrajectoryScore & score)
+  dwb_msgs::msg::TrajectoryScore & score,
+  bool * used_reserve_recovery)
 {
+  if (used_reserve_recovery) {
+    *used_reserve_recovery = false;
+  }
   score.total = 0.0;
   score.scores.clear();
   score.scores.reserve(
@@ -1217,7 +1262,11 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     }
 
     CertificationFailure failure = CertificationFailure::kInvalidInput;
-    if (!certify_stop_poses(stop_pose_scratch_, failure)) {
+    bool certificate_used_reserve_recovery = false;
+    if (!certify_stop_poses(
+        stop_pose_scratch_, failure, nullptr,
+        &certificate_used_reserve_recovery))
+    {
       record_certification_rejection(failure);
       throw dwb_core::IllegalTrajectoryException(
               "SafetyCertificate",
@@ -1228,6 +1277,16 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     certificate_score.scale = 1.0;
     certificate_score.raw_score = 0.0;
     score.scores.push_back(certificate_score);
+    if (certificate_used_reserve_recovery) {
+      dwb_msgs::msg::CriticScore recovery_score;
+      recovery_score.name = "ReserveRecovery";
+      recovery_score.scale = 0.0;
+      recovery_score.raw_score = 1.0;
+      score.scores.push_back(recovery_score);
+      if (used_reserve_recovery) {
+        *used_reserve_recovery = true;
+      }
+    }
   }
 }
 
@@ -1364,10 +1423,21 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
   }
 
   CertificationFailure failure = CertificationFailure::kInvalidInput;
-  if (!certify_stop_poses(poses, failure)) {
+  bool used_reserve_recovery = false;
+  if (!certify_stop_poses(
+      poses, failure, nullptr, &used_reserve_recovery))
+  {
+    const CertificationResult planning_footprint_result =
+      certify_pose_sequence(
+      *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
+      poses, maximum_swept_distance_);
     RCLCPP_WARN(
-      logger_, "Retained stop backup rejected during revalidation: %s",
-      certification_failure_name(failure));
+      logger_,
+      "Retained stop backup rejected during revalidation: %s; "
+      "planning_footprint_safe=%s; planning_footprint_failure=%s",
+      certification_failure_name(failure),
+      planning_footprint_result.safe ? "true" : "false",
+      certification_failure_name(planning_footprint_result.failure));
     retained_backup_commands_.clear();
     return false;
   }
@@ -1381,6 +1451,13 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
   certificate_score.scale = 1.0;
   certificate_score.raw_score = 0.0;
   backup_score.scores.push_back(certificate_score);
+  if (used_reserve_recovery) {
+    dwb_msgs::msg::CriticScore recovery_score;
+    recovery_score.name = "ReserveRecovery";
+    recovery_score.scale = 0.0;
+    recovery_score.raw_score = 1.0;
+    backup_score.scores.push_back(recovery_score);
+  }
   auto native_generator =
     std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
     traj_generator_);
@@ -1398,8 +1475,12 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
 bool CertifiedDWBLocalPlanner::certify_stop_poses(
   const std::vector<geometry_msgs::msg::Pose2D> & stop_poses,
   CertificationFailure & failure,
-  CertificationResult * output_result) const
+  CertificationResult * output_result,
+  bool * used_reserve_recovery) const
 {
+  if (used_reserve_recovery) {
+    *used_reserve_recovery = false;
+  }
   const CertificationResult result =
     certify_pose_sequence(
       *costmap_ros_->getCostmap(), certified_footprint_, stop_poses,
@@ -1408,7 +1489,23 @@ bool CertifiedDWBLocalPlanner::certify_stop_poses(
     *output_result = result;
   }
   failure = result.failure;
-  return result.safe;
+  if (result.safe) {
+    return true;
+  }
+  if (!enable_reserve_recovery_ ||
+    result.failure != CertificationFailure::kLethalObstacle ||
+    !certify_reserve_recovery_sequence(
+      *costmap_ros_->getCostmap(), certified_footprint_,
+      costmap_ros_->getRobotFootprint(), stop_poses,
+      maximum_swept_distance_, reserve_recovery_hysteresis_,
+      &certification_workspace_))
+  {
+    return false;
+  }
+  if (used_reserve_recovery) {
+    *used_reserve_recovery = true;
+  }
+  return true;
 }
 
 void CertifiedDWBLocalPlanner::prepare_certified_footprint()

@@ -8,4 +8,12 @@
       delayed-command recovery.
     </description>
   </class>
+  <class
+    type="f_dwa_controller::HorizonObstacleFootprintCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Nav2 swept-footprint collision checking over the full trajectory with
+      soft obstacle-cost accumulation limited to a configurable horizon.
+    </description>
+  </class>
 </library>

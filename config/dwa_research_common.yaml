@@ -92,6 +92,12 @@ controller_server:
       # planning footprint padding. Recovery from reserve intrusion is off by
       # default and will be implemented as a separate switchable policy.
       minimum_certified_margin: 0.02
+      # Optional reserve-only recovery never relaxes the common 0.10 m
+      # planning footprint. It is an ablation and remains off for the primary
+      # comparison; when enabled, the candidate must move toward and clear
+      # only the additional 0.02 m reserve.
+      enable_reserve_recovery: false
+      reserve_recovery_hysteresis: true
       # At 0.05 m costmap resolution, checking at half-cell swept distance
       # prevents translation plus rectangle-corner rotation from skipping a cell.
       maximum_swept_distance: 0.025

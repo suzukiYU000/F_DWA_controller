@@ -17,6 +17,7 @@
   <depend>angles</depend>
   <depend>diagnostic_msgs</depend>
   <depend>dwb_core</depend>
+  <depend>dwb_critics</depend>
   <depend>dwb_msgs</depend>
   <depend>dwb_plugins</depend>
   <depend>geometry_msgs</depend>

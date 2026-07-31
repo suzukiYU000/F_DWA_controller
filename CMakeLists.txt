@@ -7,6 +7,7 @@ find_package(angles REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(dwb_core REQUIRED)
+find_package(dwb_critics REQUIRED)
 find_package(dwb_msgs REQUIRED)
 find_package(dwb_plugins REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -45,6 +46,7 @@ add_library(${library_name} SHARED
   src/certified_dwb_local_planner.cpp
   src/dwa_controllers.cpp
   src/fir_input_dynamics.cpp
+  src/horizon_obstacle_footprint_critic.cpp
   src/hysteresis_rotate_to_goal_critic.cpp
   src/native_input_dynamics.cpp
   src/native_input_trajectory_generator.cpp
@@ -82,6 +84,7 @@ target_include_directories(${transport_library_name}
 ament_target_dependencies(${library_name}
   angles
   dwb_core
+  dwb_critics
   dwb_msgs
   dwb_plugins
   geometry_msgs
@@ -200,6 +203,21 @@ if(BUILD_TESTING)
     )
   endif()
 
+  ament_add_gtest(test_horizon_obstacle_footprint_critic
+    test/test_horizon_obstacle_footprint_critic.cpp
+  )
+  if(TARGET test_horizon_obstacle_footprint_critic)
+    target_link_libraries(
+      test_horizon_obstacle_footprint_critic ${library_name}
+    )
+    ament_target_dependencies(test_horizon_obstacle_footprint_critic
+      builtin_interfaces
+      dwb_core
+      dwb_msgs
+      geometry_msgs
+    )
+  endif()
+
   ament_add_gtest(test_fir_input_dynamics
     test/test_fir_input_dynamics.cpp
     src/fir_input_dynamics.cpp
@@ -298,6 +316,7 @@ ament_export_dependencies(
   builtin_interfaces
   diagnostic_msgs
   dwb_core
+  dwb_critics
   dwb_msgs
   dwb_plugins
   nav_2d_msgs

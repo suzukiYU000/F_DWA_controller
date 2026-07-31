@@ -110,7 +110,8 @@ private:
   void score_trajectory_components(
     const dwb_msgs::msg::Trajectory2D & trajectory,
     double best_score,
-    dwb_msgs::msg::TrajectoryScore & score);
+    dwb_msgs::msg::TrajectoryScore & score,
+    bool * used_reserve_recovery = nullptr);
   bool build_stop_trajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory,
     std::vector<geometry_msgs::msg::Pose2D> & poses,
@@ -124,7 +125,8 @@ private:
   bool certify_stop_poses(
     const std::vector<geometry_msgs::msg::Pose2D> & stop_poses,
     CertificationFailure & failure,
-    CertificationResult * result = nullptr) const;
+    CertificationResult * result = nullptr,
+    bool * used_reserve_recovery = nullptr) const;
   AxisLimits linear_limits() const;
   AxisLimits angular_limits() const;
   void reset_trial_callback(
@@ -160,6 +162,8 @@ private:
   double terminal_stop_goal_capture_yaw_tolerance_{0.0};
   double minimum_certified_margin_{0.02};
   double maximum_swept_distance_{0.025};
+  bool enable_reserve_recovery_{false};
+  bool reserve_recovery_hysteresis_{true};
   double minimum_linear_velocity_{0.0};
   double maximum_linear_velocity_{1.2};
   double maximum_angular_velocity_{1.57};

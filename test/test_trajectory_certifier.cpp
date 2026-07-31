@@ -166,6 +166,59 @@ TEST(TrajectoryCertifier, RejectsUnknownAndOffCostmap)
   EXPECT_EQ(result.failure, CertificationFailure::kOffCostmap);
 }
 
+TEST(TrajectoryCertifier, ReserveRecoveryClearsOnlyAdditionalMargin)
+{
+  nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.36, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  std::vector<geometry_msgs::msg::Point> certified_footprint =
+    rectangle_footprint();
+  std::vector<geometry_msgs::msg::Point> planning_footprint =
+    certified_footprint;
+  for (geometry_msgs::msg::Point & point : planning_footprint) {
+    point.y = std::copysign(0.30, point.y);
+  }
+  for (geometry_msgs::msg::Point & point : certified_footprint) {
+    point.y = std::copysign(0.40, point.y);
+  }
+
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].y = -0.05;
+  poses[2].y = -0.10;
+  EXPECT_TRUE(
+    certify_reserve_recovery_sequence(
+      costmap, certified_footprint, planning_footprint, poses, 0.025,
+      true));
+
+  poses[1].y = 0.05;
+  EXPECT_FALSE(
+    certify_reserve_recovery_sequence(
+      costmap, certified_footprint, planning_footprint, poses, 0.025,
+      true));
+}
+
+TEST(TrajectoryCertifier, ReserveRecoveryRejectsPlanningFootprintCollision)
+{
+  nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.26, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].y = -0.05;
+  poses[2].y = -0.10;
+  EXPECT_FALSE(
+    certify_reserve_recovery_sequence(
+      costmap, rectangle_footprint(), rectangle_footprint(), poses,
+      0.025, true));
+}
+
 TEST(TrajectoryCertifier, ReusedWorkspacePreservesCertificationResult)
 {
   nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);

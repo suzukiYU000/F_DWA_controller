@@ -81,6 +81,19 @@ CertificationResult certify_pose_sequence(
   double maximum_swept_distance,
   CertificationWorkspace * workspace = nullptr);
 
+// A recovery sequence may start inside only the additional certificate
+// reserve. The planning footprint must remain safe, the motion must progress
+// toward a pose that clears the reserve, and hysteresis optionally requires
+// the complete remaining suffix to stay clear.
+bool certify_reserve_recovery_sequence(
+  nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & certified_footprint,
+  const std::vector<geometry_msgs::msg::Point> & planning_footprint,
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  double maximum_swept_distance,
+  bool require_clear_suffix,
+  CertificationWorkspace * workspace = nullptr);
+
 const char * certification_failure_name(CertificationFailure failure);
 
 }  // namespace f_dwa_controller

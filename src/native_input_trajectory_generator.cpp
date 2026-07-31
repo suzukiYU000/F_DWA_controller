@@ -231,8 +231,8 @@ void NativeInputTrajectoryGenerator::validate_parameters() const
       !std::isfinite(maximum_angular_raw_input_) ||
       maximum_angular_raw_input_ <= 0.0 ||
       !std::isfinite(fir_prediction_pulse_duration_) ||
-      fir_prediction_pulse_duration_ < 0.0 ||
-      fir_prediction_pulse_duration_ > sim_time_ + 1.0e-12)
+      fir_prediction_pulse_duration_<0.0 ||
+      fir_prediction_pulse_duration_> sim_time_ + 1.0e-12)
     {
       throw std::invalid_argument(
               plugin_name_ +
