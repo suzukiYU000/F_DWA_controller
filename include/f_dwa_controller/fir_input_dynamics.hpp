@@ -60,6 +60,18 @@ HeldFirAffineResponse prepare_held_fir_affine_response(
   double time_step,
   int remaining_steps);
 
+// Builds an affine rollout in which the sampled raw input is active for
+// active_input_steps and is then zero. The full remaining horizon is still
+// checked against the acceleration and velocity limits.
+HeldFirAffineResponse prepare_pulsed_fir_affine_response(
+  const AxisState & state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history,
+  double time_step,
+  int remaining_steps,
+  int active_input_steps);
+
 bool sample_held_fir_affine_response(
   const HeldFirAffineResponse & response,
   const AxisLimits & limits,

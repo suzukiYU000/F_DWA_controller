@@ -8,6 +8,12 @@ controller_server:
       require_applied_command_state: true
       max_linear_raw_input: 1.2
       max_angular_raw_input: 1.57
+      # Score a short raw-input action followed by zero input, as in the ROS 1
+      # finite-pulse profile. Nav2 executes only its first 50 ms step and
+      # replans, while the independent stop certificate still checks the full
+      # delayed stopping sequence. Use 0.0 for the former 2.4 s held-input
+      # profile when running that ablation.
+      fir_prediction_pulse_duration: 0.15
 
       # Python generates coefficients before Nav2 starts. The named f8 design
       # preserves the ROS 1 profile, including its 20 Hz design sample rate.

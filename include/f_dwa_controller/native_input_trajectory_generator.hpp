@@ -228,6 +228,7 @@ private:
   double maximum_angular_jerk_{1.57};
   double maximum_linear_raw_input_{1.2};
   double maximum_angular_raw_input_{1.57};
+  double fir_prediction_pulse_duration_{0.0};
   double stop_capture_velocity_{0.01};
   double stop_command_delay_seconds_{0.07};
   int linear_samples_{11};

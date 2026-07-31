@@ -142,12 +142,28 @@ HeldFirAffineResponse prepare_held_fir_affine_response(
   const double time_step,
   const int remaining_steps)
 {
+  return prepare_pulsed_fir_affine_response(
+    state, limits, coefficients, history, time_step, remaining_steps,
+    remaining_steps);
+}
+
+HeldFirAffineResponse prepare_pulsed_fir_affine_response(
+  const AxisState & state,
+  const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history,
+  const double time_step,
+  const int remaining_steps,
+  const int active_input_steps)
+{
   HeldFirAffineResponse response;
   response.input_interval.lower = limits.native_input_min;
   response.input_interval.upper = limits.native_input_max;
   if (!valid_fir_problem(
       state, limits, coefficients, history, time_step,
-      remaining_steps))
+      remaining_steps) ||
+    active_input_steps <= 0 ||
+    active_input_steps > remaining_steps)
   {
     return response;
   }
@@ -163,8 +179,11 @@ HeldFirAffineResponse prepare_held_fir_affine_response(
   {
     const double free_acceleration =
       fir_acceleration(coefficients, free_history, 0.0);
+    const double unit_native_input =
+      step_index < active_input_steps ? 1.0 : 0.0;
     const double unit_acceleration =
-      fir_acceleration(coefficients, unit_history, 1.0);
+      fir_acceleration(
+      coefficients, unit_history, unit_native_input);
     free_velocity += time_step * free_acceleration;
     unit_velocity += time_step * unit_acceleration;
     response.free_states.push_back(
@@ -183,7 +202,7 @@ HeldFirAffineResponse prepare_held_fir_affine_response(
       return response;
     }
     push_fir_input(free_history, 0.0);
-    push_fir_input(unit_history, 1.0);
+    push_fir_input(unit_history, unit_native_input);
   }
   response.input_interval.feasible = true;
   return response;

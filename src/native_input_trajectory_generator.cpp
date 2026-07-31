@@ -110,6 +110,9 @@ void NativeInputTrajectoryGenerator::initialize(
     node, plugin_name + ".fir_coefficients_generated",
     rclcpp::ParameterValue(false));
   nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".fir_prediction_pulse_duration",
+    rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".stop_capture_velocity",
     rclcpp::ParameterValue(0.01));
   nav2_util::declare_parameter_if_not_declared(
@@ -137,6 +140,9 @@ void NativeInputTrajectoryGenerator::initialize(
   node->get_parameter(
     plugin_name + ".fir_coefficients_generated",
     fir_coefficients_generated_);
+  node->get_parameter(
+    plugin_name + ".fir_prediction_pulse_duration",
+    fir_prediction_pulse_duration_);
   node->get_parameter(
     plugin_name + ".stop_capture_velocity",
     stop_capture_velocity_);
@@ -223,7 +229,10 @@ void NativeInputTrajectoryGenerator::validate_parameters() const
       !std::isfinite(maximum_linear_raw_input_) ||
       maximum_linear_raw_input_ <= 0.0 ||
       !std::isfinite(maximum_angular_raw_input_) ||
-      maximum_angular_raw_input_ <= 0.0)
+      maximum_angular_raw_input_ <= 0.0 ||
+      !std::isfinite(fir_prediction_pulse_duration_) ||
+      fir_prediction_pulse_duration_ < 0.0 ||
+      fir_prediction_pulse_duration_ > sim_time_ + 1.0e-12)
     {
       throw std::invalid_argument(
               plugin_name_ +
@@ -523,12 +532,24 @@ void NativeInputTrajectoryGenerator::startNewIteration(
   FeasibleInterval linear_interval;
   FeasibleInterval angular_interval;
   if (input_order_ == NativeInputOrder::kFir) {
-    linear_fir_response = prepare_held_fir_affine_response(
+    const int active_input_steps =
+      fir_prediction_pulse_duration_ > 0.0 ?
+      std::min(
+      rollout_step_count,
+      std::max(
+        1, static_cast<int>(
+          std::ceil(
+            fir_prediction_pulse_duration_ / control_period_ -
+            1.0e-12)))) :
+      rollout_step_count;
+    linear_fir_response = prepare_pulsed_fir_affine_response(
       linear_state, linear_axis_limits, fir_coefficients_,
-      initial_linear_fir_history, control_period_, rollout_step_count);
-    angular_fir_response = prepare_held_fir_affine_response(
+      initial_linear_fir_history, control_period_, rollout_step_count,
+      active_input_steps);
+    angular_fir_response = prepare_pulsed_fir_affine_response(
       angular_state, angular_axis_limits, fir_coefficients_,
-      initial_angular_fir_history, control_period_, rollout_step_count);
+      initial_angular_fir_history, control_period_, rollout_step_count,
+      active_input_steps);
     linear_interval = linear_fir_response.input_interval;
     angular_interval = angular_fir_response.input_interval;
   } else {

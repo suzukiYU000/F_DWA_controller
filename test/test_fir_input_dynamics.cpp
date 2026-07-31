@@ -170,6 +170,33 @@ TEST(FirInputDynamics, AffineResponseMatchesBoundaryHeldInputRollouts)
   }
 }
 
+TEST(FirInputDynamics, PulsedAffineResponseTurnsRawInputOffAfterPulse)
+{
+  const std::vector<double> coefficients{0.5, 0.3, 0.2};
+  const std::vector<double> history(coefficients.size() - 1u, 0.0);
+  const AxisLimits limits{-10.0, 10.0, -10.0, 10.0, -2.0, 2.0};
+  const HeldFirAffineResponse response =
+    prepare_pulsed_fir_affine_response(
+    AxisState{}, limits, coefficients, history, 1.0, 5, 2);
+  ASSERT_TRUE(response.input_interval.feasible);
+
+  std::vector<AxisState> states;
+  ASSERT_TRUE(
+    sample_held_fir_affine_response(response, limits, 1.0, states));
+  ASSERT_EQ(states.size(), 5u);
+  const std::vector<double> expected_accelerations{
+    0.5, 0.8, 0.5, 0.2, 0.0};
+  const std::vector<double> expected_velocities{
+    0.5, 1.3, 1.8, 2.0, 2.0};
+  for (std::size_t index = 0; index < states.size(); ++index) {
+    EXPECT_NEAR(
+      states[index].acceleration,
+      expected_accelerations[index], 1.0e-12);
+    EXPECT_NEAR(
+      states[index].velocity, expected_velocities[index], 1.0e-12);
+  }
+}
+
 TEST(FirInputDynamics, AffineResponseMatchesRandomFortySixTapRollouts)
 {
   constexpr int kStepCount = 80;

@@ -46,6 +46,14 @@ F-DWA defaults to the named ROS 1 F-8 low-pass design. Its coefficients are
 generated deterministically by Python before Nav2 starts, so no source YAML
 contains a coefficient vector. Alternative design names remain as commented
 patterns in `config/f_dwa.yaml`.
+The nominal F-DWA rollout uses the ROS 1 finite-pulse action primitive: the
+sampled raw input is active for 0.15 s and is then zero for the remainder of
+the 2.4 s scoring horizon. Every horizon state is still checked against the
+velocity and acceleration limits. Nav2 executes only the first control step
+and replans, while the independent stop certificate continues through delayed
+activation and complete stopping. Setting
+`fir_prediction_pulse_duration: 0.0` restores the former full-horizon held
+input as an explicit ablation.
 
 The design registry in `python/f_dwa_controller/fir_filter_design.py` owns the
 tap count, design sample frequency, cutoff or attenuation bands, window, and
@@ -107,10 +115,10 @@ retried by the experiment runner.
 
 FIR axes are rolled out 11 times for translation and 11 times for rotation,
 then combined into the 121 pose candidates. A full-horizon projected FIR input
-is applied without per-step re-projection; numerical constraint violations
-invalidate the candidate rather than clipping its velocity. Critics run before
-the terminal-stop certificate, and only candidates capable of improving the
-best certified score receive that expensive certificate. Every configured
+profile is affine-sampled without per-step re-projection. Numerical constraint
+violations invalidate the candidate rather than clipping its velocity. Critics
+run before the terminal-stop certificate, and only candidates capable of
+improving the best certified score receive that expensive certificate. Every configured
 number of cycles, `planning_timing` logs p50/p95/p99/maximum and the cumulative
 50 ms deadline-miss count using a steady clock. `certificate_rejections`
 separates terminal-stop infeasibility from invalid-input, off-costmap,

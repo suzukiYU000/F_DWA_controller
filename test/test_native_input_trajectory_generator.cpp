@@ -46,7 +46,8 @@ nav2_util::LifecycleNode::SharedPtr make_node(
   const std::string & name,
   const bool coefficients_generated = true,
   const bool require_applied_command_state = false,
-  const bool prefer_previous_selected_candidate = false)
+  const bool prefer_previous_selected_candidate = false,
+  const double fir_prediction_pulse_duration = 0.0)
 {
   std::vector<rclcpp::Parameter> parameters{
     rclcpp::Parameter("FollowPath.min_vel_x", 0.0),
@@ -72,6 +73,9 @@ nav2_util::LifecycleNode::SharedPtr make_node(
     rclcpp::Parameter("FollowPath.native_input_control_period", 0.03),
     rclcpp::Parameter("FollowPath.max_linear_raw_input", 1.2),
     rclcpp::Parameter("FollowPath.max_angular_raw_input", 1.57),
+    rclcpp::Parameter(
+      "FollowPath.fir_prediction_pulse_duration",
+      fir_prediction_pulse_duration),
     rclcpp::Parameter(
       "FollowPath.require_applied_command_state",
       require_applied_command_state)};
@@ -276,6 +280,30 @@ TEST_F(NativeInputTrajectoryGeneratorTest, FirGeneratorRollsOut165Candidates)
   generator.initialize(node, kPluginName);
 
   expect_finite_trajectory(generator);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  FirFinitePulseDoesNotApplyHeldHorizonVelocityClamp)
+{
+  const auto node =
+    make_node("fir_finite_pulse_test", true, false, false, 0.15);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+
+  nav_2d_msgs::msg::Twist2D current_velocity;
+  generator.startNewIteration(current_velocity);
+  double maximum_first_linear_velocity = 0.0;
+  std::size_t candidate_count = 0u;
+  while (generator.hasMoreTwists()) {
+    const auto command = generator.nextTwist();
+    maximum_first_linear_velocity =
+      std::max(maximum_first_linear_velocity, command.x);
+    ++candidate_count;
+  }
+
+  EXPECT_EQ(candidate_count, 165u);
+  EXPECT_NEAR(maximum_first_linear_velocity, 0.018, 1.0e-12);
 }
 
 TEST_F(
