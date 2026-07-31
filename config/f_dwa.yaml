@@ -14,6 +14,7 @@ controller_server:
       # delayed stopping sequence. Use 0.0 for the former 2.4 s held-input
       # profile when running that ablation.
       fir_prediction_pulse_duration: 0.15
+      # fir_prediction_pulse_duration: 0.30  # longer-pulse ablation
 
       # Python generates coefficients before Nav2 starts. The named f8 design
       # preserves the ROS 1 profile, including its 20 Hz design sample rate.

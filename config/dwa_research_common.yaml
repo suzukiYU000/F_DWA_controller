@@ -129,22 +129,21 @@ controller_server:
         - PathAlign
         - PathDist
         - GoalDist
-        # All earlier critic costs are non-negative. Expensive swept-footprint
-        # scoring last lets the existing best-score short circuit reject most
-        # noncompetitive candidates without changing the selected optimum.
-        - ObstacleFootprint
-      # Six-critic ground-truth corridor screening compared 0.10/0.15/0.20.
-      # Endpoint clearance at 0.10 gave the longest rollout.
-      ObstacleFootprint.scale: 0.10
-      # Every pose is still checked for lethal/unknown cost. Keep the upstream
-      # endpoint-score behavior so a longer rollout does not multiply soft
-      # inflation cost and make stopping artificially preferable.
-      ObstacleFootprint.sum_scores: false
-      PathAlign.scale: 32.0
+        # The common certification layer performs exact swept-footprint safety
+        # checks. Use the standard center-cell critic only for the continuous
+        # inflation gradient used in candidate ranking.
+        - BaseObstacle
+      # About 50 trajectory poses are summed. The scale preserves a continuous
+      # clearance preference before the exact common safety certificate is
+      # evaluated, while GoalDist retains progress preference.
+      BaseObstacle.scale: 0.025
+      # BaseObstacle.scale: 0.15  # stronger-clearance ablation; recording invalid
+      BaseObstacle.sum_scores: true
+      PathAlign.scale: 2.0
       PathAlign.forward_point_distance: 0.325
-      GoalAlign.scale: 24.0
+      GoalAlign.scale: 1.5
       GoalAlign.forward_point_distance: 0.325
-      PathDist.scale: 32.0
+      PathDist.scale: 8.0
       GoalDist.scale: 24.0
       RotateToGoal.scale: 32.0
       RotateToGoal.class: "f_dwa_controller::HysteresisRotateToGoalCritic"
