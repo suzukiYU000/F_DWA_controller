@@ -42,6 +42,7 @@ private:
   bool in_window_{false};
   bool rotating_{false};
   bool release_window_latch_{false};
+  bool ignore_goal_orientation_{false};
   double goal_yaw_{0.0};
   double xy_goal_tolerance_sq_{0.0};
   double xy_goal_tolerance_release_sq_{0.0};

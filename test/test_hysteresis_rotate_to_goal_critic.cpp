@@ -74,6 +74,58 @@ TEST(HysteresisRotateToGoalCritic, ReleasesOutsideOuterWindow)
     critic->scoreTrajectory(translating_trajectory), 0.0);
 }
 
+TEST(HysteresisRotateToGoalCritic, IgnoresGoalYawWhileStoppingAngularMotion)
+{
+  auto critic =
+    std::make_shared<
+    f_dwa_controller::HysteresisRotateToGoalCritic>();
+  auto costmap_ros =
+    std::make_shared<nav2_costmap_2d::Costmap2DROS>(
+    "position_speed_rotate_costmap");
+  auto node =
+    nav2_util::LifecycleNode::make_shared(
+    "position_speed_rotate_node");
+  node->configure();
+  node->activate();
+
+  const std::string critic_name = "RotateToGoal";
+  const std::string controller_name = "FollowPath";
+  nav2_util::declare_parameter_if_not_declared(
+    node, controller_name + ".xy_goal_tolerance",
+    rclcpp::ParameterValue(0.20));
+  nav2_util::declare_parameter_if_not_declared(
+    node, controller_name + ".trans_stopped_velocity",
+    rclcpp::ParameterValue(0.01));
+  nav2_util::declare_parameter_if_not_declared(
+    node,
+    controller_name + "." + critic_name +
+    ".ignore_goal_orientation",
+    rclcpp::ParameterValue(true));
+  critic->initialize(
+    node, critic_name, controller_name, costmap_ros);
+
+  geometry_msgs::msg::Pose2D pose;
+  pose.theta = 0.4;
+  geometry_msgs::msg::Pose2D goal;
+  goal.theta = -1.2;
+  nav_2d_msgs::msg::Twist2D stopped_velocity;
+  nav_2d_msgs::msg::Path2D path;
+  ASSERT_TRUE(critic->prepare(
+      pose, stopped_velocity, goal, path));
+
+  dwb_msgs::msg::Trajectory2D stopped_trajectory;
+  stopped_trajectory.poses.resize(1);
+  stopped_trajectory.poses.back().theta = pose.theta;
+  EXPECT_DOUBLE_EQ(
+    critic->scoreTrajectory(stopped_trajectory), 0.0);
+
+  dwb_msgs::msg::Trajectory2D rotating_trajectory;
+  rotating_trajectory.poses.resize(1);
+  rotating_trajectory.poses.back().theta = pose.theta + 0.2;
+  EXPECT_NEAR(
+    critic->scoreTrajectory(rotating_trajectory), 0.2, 1.0e-12);
+}
+
 int main(int argc, char ** argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

@@ -113,6 +113,10 @@ void HysteresisRotateToGoalCritic::onInit()
     node,
     dwb_plugin_name_ + "." + name_ + ".lookahead_time",
     -1.0);
+  ignore_goal_orientation_ = nav_2d_utils::searchAndGetParam(
+    node,
+    dwb_plugin_name_ + "." + name_ + ".ignore_goal_orientation",
+    false);
   reset();
 }
 
@@ -142,7 +146,9 @@ bool HysteresisRotateToGoalCritic::prepare(
   rotating_ = rotating_ ||
     (in_window_ &&
     current_xy_speed_sq_ <= stopped_xy_velocity_sq_);
-  goal_yaw_ = goal.theta;
+  // Position-and-speed experiments still need the rotate critic's controlled
+  // deceleration, but their terminal yaw must not affect candidate ranking.
+  goal_yaw_ = ignore_goal_orientation_ ? pose.theta : goal.theta;
   return true;
 }
 

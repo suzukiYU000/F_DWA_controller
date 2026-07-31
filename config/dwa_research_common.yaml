@@ -14,11 +14,15 @@ controller_server:
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
+    general_goal_checker:
+      # The comparison evaluates terminal position and stopped velocity.
+      # A shortest angular distance never exceeds pi, so yaw cannot prevent
+      # success while angular velocity must still settle below 0.01 rad/s.
+      yaw_goal_tolerance: 3.141592653589793
     FollowPath:
       debug_trajectory_details: true
-      # Enter DWB's rotate-only phase inside the 0.25 m GoalChecker window.
-      # This leaves room to restore translation after actuator-delay drift
-      # without relaxing the pose accepted as goal success.
+      # Define the position window where the common stopping critic starts
+      # reducing translational and angular speed.
       xy_goal_tolerance: 0.20
       trans_stopped_velocity: 0.01
       min_vel_x: 0.0
@@ -77,9 +81,9 @@ controller_server:
       # and revalidate its remaining suffix instead of replanning braking away.
       # Set to 0.0 to disable the capture policy.
       terminal_stop_goal_capture_distance: 0.10
-      # Do not capture translation while final orientation still needs the
-      # common RotateToGoal policy. This matches the goal-checker tolerance.
-      terminal_stop_goal_capture_yaw_tolerance: 0.25
+      # Ignore terminal yaw when retaining a certified stop. The periodic yaw
+      # error is at most pi, matching the position-and-speed GoalChecker.
+      terminal_stop_goal_capture_yaw_tolerance: 3.141592653589793
       stop_capture_velocity: 0.01
       # Certification rounds this upward to complete 50 ms controller ticks
       # (70 ms -> 2 ticks) for every DWB-derived method.
@@ -139,13 +143,11 @@ controller_server:
       RotateToGoal.scale: 32.0
       RotateToGoal.class: "f_dwa_controller::HysteresisRotateToGoalCritic"
       RotateToGoal.slowing_factor: 5.0
-      # Keep 0.03 m hysteresis against localization noise, but restore
-      # translation at 0.23 m, before the 0.25 m GoalChecker boundary.
-      # Set to -1.0 for the upstream Nav2 permanently latched behavior.
+      # Preserve the stopping behavior without ranking the configured goal
+      # orientation. Angular motion is instead reduced around the current yaw.
+      RotateToGoal.ignore_goal_orientation: true
+      # Keep 0.03 m hysteresis against delayed-command position drift.
       RotateToGoal.xy_goal_tolerance_release_margin: 0.03
-      # Score terminal-heading progress at the 1.25 s evaluation horizon.
-      # The full 2.4 s rollout and the recursively feasible stop certificate
-      # remain unchanged.
       RotateToGoal.lookahead_time: 1.25
 
 velocity_smoother:
