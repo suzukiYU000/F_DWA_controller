@@ -208,7 +208,7 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
   initial_dispatch.command = zero_command;
   initial_dispatch.has_sequence = false;
   command_dispatch_publisher_->publish(initial_dispatch);
-  publish_transport_stopped(true);
+  publish_transport_stopped(true, true);
   RCLCPP_INFO(
     get_logger(),
     "Command delay transport: %.6f Hz, delay=[%.3f, %.3f] ms, mean=%.3f ms, "
@@ -366,7 +366,9 @@ void CommandDelayNode::timer_callback()
 
   if (reset_applied) {
     publish_transport_valid(true);
-    publish_transport_stopped(true);
+    // Publish a fresh trial boundary even if the previous state was already
+    // stopped. Between boundaries the transient-local state is event-driven.
+    publish_transport_stopped(true, true);
   } else {
     publish_transport_stopped(transport_stopped);
   }
@@ -478,8 +480,31 @@ void CommandDelayNode::publish_transport_valid(const bool is_valid)
   transport_valid_publisher_->publish(message);
 }
 
-void CommandDelayNode::publish_transport_stopped(const bool is_stopped)
+void CommandDelayNode::publish_transport_stopped(
+  const bool is_stopped,
+  const bool force)
 {
+  const int8_t desired_state = is_stopped ? 1 : 0;
+  if (!force) {
+    int8_t previous_state =
+      last_published_transport_stopped_.load(std::memory_order_relaxed);
+    while (previous_state != desired_state) {
+      if (last_published_transport_stopped_.compare_exchange_weak(
+          previous_state,
+          desired_state,
+          std::memory_order_relaxed))
+      {
+        break;
+      }
+    }
+    if (previous_state == desired_state) {
+      return;
+    }
+  } else {
+    last_published_transport_stopped_.store(
+      desired_state,
+      std::memory_order_relaxed);
+  }
   std_msgs::msg::Bool message;
   message.data = is_stopped;
   transport_stopped_publisher_->publish(message);

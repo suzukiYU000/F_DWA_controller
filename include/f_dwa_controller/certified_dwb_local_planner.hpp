@@ -155,6 +155,9 @@ private:
   double certification_control_period_{0.03};
   double terminal_stop_maximum_time_{8.0};
   double terminal_stop_velocity_threshold_{0.01};
+  double terminal_stop_goal_distance_scale_{0.0};
+  double terminal_stop_goal_capture_distance_{0.0};
+  double terminal_stop_goal_capture_yaw_tolerance_{0.0};
   double minimum_certified_margin_{0.02};
   double maximum_swept_distance_{0.025};
   double minimum_linear_velocity_{0.0};
@@ -182,9 +185,12 @@ private:
   std::vector<nav_2d_msgs::msg::Twist2D> retained_backup_commands_;
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
   retained_backup_states_;
+  bool terminal_stop_goal_capture_active_{false};
   std::vector<geometry_msgs::msg::Point> certified_footprint_;
   mutable CertificationWorkspace certification_workspace_;
   std::vector<geometry_msgs::msg::Pose2D> stop_pose_scratch_;
+  geometry_msgs::msg::Pose2D current_goal_pose_;
+  bool current_goal_pose_valid_{false};
 };
 
 }  // namespace f_dwa_controller

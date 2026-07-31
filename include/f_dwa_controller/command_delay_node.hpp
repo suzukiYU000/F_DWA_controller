@@ -21,6 +21,7 @@
 #ifndef F_DWA_CONTROLLER__COMMAND_DELAY_NODE_HPP_
 #define F_DWA_CONTROLLER__COMMAND_DELAY_NODE_HPP_
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -58,7 +59,7 @@ private:
     const rclcpp::Time & detected_at,
     const std::string & reason);
   void publish_transport_valid(bool is_valid);
-  void publish_transport_stopped(bool is_stopped);
+  void publish_transport_stopped(bool is_stopped, bool force = false);
   [[nodiscard]] bool is_transport_stopped_locked() const;
   void publish_diagnostic(
     uint8_t level,
@@ -86,6 +87,7 @@ private:
   bool has_observed_time_{false};
   rclcpp::Time last_command_received_time_{0, 0, RCL_ROS_TIME};
   bool has_command_received_time_{false};
+  std::atomic<int8_t> last_published_transport_stopped_{-1};
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_subscriber_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr command_publisher_;

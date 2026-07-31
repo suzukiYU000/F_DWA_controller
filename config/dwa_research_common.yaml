@@ -69,6 +69,17 @@ controller_server:
       # The same capture magnitude applies to internally tracked acceleration
       # and F-DWA raw-input history before terminal state is cleared.
       terminal_stop_velocity_threshold: 0.01
+      # Score the endpoint of the already-generated certified stop trajectory.
+      # This prevents receding-horizon GoalDist from postponing braking for
+      # higher-order dynamics while adding no second trajectory search.
+      terminal_stop_goal_distance_scale: 24.0
+      # Once an already-certified stop ends inside this terminal set, retain
+      # and revalidate its remaining suffix instead of replanning braking away.
+      # Set to 0.0 to disable the capture policy.
+      terminal_stop_goal_capture_distance: 0.10
+      # Do not capture translation while final orientation still needs the
+      # common RotateToGoal policy. This matches the goal-checker tolerance.
+      terminal_stop_goal_capture_yaw_tolerance: 0.25
       stop_capture_velocity: 0.01
       # Certification rounds this upward to complete 50 ms controller ticks
       # (70 ms -> 2 ticks) for every DWB-derived method.
@@ -94,10 +105,12 @@ controller_server:
       planning_metrics_report_interval: 1000
       planning_deadline_seconds: 0.05
       # Candidate evaluation is diagnostic output, not a control input.
-      # Recording at 10 Hz preserves animation detail without serializing a
-      # roughly 330 KiB evaluation message on every 50 ms control tick.
+      # Five complete candidate sets per second preserve the research
+      # animation while keeping these 0.20--0.32 MiB messages from dominating
+      # recorder transport. Candidate generation and scoring still run on
+      # every controller tick.
       publish_evaluation: true
-      evaluation_publish_frequency: 10.0
+      evaluation_publish_frequency: 5.0
       publish_trajectories: false
       stateful: true
       critics:

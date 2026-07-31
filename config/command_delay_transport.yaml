@@ -11,9 +11,9 @@ command_delay_transport:
     reset_trial_service_name: "~/reset_trial_state"
     invalidate_trial_service_name: "~/invalidate_trial"
     publish_frequency_hz: 33.333333333333333
-    # Standard Nav2 may publish one callback early after an overrun. Preserve
-    # every command in FIFO order; the robot-facing Timer below owns the 30 ms
-    # minimum handoff interval and never performs catch-up publications.
+    # Nav2 can deliver a slightly early callback and emits an immediate final
+    # zero at goal. Preserve FIFO order here; the robot-facing Timer owns the
+    # 30 ms minimum handoff interval and never performs catch-up publications.
     minimum_input_interval_ms: 0.0
     stopped_velocity_threshold: 0.01
     min_delay_ms: 60.0

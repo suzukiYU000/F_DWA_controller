@@ -212,6 +212,14 @@ TEST_F(CommandDelayNodeTest, TrialResetIsAppliedOnlyAtNextTimerBoundary)
   EXPECT_TRUE(valid_states.front());
   EXPECT_TRUE(stopped_states.front());
 
+  const auto stable_state_deadline =
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(120);
+  while (std::chrono::steady_clock::now() < stable_state_deadline) {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(stopped_states.size(), 1u);
+
   stopped_subscriber.reset();
   valid_subscriber.reset();
   dispatch_subscriber.reset();

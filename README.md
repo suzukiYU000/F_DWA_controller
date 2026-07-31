@@ -6,7 +6,7 @@ DWA (A-DWA), jerk-constrained DWA (J-DWA), and FIR-constrained DWA (F-DWA).
 The package derives from Nav2 `dwb_core::DWBLocalPlanner` so that plan handling,
 trajectory critics, costmap access, lifecycle behavior, and controller-server
 integration remain common across the compared methods.
-Research-specific goal-window hysteresis and 10 Hz evaluation throttling are
+Research-specific goal-window hysteresis and 5 Hz evaluation throttling are
 implemented in this package. The pinned Navigation2 source remains unmodified.
 
 ## Current status
