@@ -115,36 +115,62 @@ controller_server:
       planning_metrics_report_interval: 1000
       planning_deadline_seconds: 0.05
       # Candidate evaluation is diagnostic output, not a control input.
-      # Five complete candidate sets per second preserve the research
-      # animation while keeping these 0.20--0.32 MiB messages from dominating
-      # recorder transport. Candidate generation and scoring still run on
-      # every controller tick.
+      # One complete candidate set every two seconds is sufficient for post-run
+      # animation and cost diagnosis. Candidate generation and scoring still
+      # run on every controller tick; this only prevents large diagnostic
+      # messages from causing rosbag transport loss.
       publish_evaluation: true
-      evaluation_publish_frequency: 5.0
+      evaluation_publish_frequency: 0.5
       publish_trajectories: false
       stateful: true
       critics:
         - RotateToGoal
         - GoalAlign
         - PathAlign
-        - PathDist
+        - MeanPathDist
         - GoalDist
+        # These two research critics restore the progress and predicted-speed
+        # terms used by the earlier evaluator without reading simulator-only
+        # obstacle state. They are identical for V/A/J/F.
+        - TrajectoryProgress
+        - MeanSpeed
+        # Softly expose whether the endpoint heading leaves observable room
+        # for the next receding-horizon cycle. This never replaces or relaxes
+        # the common swept-footprint SafetyCertificate.
+        - ForwardObstacle
         # The common certification layer performs exact swept-footprint safety
         # checks. Use the standard center-cell critic only for the continuous
         # inflation gradient used in candidate ranking.
         - BaseObstacle
-      # About 50 trajectory poses are summed. The scale preserves a continuous
-      # clearance preference before the exact common safety certificate is
-      # evaluated, while GoalDist retains progress preference.
-      BaseObstacle.scale: 0.025
+      # Preserve the full-trajectory inflation gradient. Candidate diagnostics
+      # showed that 0.025 reversed an 8.7-cost path/progress advantage by a
+      # 9.3-cost obstacle difference; 0.020 keeps the trajectory observable
+      # while allowing the earlier steering reversal by about 1.2 cost.
+      BaseObstacle.scale: 0.020
       # BaseObstacle.scale: 0.15  # stronger-clearance ablation; recording invalid
       BaseObstacle.sum_scores: true
       PathAlign.scale: 2.0
       PathAlign.forward_point_distance: 0.325
       GoalAlign.scale: 1.5
       GoalAlign.forward_point_distance: 0.325
-      PathDist.scale: 8.0
+      MeanPathDist.class: "f_dwa_controller::MeanPathDistCritic"
+      # MapGridCritic's effective scale is resolution * 0.5 * scale.
+      # A value of 16 therefore gives an interpretable 8 * mean_distance_m.
+      MeanPathDist.scale: 16.0
       GoalDist.scale: 24.0
+      TrajectoryProgress.class: "f_dwa_controller::TrajectoryProgressCritic"
+      # 1.2 m/s x 2.4 s. Near the goal, the critic automatically uses the
+      # shorter remaining Path length.
+      TrajectoryProgress.lookahead_distance: 2.88
+      TrajectoryProgress.scale: 12.0
+      MeanSpeed.class: "f_dwa_controller::MeanSpeedCritic"
+      MeanSpeed.target_speed: 1.2
+      MeanSpeed.scale: 4.0
+      ForwardObstacle.class: "f_dwa_controller::ForwardObstacleCritic"
+      ForwardObstacle.lookahead_distance: 1.2
+      ForwardObstacle.sample_resolution: 0.05
+      # Raw cost is normalized to [0, 1].
+      ForwardObstacle.scale: 8.0
       RotateToGoal.scale: 32.0
       RotateToGoal.class: "f_dwa_controller::HysteresisRotateToGoalCritic"
       RotateToGoal.slowing_factor: 5.0
@@ -182,8 +208,10 @@ local_costmap:
       # Match the 20 Hz controller so a newly marked obstacle is not held for
       # an additional 100 ms before committed-delay revalidation.
       update_frequency: 20.0
-      # Record the same snapshots used by the controller for failure analysis.
-      publish_frequency: 10.0
+      # One snapshot per second is sufficient to associate every 0.5 Hz
+      # candidate evaluation with its local costmap without affecting the
+      # internal 20 Hz costmap update used by control.
+      publish_frequency: 1.0
       resolution: 0.05
       width: 10
       height: 10

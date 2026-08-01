@@ -16,4 +16,32 @@
       soft obstacle-cost accumulation limited to a configurable horizon.
     </description>
   </class>
+  <class
+    type="f_dwa_controller::ForwardObstacleCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Soft local-costmap lookahead beyond the candidate endpoint.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::TrajectoryProgressCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Non-negative lack-of-progress cost measured along the observable Path.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::MeanSpeedCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Mean predicted translational-speed cost reconstructed from trajectory poses.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::MeanPathDistCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Mean transformed-Path distance over every predicted trajectory pose.
+    </description>
+  </class>
 </library>

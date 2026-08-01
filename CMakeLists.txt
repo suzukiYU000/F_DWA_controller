@@ -46,11 +46,15 @@ add_library(${library_name} SHARED
   src/certified_dwb_local_planner.cpp
   src/dwa_controllers.cpp
   src/fir_input_dynamics.cpp
+  src/forward_obstacle_critic.cpp
   src/horizon_obstacle_footprint_critic.cpp
   src/hysteresis_rotate_to_goal_critic.cpp
+  src/mean_path_dist_critic.cpp
+  src/mean_speed_critic.cpp
   src/native_input_dynamics.cpp
   src/native_input_trajectory_generator.cpp
   src/terminal_stop_dynamics.cpp
+  src/trajectory_progress_critic.cpp
   src/trajectory_certifier.cpp
   src/v_dwb_trajectory_generators.cpp
 )
@@ -215,6 +219,22 @@ if(BUILD_TESTING)
       dwb_core
       dwb_msgs
       geometry_msgs
+    )
+  endif()
+
+  ament_add_gtest(test_research_trajectory_critics
+    test/test_research_trajectory_critics.cpp
+  )
+  if(TARGET test_research_trajectory_critics)
+    target_link_libraries(
+      test_research_trajectory_critics ${library_name}
+    )
+    ament_target_dependencies(test_research_trajectory_critics
+      builtin_interfaces
+      dwb_core
+      dwb_msgs
+      geometry_msgs
+      nav_2d_msgs
     )
   endif()
 
