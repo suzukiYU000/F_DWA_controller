@@ -74,6 +74,14 @@ protected:
     std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & results) override;
 
 private:
+  enum class TerminalStopScoreMode
+  {
+    kGlobalGoalDistance,
+    kPathSubgoalDistance,
+    kPathSubgoalProgress,
+    kPathSubgoalForwardRay
+  };
+
   struct IssuedCommand
   {
     rclcpp::Time issued_at;
@@ -107,6 +115,7 @@ private:
   void publish_evaluation(
     const std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & evaluation);
   void prepare_certified_footprint();
+  void prepare_terminal_targets(const geometry_msgs::msg::Pose2D & pose);
   void score_trajectory_components(
     const dwb_msgs::msg::Trajectory2D & trajectory,
     double best_score,
@@ -158,6 +167,10 @@ private:
   double terminal_stop_maximum_time_{8.0};
   double terminal_stop_velocity_threshold_{0.01};
   double terminal_stop_goal_distance_scale_{0.0};
+  double terminal_stop_path_lookahead_distance_{1.5};
+  double terminal_stop_path_lateral_weight_{1.0};
+  TerminalStopScoreMode terminal_stop_score_mode_{
+    TerminalStopScoreMode::kGlobalGoalDistance};
   double terminal_stop_goal_capture_distance_{0.0};
   double terminal_stop_goal_capture_yaw_tolerance_{0.0};
   double minimum_certified_margin_{0.02};
@@ -195,6 +208,8 @@ private:
   std::vector<geometry_msgs::msg::Pose2D> stop_pose_scratch_;
   geometry_msgs::msg::Pose2D current_goal_pose_;
   bool current_goal_pose_valid_{false};
+  geometry_msgs::msg::Pose2D current_terminal_distance_target_pose_;
+  bool current_terminal_distance_target_pose_valid_{false};
 };
 
 }  // namespace f_dwa_controller

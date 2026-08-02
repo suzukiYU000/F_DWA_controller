@@ -478,33 +478,6 @@ bool certify_reserve_recovery_sequence(
     }
   }
 
-  double footprint_radius = 0.0;
-  for (const geometry_msgs::msg::Point & point : certified_footprint) {
-    footprint_radius =
-      std::max(footprint_radius, std::hypot(point.x, point.y));
-  }
-  const geometry_msgs::msg::Pose2D & clear_pose = poses[clearance_index];
-  const auto distance_to_clear_pose =
-    [&clear_pose, footprint_radius](
-    const geometry_msgs::msg::Pose2D & pose)
-    {
-      return std::hypot(
-        clear_pose.x - pose.x, clear_pose.y - pose.y) +
-             footprint_radius * std::abs(
-        normalized_angle_difference(pose.theta, clear_pose.theta));
-    };
-  double previous_distance = distance_to_clear_pose(poses.front());
-  const double monotonic_tolerance =
-    std::max(1.0e-9, maximum_swept_distance * 1.0e-6);
-  for (std::size_t pose_index = 1u;
-    pose_index <= clearance_index; ++pose_index)
-  {
-    const double distance = distance_to_clear_pose(poses[pose_index]);
-    if (distance > previous_distance + monotonic_tolerance) {
-      return false;
-    }
-    previous_distance = distance;
-  }
   return true;
 }
 

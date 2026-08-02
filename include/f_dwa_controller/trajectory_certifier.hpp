@@ -82,9 +82,11 @@ CertificationResult certify_pose_sequence(
   CertificationWorkspace * workspace = nullptr);
 
 // A recovery sequence may start inside only the additional certificate
-// reserve. The planning footprint must remain safe, the motion must progress
-// toward a pose that clears the reserve, and hysteresis optionally requires
-// the complete remaining suffix to stay clear.
+// reserve. The planning footprint must remain safe, the trajectory must reach
+// a pose that clears the reserve, and hysteresis optionally requires the
+// complete remaining suffix to stay clear. Recovery is evaluated over the
+// complete swept footprint rather than by monotonic pose-to-goal distance so
+// a hard-safe rectangular tail swing can be retained.
 bool certify_reserve_recovery_sequence(
   nav2_costmap_2d::Costmap2D & costmap,
   const std::vector<geometry_msgs::msg::Point> & certified_footprint,

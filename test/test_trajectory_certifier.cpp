@@ -166,7 +166,7 @@ TEST(TrajectoryCertifier, RejectsUnknownAndOffCostmap)
   EXPECT_EQ(result.failure, CertificationFailure::kOffCostmap);
 }
 
-TEST(TrajectoryCertifier, ReserveRecoveryClearsOnlyAdditionalMargin)
+TEST(TrajectoryCertifier, ReserveRecoveryClearsAdditionalMargin)
 {
   nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
   unsigned int obstacle_x = 0u;
@@ -195,6 +195,15 @@ TEST(TrajectoryCertifier, ReserveRecoveryClearsOnlyAdditionalMargin)
       true));
 
   poses[1].y = 0.05;
+  EXPECT_TRUE(
+    certify_reserve_recovery_sequence(
+      costmap, certified_footprint, planning_footprint, poses, 0.025,
+      true));
+
+  // A hard-safe sequence that never clears the additional reserve remains
+  // inadmissible, even though recovery motion need not be monotonic.
+  poses[1].y = -0.01;
+  poses[2].y = -0.02;
   EXPECT_FALSE(
     certify_reserve_recovery_sequence(
       costmap, certified_footprint, planning_footprint, poses, 0.025,
@@ -217,6 +226,38 @@ TEST(TrajectoryCertifier, ReserveRecoveryRejectsPlanningFootprintCollision)
     certify_reserve_recovery_sequence(
       costmap, rectangle_footprint(), rectangle_footprint(), poses,
       0.025, true));
+}
+
+TEST(TrajectoryCertifier, ReserveRecoveryAllowsHardSafeNonmonotonicDetour)
+{
+  nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.36, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  std::vector<geometry_msgs::msg::Point> certified_footprint =
+    rectangle_footprint();
+  std::vector<geometry_msgs::msg::Point> planning_footprint =
+    certified_footprint;
+  for (geometry_msgs::msg::Point & point : planning_footprint) {
+    point.y = std::copysign(0.30, point.y);
+  }
+  for (geometry_msgs::msg::Point & point : certified_footprint) {
+    point.y = std::copysign(0.40, point.y);
+  }
+
+  // The intermediate pose moves away from the eventual clear pose. This is
+  // allowed because the complete swept planning footprint remains hard-safe
+  // and the terminal suffix clears the additional reserve.
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].x = -0.20;
+  poses[2].x = 0.70;
+  EXPECT_TRUE(
+    certify_reserve_recovery_sequence(
+      costmap, certified_footprint, planning_footprint, poses, 0.025,
+      true));
 }
 
 TEST(TrajectoryCertifier, ReusedWorkspacePreservesCertificationResult)

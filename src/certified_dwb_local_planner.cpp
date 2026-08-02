@@ -35,6 +35,7 @@
 #include "dwb_core/exceptions.hpp"
 #include "dwb_core/illegal_trajectory_tracker.hpp"
 #include "f_dwa_controller/native_input_trajectory_generator.hpp"
+#include "f_dwa_controller/path_subgoal.hpp"
 #include "f_dwa_controller/terminal_stop_dynamics.hpp"
 #include "f_dwa_controller/trajectory_certifier.hpp"
 #include "nav_2d_utils/conversions.hpp"
@@ -163,6 +164,15 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".terminal_stop_goal_distance_scale",
     rclcpp::ParameterValue(0.0));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".terminal_stop_distance_target",
+    rclcpp::ParameterValue(std::string("global_goal")));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".terminal_stop_path_lookahead_distance",
+    rclcpp::ParameterValue(1.5));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".terminal_stop_path_lateral_weight",
+    rclcpp::ParameterValue(1.0));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".terminal_stop_goal_capture_distance",
     rclcpp::ParameterValue(0.0));
   nav2_util::declare_parameter_if_not_declared(
@@ -221,6 +231,32 @@ void CertifiedDWBLocalPlanner::configure(
   node->get_parameter(
     name + ".terminal_stop_goal_distance_scale",
     terminal_stop_goal_distance_scale_);
+  const std::string terminal_stop_distance_target =
+    node->get_parameter(
+    name + ".terminal_stop_distance_target").as_string();
+  node->get_parameter(
+    name + ".terminal_stop_path_lookahead_distance",
+    terminal_stop_path_lookahead_distance_);
+  node->get_parameter(
+    name + ".terminal_stop_path_lateral_weight",
+    terminal_stop_path_lateral_weight_);
+  if (terminal_stop_distance_target == "global_goal") {
+    terminal_stop_score_mode_ =
+      TerminalStopScoreMode::kGlobalGoalDistance;
+  } else if (terminal_stop_distance_target == "path_subgoal") {
+    terminal_stop_score_mode_ =
+      TerminalStopScoreMode::kPathSubgoalDistance;
+  } else if (terminal_stop_distance_target == "path_progress") {
+    terminal_stop_score_mode_ =
+      TerminalStopScoreMode::kPathSubgoalProgress;
+  } else if (terminal_stop_distance_target == "path_progress_ray") {
+    terminal_stop_score_mode_ =
+      TerminalStopScoreMode::kPathSubgoalForwardRay;
+  } else {
+    throw nav2_core::ControllerException(
+            "terminal_stop_distance_target must be global_goal, "
+            "path_subgoal, path_progress, or path_progress_ray");
+  }
   node->get_parameter(
     name + ".terminal_stop_goal_capture_distance",
     terminal_stop_goal_capture_distance_);
@@ -268,6 +304,9 @@ void CertifiedDWBLocalPlanner::configure(
     !is_positive_finite(terminal_stop_velocity_threshold_) ||
     !std::isfinite(terminal_stop_goal_distance_scale_) ||
     terminal_stop_goal_distance_scale_ < 0.0 ||
+    !is_positive_finite(terminal_stop_path_lookahead_distance_) ||
+    !std::isfinite(terminal_stop_path_lateral_weight_) ||
+    terminal_stop_path_lateral_weight_ < 0.0 ||
     !std::isfinite(terminal_stop_goal_capture_distance_) ||
     terminal_stop_goal_capture_distance_ < 0.0 ||
     !std::isfinite(terminal_stop_goal_capture_yaw_tolerance_) ||
@@ -906,6 +945,7 @@ void CertifiedDWBLocalPlanner::setPlan(const nav_msgs::msg::Path & path)
   terminal_stop_goal_capture_active_ = false;
   has_evaluation_publish_time_ = false;
   current_goal_pose_valid_ = false;
+  current_terminal_distance_target_pose_valid_ = false;
   dwb_core::DWBLocalPlanner::setPlan(path);
 }
 
@@ -918,10 +958,75 @@ void CertifiedDWBLocalPlanner::reset()
   planning_snapshot_.reset();
   has_evaluation_publish_time_ = false;
   current_goal_pose_valid_ = false;
+  current_terminal_distance_target_pose_valid_ = false;
   for (dwb_core::TrajectoryCritic::Ptr & critic : critics_) {
     critic->reset();
   }
   traj_generator_->reset();
+}
+
+void CertifiedDWBLocalPlanner::prepare_terminal_targets(
+  const geometry_msgs::msg::Pose2D & pose)
+{
+  current_goal_pose_valid_ = false;
+  current_terminal_distance_target_pose_valid_ = false;
+  if (global_plan_.poses.empty()) {
+    return;
+  }
+
+  nav_2d_msgs::msg::Pose2DStamped goal_pose;
+  goal_pose.header.frame_id = global_plan_.header.frame_id;
+  goal_pose.header.stamp = global_plan_.header.stamp;
+  goal_pose.pose = global_plan_.poses.back();
+  nav_2d_msgs::msg::Pose2DStamped transformed_goal;
+  if (nav_2d_utils::transformPose(
+      tf_, costmap_ros_->getGlobalFrameID(), goal_pose,
+      transformed_goal, transform_tolerance_))
+  {
+    current_goal_pose_ = transformed_goal.pose;
+    current_goal_pose_valid_ = true;
+  }
+
+  if (terminal_stop_score_mode_ ==
+    TerminalStopScoreMode::kGlobalGoalDistance)
+  {
+    if (current_goal_pose_valid_) {
+      current_terminal_distance_target_pose_ = current_goal_pose_;
+      current_terminal_distance_target_pose_valid_ = true;
+    }
+    return;
+  }
+
+  nav_2d_msgs::msg::Pose2DStamped costmap_pose;
+  costmap_pose.header.frame_id = costmap_ros_->getGlobalFrameID();
+  costmap_pose.header.stamp = global_plan_.header.stamp;
+  costmap_pose.pose = pose;
+  nav_2d_msgs::msg::Pose2DStamped plan_frame_pose;
+  if (!nav_2d_utils::transformPose(
+      tf_, global_plan_.header.frame_id, costmap_pose,
+      plan_frame_pose, transform_tolerance_))
+  {
+    return;
+  }
+
+  geometry_msgs::msg::Pose2D path_subgoal;
+  if (!compute_path_subgoal(
+      global_plan_, plan_frame_pose.pose,
+      terminal_stop_path_lookahead_distance_, path_subgoal))
+  {
+    return;
+  }
+  nav_2d_msgs::msg::Pose2DStamped stamped_subgoal;
+  stamped_subgoal.header = global_plan_.header;
+  stamped_subgoal.pose = path_subgoal;
+  nav_2d_msgs::msg::Pose2DStamped transformed_subgoal;
+  if (nav_2d_utils::transformPose(
+      tf_, costmap_ros_->getGlobalFrameID(), stamped_subgoal,
+      transformed_subgoal, transform_tolerance_))
+  {
+    current_terminal_distance_target_pose_ = transformed_subgoal.pose;
+    current_terminal_distance_target_pose_valid_ = true;
+  }
 }
 
 dwb_msgs::msg::TrajectoryScore
@@ -934,27 +1039,20 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
     prepare_certification_broadphase(
       *costmap_ros_->getCostmap(), certification_workspace_);
   }
-  current_goal_pose_valid_ = false;
-  if (
-    terminal_stop_goal_distance_scale_ > 0.0 &&
-    !global_plan_.poses.empty())
-  {
-    nav_2d_msgs::msg::Pose2DStamped goal_pose;
-    goal_pose.header.frame_id = global_plan_.header.frame_id;
-    goal_pose.header.stamp = global_plan_.header.stamp;
-    goal_pose.pose = global_plan_.poses.back();
-    nav_2d_msgs::msg::Pose2DStamped transformed_goal;
-    if (nav_2d_utils::transformPose(
-        tf_, costmap_ros_->getGlobalFrameID(), goal_pose,
-        transformed_goal, transform_tolerance_))
-    {
-      current_goal_pose_ = transformed_goal.pose;
-      current_goal_pose_valid_ = true;
-    }
-  }
+  prepare_terminal_targets(pose);
   auto native_generator =
     std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
     traj_generator_);
+  const bool terminal_stop_policy_enabled =
+    native_generator && terminal_stop_goal_capture_distance_ > 0.0 &&
+    terminal_stop_goal_capture_yaw_tolerance_ > 0.0;
+  if (certification_enabled_ &&
+    terminal_stop_goal_distance_scale_ > 0.0 &&
+    !current_terminal_distance_target_pose_valid_)
+  {
+    throw nav2_core::ControllerTFError(
+            "Unable to prepare terminal-stop distance target");
+  }
   // Native generators must retain the selected candidate's internal state
   // even when terminal-stop certification is disabled for an ablation.
   if (!certification_enabled_ && !native_generator) {
@@ -962,10 +1060,10 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       pose, velocity, results);
   }
 
-  // A certified stop that has entered the goal capture set is a terminal
+  // A feasible stop that has entered the goal capture set is a terminal
   // policy. Revalidate its remaining suffix against the latest costmap, but do
   // not postpone braking by returning to receding-horizon optimization.
-  if (certification_enabled_ && terminal_stop_goal_capture_active_) {
+  if (terminal_stop_goal_capture_active_) {
     dwb_msgs::msg::TrajectoryScore backup_score;
     if (build_revalidated_backup(pose, backup_score)) {
       if (results) {
@@ -1087,7 +1185,7 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   }
 
   if (best.total >= 0.0) {
-    if (!certification_enabled_) {
+    if (!certification_enabled_ && !terminal_stop_policy_enabled) {
       retained_backup_commands_.clear();
       retained_backup_states_.clear();
       terminal_stop_goal_capture_active_ = false;
@@ -1102,8 +1200,15 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         best.traj, best_stop_poses, &best_stop_velocities,
         &best_stop_states, native_candidate_index))
     {
-      throw nav2_core::NoValidControl(
-              "Certified best trajectory could not be materialized");
+      if (certification_enabled_) {
+        throw nav2_core::NoValidControl(
+                "Certified best trajectory could not be materialized");
+      }
+      retained_backup_commands_.clear();
+      retained_backup_states_.clear();
+      terminal_stop_goal_capture_active_ = false;
+      native_generator->select_command_for_dispatch(best_command_state);
+      return best;
     }
     retained_backup_commands_.clear();
     retained_backup_states_.clear();
@@ -1137,16 +1242,21 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       const double yaw_error = std::abs(std::atan2(
           std::sin(terminal_pose.theta - current_goal_pose_.theta),
           std::cos(terminal_pose.theta - current_goal_pose_.theta)));
-      for (const auto & critic_score : best.scores) {
-        if (
-          critic_score.name == "TerminalStopGoalDist" &&
-          critic_score.raw_score <= terminal_stop_goal_capture_distance_ &&
-          yaw_error <= terminal_stop_goal_capture_yaw_tolerance_)
-        {
-          terminal_stop_goal_capture_active_ = true;
-          break;
-        }
+      const double position_error = std::hypot(
+        terminal_pose.x - current_goal_pose_.x,
+        terminal_pose.y - current_goal_pose_.y);
+      if (
+        position_error <= terminal_stop_goal_capture_distance_ &&
+        yaw_error <= terminal_stop_goal_capture_yaw_tolerance_)
+      {
+        terminal_stop_goal_capture_active_ = true;
       }
+    }
+    if (!certification_enabled_ &&
+      !terminal_stop_goal_capture_active_)
+    {
+      retained_backup_commands_.clear();
+      retained_backup_states_.clear();
     }
     return best;
   }
@@ -1201,8 +1311,13 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
   }
   score.total = 0.0;
   score.scores.clear();
+  const bool score_terminal_stop =
+    certification_enabled_ &&
+    terminal_stop_goal_distance_scale_ > 0.0 &&
+    current_terminal_distance_target_pose_valid_;
   score.scores.reserve(
-    critics_.size() + (certification_enabled_ ? 2u : 0u));
+    critics_.size() + (score_terminal_stop ? 1u : 0u) +
+    (certification_enabled_ ? 2u : 0u));
   for (dwb_core::TrajectoryCritic::Ptr & critic : critics_) {
     dwb_msgs::msg::CriticScore critic_score;
     critic_score.name = critic->getName();
@@ -1224,7 +1339,7 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     }
   }
 
-  if (certification_enabled_) {
+  if (certification_enabled_ || score_terminal_stop) {
     if (best_score >= 0.0 && score.total > best_score) {
       return;
     }
@@ -1232,24 +1347,42 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     if (!build_stop_trajectory(
         trajectory, stop_pose_scratch_, nullptr, nullptr))
     {
-      ++certification_rejections_.terminal_stop_infeasible;
+      if (certification_enabled_) {
+        ++certification_rejections_.terminal_stop_infeasible;
+      }
       throw dwb_core::IllegalTrajectoryException(
-              "SafetyCertificate",
+              certification_enabled_ ?
+              "SafetyCertificate" : "TerminalStopDynamics",
               "No dynamically feasible terminal stop sequence");
     }
 
-    if (
-      terminal_stop_goal_distance_scale_ > 0.0 &&
-      current_goal_pose_valid_)
-    {
+    if (score_terminal_stop) {
       const geometry_msgs::msg::Pose2D & terminal_pose =
         stop_pose_scratch_.back();
       dwb_msgs::msg::CriticScore stop_goal_score;
-      stop_goal_score.name = "TerminalStopGoalDist";
+      switch (terminal_stop_score_mode_) {
+        case TerminalStopScoreMode::kPathSubgoalProgress:
+          stop_goal_score.name = "TerminalStopPathProgress";
+          stop_goal_score.raw_score = path_subgoal_progress_cost(
+            terminal_pose, current_terminal_distance_target_pose_);
+          break;
+        case TerminalStopScoreMode::kPathSubgoalForwardRay:
+          stop_goal_score.name = "TerminalStopPathProgressRay";
+          stop_goal_score.raw_score = path_subgoal_forward_ray_cost(
+            terminal_pose, current_terminal_distance_target_pose_,
+            terminal_stop_path_lateral_weight_);
+          break;
+        default:
+          stop_goal_score.name =
+            terminal_stop_score_mode_ ==
+            TerminalStopScoreMode::kPathSubgoalDistance ?
+            "TerminalStopPathSubgoalDist" : "TerminalStopGoalDist";
+          stop_goal_score.raw_score = std::hypot(
+            terminal_pose.x - current_terminal_distance_target_pose_.x,
+            terminal_pose.y - current_terminal_distance_target_pose_.y);
+          break;
+      }
       stop_goal_score.scale = terminal_stop_goal_distance_scale_;
-      stop_goal_score.raw_score = std::hypot(
-        terminal_pose.x - current_goal_pose_.x,
-        terminal_pose.y - current_goal_pose_.y);
       score.scores.push_back(stop_goal_score);
       score.total +=
         stop_goal_score.raw_score * stop_goal_score.scale;
@@ -1260,7 +1393,9 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
         return;
       }
     }
+  }
 
+  if (certification_enabled_) {
     CertificationFailure failure = CertificationFailure::kInvalidInput;
     bool certificate_used_reserve_recovery = false;
     if (!certify_stop_poses(
@@ -1422,11 +1557,21 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
     poses.push_back(pose);
   }
 
-  CertificationFailure failure = CertificationFailure::kInvalidInput;
   bool used_reserve_recovery = false;
-  if (!certify_stop_poses(
-      poses, failure, nullptr, &used_reserve_recovery))
-  {
+  CertificationFailure failure = CertificationFailure::kInvalidInput;
+  bool backup_is_valid = false;
+  if (certification_enabled_) {
+    backup_is_valid = certify_stop_poses(
+      poses, failure, nullptr, &used_reserve_recovery);
+  } else {
+    const CertificationResult planning_footprint_result =
+      certify_pose_sequence(
+      *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
+      poses, maximum_swept_distance_);
+    failure = planning_footprint_result.failure;
+    backup_is_valid = planning_footprint_result.safe;
+  }
+  if (!backup_is_valid) {
     const CertificationResult planning_footprint_result =
       certify_pose_sequence(
       *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
@@ -1447,7 +1592,8 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
   backup_score.traj.velocity = retained_backup_commands_.front();
   backup_score.traj.poses = std::move(poses);
   dwb_msgs::msg::CriticScore certificate_score;
-  certificate_score.name = "RetainedSafetyBackup";
+  certificate_score.name = certification_enabled_ ?
+    "RetainedSafetyBackup" : "RetainedTerminalStop";
   certificate_score.scale = 1.0;
   certificate_score.raw_score = 0.0;
   backup_score.scores.push_back(certificate_score);

@@ -11,6 +11,7 @@
 #include "f_dwa_controller/forward_obstacle_critic.hpp"
 #include "f_dwa_controller/mean_path_dist_critic.hpp"
 #include "f_dwa_controller/mean_speed_critic.hpp"
+#include "f_dwa_controller/path_subgoal_dist_critic.hpp"
 #include "f_dwa_controller/trajectory_progress_critic.hpp"
 #include "gtest/gtest.h"
 
@@ -39,6 +40,16 @@ public:
     const geometry_msgs::msg::Pose2D & pose) const override
   {
     return pose.y < -0.1 ? 1.0 : 0.0;
+  }
+};
+
+class StubPathSubgoalDistCritic
+  : public f_dwa_controller::PathSubgoalDistCritic
+{
+public:
+  void allowForwardOvershoot()
+  {
+    allow_forward_overshoot_ = true;
   }
 };
 
@@ -131,6 +142,34 @@ TEST(TrajectoryProgressCritic, IsNeutralForSinglePosePlanNearGoal)
   path.poses.push_back(goal);
   ASSERT_TRUE(critic.prepare(pose, velocity, goal, path));
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(trajectory_to(1.0, 1.0)), 0.0);
+}
+
+TEST(PathSubgoalDistCritic, ScoresNominalEndpointAgainstPathLookahead)
+{
+  f_dwa_controller::PathSubgoalDistCritic critic;
+  geometry_msgs::msg::Pose2D pose;
+  nav_2d_msgs::msg::Twist2D velocity;
+  geometry_msgs::msg::Pose2D goal;
+  ASSERT_TRUE(critic.prepare(pose, velocity, goal, straight_path(4.0)));
+
+  EXPECT_NEAR(critic.scoreTrajectory(trajectory_to(1.0, 1.0)), 0.5, 1.0e-9);
+  EXPECT_NEAR(critic.scoreTrajectory(trajectory_to(1.5, 1.0)), 0.0, 1.0e-9);
+  EXPECT_NEAR(critic.scoreTrajectory(trajectory_to(2.0, 1.0)), 0.5, 1.0e-9);
+}
+
+TEST(PathSubgoalDistCritic, AllowsForwardOvershootButRetainsLateralError)
+{
+  StubPathSubgoalDistCritic critic;
+  critic.allowForwardOvershoot();
+  geometry_msgs::msg::Pose2D pose;
+  nav_2d_msgs::msg::Twist2D velocity;
+  geometry_msgs::msg::Pose2D goal;
+  ASSERT_TRUE(critic.prepare(pose, velocity, goal, straight_path(4.0)));
+
+  auto trajectory = trajectory_to(2.0, 1.0);
+  EXPECT_NEAR(critic.scoreTrajectory(trajectory), 0.0, 1.0e-9);
+  trajectory.poses.back().y = 0.4;
+  EXPECT_NEAR(critic.scoreTrajectory(trajectory), 0.4, 1.0e-9);
 }
 
 TEST(MeanSpeedCritic, UsesPredictedMotionInsteadOfRequestedVelocity)

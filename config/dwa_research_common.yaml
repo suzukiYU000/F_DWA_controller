@@ -73,10 +73,14 @@ controller_server:
       # The same capture magnitude applies to internally tracked acceleration
       # and F-DWA raw-input history before terminal state is cleared.
       terminal_stop_velocity_threshold: 0.01
-      # Score the endpoint of the already-generated certified stop trajectory.
-      # This prevents receding-horizon GoalDist from postponing braking for
-      # higher-order dynamics while adding no second trajectory search.
+      # Score whether the already-generated certified stop trajectory reaches
+      # 1.5 m of forward Path progress. Overshoot is not penalized here;
+      # nominal-trajectory critics retain lateral tracking responsibility.
+      # This adds no second trajectory search and keeps safety as a separate
+      # swept-footprint rejection.
       terminal_stop_goal_distance_scale: 24.0
+      terminal_stop_distance_target: path_progress
+      terminal_stop_path_lookahead_distance: 1.5
       # Once an already-certified stop ends inside this terminal set, retain
       # and revalidate its remaining suffix instead of replanning braking away.
       # Set to 0.0 to disable the capture policy.
@@ -115,12 +119,13 @@ controller_server:
       planning_metrics_report_interval: 1000
       planning_deadline_seconds: 0.05
       # Candidate evaluation is diagnostic output, not a control input.
-      # One complete candidate set every two seconds is sufficient for post-run
-      # animation and cost diagnosis. Candidate generation and scoring still
-      # run on every controller tick; this only prevents large diagnostic
-      # messages from causing rosbag transport loss.
+      # One complete candidate set every five seconds is sufficient for the
+      # post-run cost diagnosis. R28d showed that 0.5 Hz could invalidate both
+      # the run and its automatic retry through rosbag loss, while 0.2 Hz
+      # recorded the same control outcome with zero loss. Candidate generation
+      # and scoring still run on every controller tick.
       publish_evaluation: true
-      evaluation_publish_frequency: 0.5
+      evaluation_publish_frequency: 0.2
       publish_trajectories: false
       stateful: true
       critics:
@@ -155,8 +160,11 @@ controller_server:
       GoalAlign.forward_point_distance: 0.325
       MeanPathDist.class: "f_dwa_controller::MeanPathDistCritic"
       # MapGridCritic's effective scale is resolution * 0.5 * scale.
-      # A value of 16 therefore gives an interpretable 8 * mean_distance_m.
-      MeanPathDist.scale: 16.0
+      # A value of 80 therefore gives an interpretable 40 * mean_distance_m.
+      # R30--R32 used this same value in Straight, Env2, and Corridor: it
+      # restored whole-trajectory Path tracking without preventing the lateral
+      # departures required to pass alternating LiDAR-only obstacles.
+      MeanPathDist.scale: 80.0
       GoalDist.scale: 24.0
       TrajectoryProgress.class: "f_dwa_controller::TrajectoryProgressCritic"
       # 1.2 m/s x 2.4 s. Near the goal, the critic automatically uses the

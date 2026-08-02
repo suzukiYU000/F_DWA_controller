@@ -53,6 +53,8 @@ add_library(${library_name} SHARED
   src/mean_speed_critic.cpp
   src/native_input_dynamics.cpp
   src/native_input_trajectory_generator.cpp
+  src/path_subgoal.cpp
+  src/path_subgoal_dist_critic.cpp
   src/terminal_stop_dynamics.cpp
   src/trajectory_progress_critic.cpp
   src/trajectory_certifier.cpp
@@ -318,6 +320,21 @@ if(BUILD_TESTING)
     ament_target_dependencies(test_trajectory_certifier
       geometry_msgs
       nav2_costmap_2d
+    )
+  endif()
+
+  ament_add_gtest(test_path_subgoal
+    test/test_path_subgoal.cpp
+    src/path_subgoal.cpp
+  )
+  if(TARGET test_path_subgoal)
+    target_include_directories(test_path_subgoal
+      PRIVATE
+        include
+    )
+    ament_target_dependencies(test_path_subgoal
+      geometry_msgs
+      nav_2d_msgs
     )
   endif()
 

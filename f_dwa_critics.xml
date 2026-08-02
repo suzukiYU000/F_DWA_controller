@@ -31,6 +31,13 @@
     </description>
   </class>
   <class
+    type="f_dwa_controller::PathSubgoalDistCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Nominal trajectory endpoint distance to a Path-arclength subgoal.
+    </description>
+  </class>
+  <class
     type="f_dwa_controller::MeanSpeedCritic"
     base_class_type="dwb_core::TrajectoryCritic">
     <description>
