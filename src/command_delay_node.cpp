@@ -41,6 +41,14 @@ namespace
 
 constexpr double kMaximumPublishFrequencyHz = 33.333333333333333;
 
+uint64_t steady_time_nanoseconds(
+  const std::chrono::steady_clock::time_point time_point)
+{
+  const auto count = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    time_point.time_since_epoch()).count();
+  return count > 0 ? static_cast<uint64_t>(count) : 0u;
+}
+
 diagnostic_msgs::msg::KeyValue make_key_value(
   const std::string & key,
   const std::string & value)
@@ -98,6 +106,9 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
   const std::string invalidate_trial_service_name =
     declare_parameter<std::string>(
     "invalidate_trial_service_name", "~/invalidate_trial");
+  const std::string emergency_stop_service_name =
+    declare_parameter<std::string>(
+    "emergency_stop_service_name", "~/emergency_stop");
   const double publish_frequency_hz =
     declare_parameter<double>("publish_frequency_hz", kMaximumPublishFrequencyHz);
   stopped_velocity_threshold_ =
@@ -123,7 +134,7 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
       get_logger(),
       "zero_threshold is deprecated; use command_zero_threshold");
   }
-  const int64_t max_queue_depth = declare_parameter<int64_t>("max_queue_depth", 5);
+  const int64_t max_queue_depth = declare_parameter<int64_t>("max_queue_depth", 24);
   const int64_t random_seed = declare_parameter<int64_t>("random_seed", 0);
 
   if (!std::isfinite(publish_frequency_hz) || publish_frequency_hz <= 0.0 ||
@@ -195,9 +206,16 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
     std::bind(
       &CommandDelayNode::invalidate_trial_callback,
       this, std::placeholders::_1, std::placeholders::_2));
+  emergency_stop_service_ = create_service<std_srvs::srv::Trigger>(
+    emergency_stop_service_name,
+    std::bind(
+      &CommandDelayNode::emergency_stop_callback,
+      this, std::placeholders::_1, std::placeholders::_2));
 
   publish_transport_valid(true);
   geometry_msgs::msg::Twist zero_command;
+  const uint64_t initial_steady_time_ns =
+    steady_time_nanoseconds(std::chrono::steady_clock::now());
   const rclcpp::Time initial_time = now();
   last_observed_time_ = initial_time;
   has_observed_time_ = true;
@@ -205,6 +223,8 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
   applied_command_publisher_->publish(zero_command);
   f_dwa_controller::msg::CommandDispatch initial_dispatch;
   initial_dispatch.header.stamp = initial_time;
+  initial_dispatch.received_at = initial_time;
+  initial_dispatch.received_steady_time_ns = initial_steady_time_ns;
   initial_dispatch.command = zero_command;
   initial_dispatch.has_sequence = false;
   command_dispatch_publisher_->publish(initial_dispatch);
@@ -227,6 +247,8 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
 void CommandDelayNode::command_callback(
   const geometry_msgs::msg::Twist::SharedPtr message)
 {
+  const uint64_t received_steady_time_ns =
+    steady_time_nanoseconds(std::chrono::steady_clock::now());
   const rclcpp::Time received_at = now();
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -257,7 +279,9 @@ void CommandDelayNode::command_callback(
     last_command_received_time_ = received_at;
     has_command_received_time_ = true;
 
-    if (!delay_queue_->enqueue(*message, received_at)) {
+    if (!delay_queue_->enqueue(
+        *message, received_at, received_steady_time_ns))
+    {
       invalidate_transport(received_at, "command queue overflow");
       return;
     }
@@ -274,6 +298,9 @@ void CommandDelayNode::timer_callback()
   const auto callback_started_at = std::chrono::steady_clock::now();
   const rclcpp::Time callback_time = now();
   rclcpp::Time dispatch_time(0, 0, callback_time.get_clock_type());
+  rclcpp::Time command_received_at(0, 0, callback_time.get_clock_type());
+  uint64_t command_received_steady_time_ns = 0u;
+  uint64_t dispatch_steady_time_ns = 0u;
   bool command_changed = false;
   bool reset_applied = false;
   bool transport_stopped = false;
@@ -311,6 +338,7 @@ void CommandDelayNode::timer_callback()
       last_applied_sequence_ = 0;
       has_applied_sequence_ = false;
       transport_valid_ = true;
+      emergency_stop_active_ = false;
       last_observed_time_ = callback_time;
       has_observed_time_ = true;
       last_command_received_time_ =
@@ -324,6 +352,9 @@ void CommandDelayNode::timer_callback()
         last_applied_command_ = due_command->command;
         last_applied_sequence_ = due_command->sequence;
         has_applied_sequence_ = true;
+        command_received_at = due_command->received_at;
+        command_received_steady_time_ns =
+          due_command->received_steady_time_ns;
         command_changed = true;
       }
     } else {
@@ -337,6 +368,8 @@ void CommandDelayNode::timer_callback()
     // releasing the state lock so a concurrently scheduled reset cannot
     // establish a different pacing boundary.
     dispatch_time = now();
+    dispatch_steady_time_ns =
+      steady_time_nanoseconds(std::chrono::steady_clock::now());
     last_robot_publish_time_ = dispatch_time;
     has_robot_publish_time_ = true;
   }
@@ -347,17 +380,35 @@ void CommandDelayNode::timer_callback()
   // The strict last_robot_publish_time_ gate above still prevents catch-up.
   publish_timer_->reset();
 
+  std::lock_guard<std::mutex> publication_lock(publish_mutex_);
+  {
+    // The emergency service can invalidate the transport after this Timer
+    // selected a command but before DDS publication. Recheck under the
+    // publication boundary so a stale non-zero command can never overtake the
+    // emergency zero.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (emergency_stop_active_) {
+      command_to_publish = geometry_msgs::msg::Twist();
+      command_changed = false;
+      reset_applied = false;
+      transport_stopped = true;
+    }
+  }
   command_publisher_->publish(command_to_publish);
   applied_command_publisher_->publish(command_to_publish);
   if (reset_applied) {
     f_dwa_controller::msg::CommandDispatch reset_dispatch;
     reset_dispatch.header.stamp = dispatch_time;
+    reset_dispatch.received_at = dispatch_time;
+    reset_dispatch.received_steady_time_ns = dispatch_steady_time_ns;
     reset_dispatch.command = command_to_publish;
     reset_dispatch.has_sequence = false;
     command_dispatch_publisher_->publish(reset_dispatch);
   } else if (command_changed) {
     f_dwa_controller::msg::CommandDispatch dispatch;
     dispatch.header.stamp = dispatch_time;
+    dispatch.received_at = command_received_at;
+    dispatch.received_steady_time_ns = command_received_steady_time_ns;
     dispatch.command = command_to_publish;
     dispatch.sequence_id = applied_sequence;
     dispatch.has_sequence = has_applied_sequence;
@@ -418,6 +469,70 @@ void CommandDelayNode::invalidate_trial_callback(
   response->message = "transport trial marked invalid";
 }
 
+void CommandDelayNode::emergency_stop_callback(
+  const std::shared_ptr<std_srvs::srv::Trigger::Request>/*request*/,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  const uint64_t stopped_steady_time_ns =
+    steady_time_nanoseconds(std::chrono::steady_clock::now());
+  const rclcpp::Time stopped_at = now();
+  geometry_msgs::msg::Twist zero_command;
+  std::vector<DelayedCommand> discarded_commands;
+  std::size_t discarded_count = 0;
+  uint64_t next_sequence = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    discarded_commands = delay_queue_->snapshot();
+    discarded_count = discarded_commands.size();
+    next_sequence = delay_queue_->next_sequence();
+    delay_queue_->clear();
+    reset_publication_pending_ = false;
+    emergency_stop_active_ = true;
+    transport_valid_ = false;
+    last_applied_command_ = zero_command;
+    last_applied_sequence_ = 0;
+    has_applied_sequence_ = false;
+    last_observed_time_ = stopped_at;
+    has_observed_time_ = true;
+    last_command_received_time_ =
+      rclcpp::Time(0, 0, stopped_at.get_clock_type());
+    has_command_received_time_ = false;
+    last_robot_publish_time_ = stopped_at;
+    has_robot_publish_time_ = true;
+  }
+
+  // Emergency stop is the only deliberate bypass of the nominal-delay FIFO.
+  // Publish the zero from this service callback so it is not delayed until the
+  // next transport Timer tick. The invalid state prevents a queued or newly
+  // arriving command from re-enabling motion before an explicit trial reset.
+  std::lock_guard<std::mutex> publication_lock(publish_mutex_);
+  command_publisher_->publish(zero_command);
+  applied_command_publisher_->publish(zero_command);
+  f_dwa_controller::msg::CommandDispatch dispatch;
+  dispatch.header.stamp = stopped_at;
+  dispatch.received_at = stopped_at;
+  dispatch.received_steady_time_ns = stopped_steady_time_ns;
+  dispatch.command = zero_command;
+  dispatch.has_sequence = false;
+  command_dispatch_publisher_->publish(dispatch);
+  publish_transport_valid(false);
+  publish_transport_stopped(true, true);
+  publish_diagnostic(
+    diagnostic_msgs::msg::DiagnosticStatus::ERROR,
+    "emergency_stop: delayed command FIFO discarded and zero dispatched",
+    stopped_at,
+    discarded_count,
+    next_sequence,
+    discarded_commands);
+  publish_timer_->reset();
+
+  response->success = true;
+  response->message =
+    "emergency stop applied immediately; discarded " +
+    std::to_string(discarded_count) + " delayed command(s)";
+  RCLCPP_ERROR(get_logger(), "%s", response->message.c_str());
+}
+
 bool CommandDelayNode::observe_time_locked(const rclcpp::Time & observed_at)
 {
   if (has_observed_time_ && observed_at < last_observed_time_) {
@@ -444,7 +559,8 @@ void CommandDelayNode::invalidate_transport(
       queued_timing << ";";
     }
     queued_timing << queued.sequence << "@" <<
-      queued.received_at.seconds() << "->" <<
+      queued.received_at.seconds() <<
+      "[steady_ns=" << queued.received_steady_time_ns << "]->" <<
       queued.eligible_at.seconds();
   }
 
@@ -512,9 +628,10 @@ void CommandDelayNode::publish_transport_stopped(
 
 bool CommandDelayNode::is_transport_stopped_locked() const
 {
-  return transport_valid_ && delay_queue_->empty() &&
+  return emergency_stop_active_ ||
+         (transport_valid_ && delay_queue_->empty() &&
          CommandDelayQueue::is_zero(
-    last_applied_command_, stopped_velocity_threshold_);
+    last_applied_command_, stopped_velocity_threshold_));
 }
 
 void CommandDelayNode::publish_diagnostic(
@@ -553,6 +670,7 @@ void CommandDelayNode::publish_diagnostic(
     std::ostringstream value;
     value << "sequence=" << queued.sequence <<
       ",received_at=" << queued.received_at.seconds() <<
+      ",received_steady_time_ns=" << queued.received_steady_time_ns <<
       ",eligible_at=" << queued.eligible_at.seconds() <<
       ",sampled_delay_ms=" << queued.sampled_delay_ms <<
       "," << command_to_string(queued.command);

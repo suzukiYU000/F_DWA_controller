@@ -10,6 +10,7 @@ command_delay_transport:
     diagnostics_topic: "/diagnostics"
     reset_trial_service_name: "~/reset_trial_state"
     invalidate_trial_service_name: "~/invalidate_trial"
+    emergency_stop_service_name: "~/emergency_stop"
     publish_frequency_hz: 33.333333333333333
     # Nav2 can deliver a slightly early callback and emits an immediate final
     # zero at goal. Preserve FIFO order here; the robot-facing Timer owns the
@@ -24,7 +25,8 @@ command_delay_transport:
     # F-8's first valid increment is smaller than 0.01 m/s.
     command_zero_threshold: 0.0
     # At a 20 Hz producer rate, at most two commands normally occupy the
-    # 60--80 ms delay window. Five slots also cover producer/Timer phase and
-    # bounded scheduling jitter; further growth is invalid.
-    max_queue_depth: 5
+    # 60--80 ms delay window. Gazebo /clock may briefly stop while wall-time
+    # controller callbacks continue; 24 slots preserve FIFO order through
+    # 1.0 s of bounded clock stall. Further growth remains a hard failure.
+    max_queue_depth: 24
     random_seed: 0

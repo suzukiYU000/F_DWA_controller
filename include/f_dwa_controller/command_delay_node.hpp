@@ -54,6 +54,9 @@ private:
   void invalidate_trial_callback(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  void emergency_stop_callback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   [[nodiscard]] bool observe_time_locked(const rclcpp::Time & observed_at);
   void invalidate_transport(
     const rclcpp::Time & detected_at,
@@ -70,11 +73,16 @@ private:
     const std::vector<DelayedCommand> & queued_commands);
 
   std::mutex mutex_;
+  // Serializes robot-facing publications with the emergency-stop callback.
+  // State is never held while waiting for this mutex, which avoids lock-order
+  // inversion with the Timer's final state recheck.
+  std::mutex publish_mutex_;
   std::unique_ptr<CommandDelayQueue> delay_queue_;
   geometry_msgs::msg::Twist last_applied_command_;
   uint64_t last_applied_sequence_{0};
   bool has_applied_sequence_{false};
   bool transport_valid_{true};
+  bool emergency_stop_active_{false};
   bool reset_publication_pending_{false};
   uint64_t pending_reset_seed_{0};
   std::chrono::steady_clock::time_point pending_reset_requested_at_;
@@ -99,6 +107,7 @@ private:
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_trial_service_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr invalidate_trial_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr emergency_stop_service_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
 };
 

@@ -22,8 +22,13 @@ Odometry velocity is not a nominal-state input.
 `f_dwa_controller/msg/CommandDispatch` event published only when a command is
 handed to the robot-facing publisher. Its stamp is observable software dispatch
 time, not an estimate of the physical motor-actuation instant. Its sequence ID
-detects dropped, reordered, or ambiguous duplicate-velocity events. The
-controller correlates each event with its FIFO command ledger. A/J state follows
+detects dropped, reordered, or ambiguous duplicate-velocity events. The FIFO
+reception event also carries a same-host monotonic-clock timestamp; this is the
+causal key used to exclude numerically identical Controller results issued only
+after the command entered the transport. ROS time is retained for diagnostics,
+but is not used for this comparison because accelerated `/clock` samples are
+not synchronized across processes. The controller correlates each event with
+its FIFO command ledger. A/J state follows
 that ledger; F-DWA carries the selected raw input and FIR state as metadata.
 Inverse FIR reconstruction from differentiated velocity is not used by the
 certified path. An unmatched nonzero dispatch invalidates the certificate

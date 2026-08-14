@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <future>
 #include <limits>
@@ -209,6 +210,8 @@ TEST_F(CommandDelayNodeTest, TrialResetIsAppliedOnlyAtNextTimerBoundary)
   EXPECT_DOUBLE_EQ(dispatches.front().command.linear.x, 0.0);
   EXPECT_DOUBLE_EQ(dispatches.front().command.angular.z, 0.0);
   EXPECT_NE(dispatches.front().header.stamp.sec, 0);
+  EXPECT_EQ(dispatches.front().received_at, dispatches.front().header.stamp);
+  EXPECT_GT(dispatches.front().received_steady_time_ns, 0u);
   EXPECT_TRUE(valid_states.front());
   EXPECT_TRUE(stopped_states.front());
 
@@ -520,6 +523,8 @@ TEST_F(CommandDelayNodeTest, NormalTwentyTicksMeetPacingRateAndMinimumInterval)
     client_node->create_publisher<geometry_msgs::msg::Twist>(
     prefix + "/input", rclcpp::QoS(24).reliable());
   std::vector<rclcpp::Time> dispatch_stamps;
+  std::vector<rclcpp::Time> received_stamps;
+  std::vector<uint64_t> received_steady_stamps;
   std::vector<uint64_t> dispatch_sequences;
   std::promise<void> dispatch_count_reached;
   auto dispatch_future = dispatch_count_reached.get_future();
@@ -527,11 +532,15 @@ TEST_F(CommandDelayNodeTest, NormalTwentyTicksMeetPacingRateAndMinimumInterval)
     client_node->create_subscription<f_dwa_controller::msg::CommandDispatch>(
     prefix + "/dispatch",
     rclcpp::QoS(24).reliable().transient_local(),
-    [&dispatch_stamps, &dispatch_sequences, &dispatch_count_reached](
+    [&dispatch_stamps, &received_stamps, &received_steady_stamps, &dispatch_sequences,
+    &dispatch_count_reached](
       const f_dwa_controller::msg::CommandDispatch::SharedPtr message)
     {
       if (message && message->has_sequence) {
         dispatch_stamps.emplace_back(message->header.stamp);
+        received_stamps.emplace_back(message->received_at);
+        received_steady_stamps.emplace_back(
+          message->received_steady_time_ns);
         dispatch_sequences.emplace_back(message->sequence_id);
         if (dispatch_stamps.size() == kDispatchCount) {
           dispatch_count_reached.set_value();
@@ -563,6 +572,8 @@ TEST_F(CommandDelayNodeTest, NormalTwentyTicksMeetPacingRateAndMinimumInterval)
       dispatch_future, std::chrono::seconds(2)),
     rclcpp::FutureReturnCode::SUCCESS);
   ASSERT_EQ(dispatch_stamps.size(), kDispatchCount);
+  ASSERT_EQ(received_stamps.size(), kDispatchCount);
+  ASSERT_EQ(received_steady_stamps.size(), kDispatchCount);
   ASSERT_EQ(dispatch_sequences.size(), kDispatchCount);
 
   const int64_t minimum_interval_nanoseconds =
@@ -578,6 +589,15 @@ TEST_F(CommandDelayNodeTest, NormalTwentyTicksMeetPacingRateAndMinimumInterval)
       minimum_interval_nanoseconds);
     if (interval_nanoseconds < observed_minimum_interval_nanoseconds) {
       observed_minimum_interval_nanoseconds = interval_nanoseconds;
+    }
+  }
+  for (std::size_t index = 0; index < kDispatchCount; ++index) {
+    EXPECT_LE(received_stamps[index], dispatch_stamps[index]);
+    EXPECT_GT(received_steady_stamps[index], 0u);
+    if (index > 0u) {
+      EXPECT_LT(
+        received_steady_stamps[index - 1u],
+        received_steady_stamps[index]);
     }
   }
   EXPECT_EQ(dispatch_sequences.front(), 0u);
@@ -720,6 +740,206 @@ TEST_F(CommandDelayNodeTest, LateTimerCallbackReanchorsAtRobotHandoff)
 
   valid_subscriber.reset();
   dispatch_subscriber.reset();
+  executor.remove_node(client_node);
+  executor.remove_node(transport);
+}
+
+TEST_F(CommandDelayNodeTest, EmergencyStopImmediatelyDiscardsDelayedCommands)
+{
+  const std::string prefix = "/f_dwa_controller_emergency_stop_test";
+  const std::string service_name = prefix + "/emergency_stop";
+  const std::string reset_service_name = prefix + "/reset";
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+    std::vector<rclcpp::Parameter>{
+      rclcpp::Parameter("input_topic", prefix + "/input"),
+      rclcpp::Parameter("output_topic", prefix + "/output"),
+      rclcpp::Parameter("applied_topic", prefix + "/applied"),
+      rclcpp::Parameter("dispatch_topic", prefix + "/dispatch"),
+      rclcpp::Parameter("transport_valid_topic", prefix + "/valid"),
+      rclcpp::Parameter("transport_stopped_topic", prefix + "/stopped"),
+      rclcpp::Parameter("diagnostics_topic", prefix + "/diagnostics"),
+      rclcpp::Parameter("emergency_stop_service_name", service_name),
+      rclcpp::Parameter("reset_trial_service_name", reset_service_name),
+      rclcpp::Parameter("publish_frequency_hz", 2.0)});
+
+  const auto transport = std::make_shared<CommandDelayNode>(options);
+  const auto client_node =
+    std::make_shared<rclcpp::Node>("command_delay_emergency_stop_client_test");
+  const auto client =
+    client_node->create_client<std_srvs::srv::Trigger>(service_name);
+  const auto reset_client =
+    client_node->create_client<std_srvs::srv::Trigger>(reset_service_name);
+  const auto command_publisher =
+    client_node->create_publisher<geometry_msgs::msg::Twist>(
+    prefix + "/input", rclcpp::QoS(2).reliable());
+  std::vector<geometry_msgs::msg::Twist> outputs;
+  std::vector<geometry_msgs::msg::Twist> applied_commands;
+  std::vector<f_dwa_controller::msg::CommandDispatch> dispatches;
+  std::vector<bool> valid_states;
+  std::vector<bool> stopped_states;
+  auto output_subscriber =
+    client_node->create_subscription<geometry_msgs::msg::Twist>(
+    prefix + "/output", rclcpp::QoS(2).reliable(),
+    [&outputs](const geometry_msgs::msg::Twist::SharedPtr message) {
+      outputs.push_back(*message);
+    });
+  auto applied_subscriber =
+    client_node->create_subscription<geometry_msgs::msg::Twist>(
+    prefix + "/applied", rclcpp::QoS(2).reliable(),
+    [&applied_commands](const geometry_msgs::msg::Twist::SharedPtr message) {
+      applied_commands.push_back(*message);
+    });
+  auto dispatch_subscriber =
+    client_node->create_subscription<f_dwa_controller::msg::CommandDispatch>(
+    prefix + "/dispatch", rclcpp::QoS(2).reliable().transient_local(),
+    [&dispatches](
+      const f_dwa_controller::msg::CommandDispatch::SharedPtr message) {
+      dispatches.push_back(*message);
+    });
+  auto valid_subscriber =
+    client_node->create_subscription<std_msgs::msg::Bool>(
+    prefix + "/valid", rclcpp::QoS(2).reliable().transient_local(),
+    [&valid_states](const std_msgs::msg::Bool::SharedPtr message) {
+      valid_states.push_back(message->data);
+    });
+  auto stopped_subscriber =
+    client_node->create_subscription<std_msgs::msg::Bool>(
+    prefix + "/stopped", rclcpp::QoS(2).reliable().transient_local(),
+    [&stopped_states](const std_msgs::msg::Bool::SharedPtr message) {
+      stopped_states.push_back(message->data);
+    });
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(transport);
+  executor.add_node(client_node);
+  ASSERT_TRUE(client->wait_for_service(std::chrono::seconds(1)));
+  ASSERT_TRUE(reset_client->wait_for_service(std::chrono::seconds(1)));
+  const auto match_deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (command_publisher->get_subscription_count() == 0u &&
+    std::chrono::steady_clock::now() < match_deadline)
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GT(command_publisher->get_subscription_count(), 0u);
+
+  geometry_msgs::msg::Twist moving_command;
+  moving_command.linear.x = 0.4;
+  command_publisher->publish(moving_command);
+  const auto enqueue_deadline =
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(30);
+  while (std::chrono::steady_clock::now() < enqueue_deadline) {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  outputs.clear();
+  applied_commands.clear();
+  dispatches.clear();
+  valid_states.clear();
+  stopped_states.clear();
+
+  auto future = client->async_send_request(
+    std::make_shared<std_srvs::srv::Trigger::Request>());
+  ASSERT_EQ(
+    executor.spin_until_future_complete(future, std::chrono::seconds(1)),
+    rclcpp::FutureReturnCode::SUCCESS);
+  const auto response = future.get();
+  ASSERT_NE(response, nullptr);
+  EXPECT_TRUE(response->success);
+  EXPECT_NE(response->message.find("discarded 1"), std::string::npos);
+
+  const auto message_deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while ((outputs.empty() || applied_commands.empty() || dispatches.empty() ||
+    valid_states.empty() || stopped_states.empty()) &&
+    std::chrono::steady_clock::now() < message_deadline)
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_FALSE(outputs.empty());
+  ASSERT_FALSE(applied_commands.empty());
+  ASSERT_FALSE(dispatches.empty());
+  ASSERT_FALSE(valid_states.empty());
+  ASSERT_FALSE(stopped_states.empty());
+  EXPECT_DOUBLE_EQ(outputs.back().linear.x, 0.0);
+  EXPECT_DOUBLE_EQ(applied_commands.back().linear.x, 0.0);
+  EXPECT_DOUBLE_EQ(dispatches.back().command.linear.x, 0.0);
+  EXPECT_FALSE(dispatches.back().has_sequence);
+  EXPECT_GT(dispatches.back().received_steady_time_ns, 0u);
+  EXPECT_FALSE(valid_states.back());
+  EXPECT_TRUE(stopped_states.back());
+
+  outputs.clear();
+  command_publisher->publish(moving_command);
+  const auto blocked_command_deadline =
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
+  while (std::chrono::steady_clock::now() < blocked_command_deadline) {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_FALSE(outputs.empty());
+  EXPECT_TRUE(
+    std::all_of(
+      outputs.begin(), outputs.end(),
+      [](const geometry_msgs::msg::Twist & command) {
+        return command.linear.x == 0.0 && command.angular.z == 0.0;
+      }));
+
+  // An explicit trial reset is the only recovery from the emergency latch.
+  // It must publish a new zero/valid/stopped boundary before accepting a new
+  // delayed command; restarting the transport process is not required.
+  valid_states.clear();
+  stopped_states.clear();
+  auto reset_future = reset_client->async_send_request(
+    std::make_shared<std_srvs::srv::Trigger::Request>());
+  ASSERT_EQ(
+    executor.spin_until_future_complete(reset_future, std::chrono::seconds(1)),
+    rclcpp::FutureReturnCode::SUCCESS);
+  const auto reset_response = reset_future.get();
+  ASSERT_NE(reset_response, nullptr);
+  EXPECT_TRUE(reset_response->success);
+  const auto reset_deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while ((valid_states.empty() || !valid_states.back() ||
+    stopped_states.empty() || !stopped_states.back()) &&
+    std::chrono::steady_clock::now() < reset_deadline)
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_FALSE(valid_states.empty());
+  ASSERT_FALSE(stopped_states.empty());
+  EXPECT_TRUE(valid_states.back());
+  EXPECT_TRUE(stopped_states.back());
+
+  outputs.clear();
+  command_publisher->publish(moving_command);
+  const auto resumed_command_deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::none_of(
+      outputs.begin(), outputs.end(),
+      [](const geometry_msgs::msg::Twist & command) {
+        return command.linear.x > 0.0;
+      }) && std::chrono::steady_clock::now() < resumed_command_deadline)
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(
+    std::any_of(
+      outputs.begin(), outputs.end(),
+      [](const geometry_msgs::msg::Twist & command) {
+        return command.linear.x > 0.0;
+      }));
+
+  stopped_subscriber.reset();
+  valid_subscriber.reset();
+  dispatch_subscriber.reset();
+  applied_subscriber.reset();
+  output_subscriber.reset();
   executor.remove_node(client_node);
   executor.remove_node(transport);
 }

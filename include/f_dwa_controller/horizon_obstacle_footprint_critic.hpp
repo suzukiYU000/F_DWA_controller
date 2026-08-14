@@ -14,24 +14,33 @@ namespace f_dwa_controller
 {
 
 /**
- * @brief Score the executable obstacle-avoidance horizon.
+ * @brief Hard-check the complete nominal rollout with the physical footprint.
  *
- * Poses through score_time_horizon use Nav2's ObstacleFootprintCritic and are
- * averaged so the scale does not depend on the sampling interval. The common
- * safety certificate independently validates the delayed first command and
- * its complete stopping trajectory; later poses in the DWB constant-control
- * scoring rollout are not executed before replanning.
+ * Every generated pose and every swept segment is checked through Nav2's
+ * ObstacleFootprintCritic. A collision throws IllegalTrajectoryException;
+ * every legal trajectory returns a neutral raw score of zero. Soft obstacle
+ * ranking belongs to ForwardObstacle, FootprintClearance, and BaseObstacle.
+ * score_time_horizon remains a validated compatibility parameter only and no
+ * longer truncates either the hard check or a soft score.
  */
 class HorizonObstacleFootprintCritic
   : public dwb_critics::ObstacleFootprintCritic
 {
 public:
   void onInit() override;
+  bool prepare(
+    const geometry_msgs::msg::Pose2D & pose,
+    const nav_2d_msgs::msg::Twist2D & velocity,
+    const geometry_msgs::msg::Pose2D & goal,
+    const nav_2d_msgs::msg::Path2D & global_plan) override;
   double scoreTrajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory) override;
 
 protected:
+  // Deprecated compatibility parameter. It has no scoring or gating effect.
   double score_time_horizon_{1.25};
+  double maximum_swept_distance_{0.025};
+  double footprint_radius_{0.0};
 };
 
 }  // namespace f_dwa_controller

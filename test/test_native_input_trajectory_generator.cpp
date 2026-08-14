@@ -20,15 +20,22 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "dwb_core/exceptions.hpp"
+#include "dwb_core/illegal_trajectory_tracker.hpp"
 #include "dwb_core/trajectory_critic.hpp"
+#include "dwb_core/trajectory_generator.hpp"
 #include "f_dwa_controller/certified_dwb_local_planner.hpp"
 #include "f_dwa_controller/native_input_trajectory_generator.hpp"
 #include "nav2_util/lifecycle_node.hpp"
@@ -47,16 +54,19 @@ nav2_util::LifecycleNode::SharedPtr make_node(
   const bool coefficients_generated = true,
   const bool require_applied_command_state = false,
   const bool prefer_previous_selected_candidate = false,
-  const double fir_prediction_pulse_duration = 0.0)
+  const double fir_prediction_pulse_duration = 0.0,
+  const double maximum_linear_velocity = 1.2,
+  const double maximum_angular_velocity = 1.57,
+  const double control_period = 0.03)
 {
   std::vector<rclcpp::Parameter> parameters{
     rclcpp::Parameter("FollowPath.min_vel_x", 0.0),
-    rclcpp::Parameter("FollowPath.max_vel_x", 1.2),
+    rclcpp::Parameter("FollowPath.max_vel_x", maximum_linear_velocity),
     rclcpp::Parameter("FollowPath.min_vel_y", 0.0),
     rclcpp::Parameter("FollowPath.max_vel_y", 0.0),
-    rclcpp::Parameter("FollowPath.max_vel_theta", 1.57),
+    rclcpp::Parameter("FollowPath.max_vel_theta", maximum_angular_velocity),
     rclcpp::Parameter("FollowPath.min_speed_xy", 0.0),
-    rclcpp::Parameter("FollowPath.max_speed_xy", 1.2),
+    rclcpp::Parameter("FollowPath.max_speed_xy", maximum_linear_velocity),
     rclcpp::Parameter("FollowPath.min_speed_theta", 0.0),
     rclcpp::Parameter("FollowPath.acc_lim_x", 1.2),
     rclcpp::Parameter("FollowPath.acc_lim_y", 0.0),
@@ -69,8 +79,10 @@ nav2_util::LifecycleNode::SharedPtr make_node(
     rclcpp::Parameter("FollowPath.vtheta_samples", 15),
     rclcpp::Parameter("FollowPath.sim_time", 2.4),
     rclcpp::Parameter("FollowPath.discretize_by_time", true),
-    rclcpp::Parameter("FollowPath.time_granularity", 0.03),
-    rclcpp::Parameter("FollowPath.native_input_control_period", 0.03),
+    rclcpp::Parameter("FollowPath.time_granularity", control_period),
+    rclcpp::Parameter("FollowPath.native_input_control_period", control_period),
+    rclcpp::Parameter("FollowPath.max_linear_jerk", 1.57),
+    rclcpp::Parameter("FollowPath.max_angular_jerk", 1.57),
     rclcpp::Parameter("FollowPath.max_linear_raw_input", 1.2),
     rclcpp::Parameter("FollowPath.max_angular_raw_input", 1.57),
     rclcpp::Parameter(
@@ -168,6 +180,33 @@ geometry_msgs::msg::Pose2D legacy_compute_new_position(
   return pose;
 }
 
+std::vector<double> trajectory_signature(
+  const dwb_msgs::msg::Trajectory2D & trajectory)
+{
+  std::vector<double> signature;
+  signature.reserve(3u + trajectory.poses.size() * 3u);
+  signature.push_back(trajectory.velocity.x);
+  signature.push_back(trajectory.velocity.y);
+  signature.push_back(trajectory.velocity.theta);
+  for (const auto & pose : trajectory.poses) {
+    signature.push_back(pose.x);
+    signature.push_back(pose.y);
+    signature.push_back(pose.theta);
+  }
+  return signature;
+}
+
+void expect_axis_state_within_limits(
+  const AxisState & state,
+  const AxisLimits & limits)
+{
+  constexpr double kTolerance = 1.0e-10;
+  EXPECT_GE(state.velocity, limits.velocity_min - kTolerance);
+  EXPECT_LE(state.velocity, limits.velocity_max + kTolerance);
+  EXPECT_GE(state.acceleration, limits.acceleration_min - kTolerance);
+  EXPECT_LE(state.acceleration, limits.acceleration_max + kTolerance);
+}
+
 class FixedScoreCritic final : public dwb_core::TrajectoryCritic
 {
 public:
@@ -198,9 +237,171 @@ private:
   int call_count_{0};
 };
 
+class EndpointScoreCritic final : public dwb_core::TrajectoryCritic
+{
+public:
+  EndpointScoreCritic(
+    std::string name,
+    const double scale,
+    const geometry_msgs::msg::Pose2D & target,
+    std::vector<std::string> & call_trace)
+  : target_(target), call_trace_(call_trace)
+  {
+    name_ = std::move(name);
+    scale_ = scale;
+  }
+
+  double scoreTrajectory(
+    const dwb_msgs::msg::Trajectory2D & trajectory) override
+  {
+    call_trace_.push_back(name_);
+    ++call_count_;
+    if (trajectory.poses.empty()) {
+      return 1.0e6;
+    }
+    const auto & endpoint = trajectory.poses.back();
+    return 0.01 + std::pow(endpoint.x - target_.x, 2) +
+           0.7 * std::pow(endpoint.y - target_.y, 2) +
+           0.3 * std::pow(endpoint.theta - target_.theta, 2);
+  }
+
+  [[nodiscard]] std::size_t call_count() const
+  {
+    return call_count_;
+  }
+
+private:
+  geometry_msgs::msg::Pose2D target_;
+  std::vector<std::string> & call_trace_;
+  std::size_t call_count_{0u};
+};
+
+class ScriptedVelocityGenerator final : public dwb_core::TrajectoryGenerator
+{
+public:
+  explicit ScriptedVelocityGenerator(std::vector<double> velocities)
+  : velocities_(std::move(velocities)) {}
+
+  void initialize(
+    const nav2_util::LifecycleNode::SharedPtr & /*node*/,
+    const std::string & /*plugin_name*/) override
+  {}
+
+  void startNewIteration(
+    const nav_2d_msgs::msg::Twist2D & /*current_velocity*/) override
+  {
+    index_ = 0u;
+    generated_velocities_.clear();
+  }
+
+  bool hasMoreTwists() override
+  {
+    return index_ < velocities_.size();
+  }
+
+  nav_2d_msgs::msg::Twist2D nextTwist() override
+  {
+    nav_2d_msgs::msg::Twist2D twist;
+    twist.x = velocities_.at(index_++);
+    return twist;
+  }
+
+  dwb_msgs::msg::Trajectory2D generateTrajectory(
+    const geometry_msgs::msg::Pose2D & start_pose,
+    const nav_2d_msgs::msg::Twist2D & /*start_velocity*/,
+    const nav_2d_msgs::msg::Twist2D & command_velocity) override
+  {
+    generated_velocities_.push_back(command_velocity.x);
+    dwb_msgs::msg::Trajectory2D trajectory;
+    trajectory.velocity = command_velocity;
+    trajectory.poses.push_back(start_pose);
+    geometry_msgs::msg::Pose2D endpoint = start_pose;
+    endpoint.x += command_velocity.x;
+    trajectory.poses.push_back(endpoint);
+    trajectory.time_offsets.push_back(
+      rclcpp::Duration::from_seconds(0.0));
+    return trajectory;
+  }
+
+  void setSpeedLimit(
+    const double & /*speed_limit*/,
+    const bool & /*percentage*/) override
+  {}
+
+  [[nodiscard]] const std::vector<double> & generated_velocities() const
+  {
+    return generated_velocities_;
+  }
+
+private:
+  std::vector<double> velocities_;
+  std::vector<double> generated_velocities_;
+  std::size_t index_{0u};
+};
+
+class ScriptedScoreCritic final : public dwb_core::TrajectoryCritic
+{
+public:
+  ScriptedScoreCritic(
+    std::string name,
+    std::vector<double> raw_scores,
+    const int throwing_candidate,
+    std::vector<std::string> & call_trace)
+  : raw_scores_(std::move(raw_scores)),
+    throwing_candidate_(throwing_candidate),
+    call_trace_(call_trace)
+  {
+    name_ = std::move(name);
+    scale_ = 1.0;
+  }
+
+  double scoreTrajectory(
+    const dwb_msgs::msg::Trajectory2D & trajectory) override
+  {
+    const int candidate = static_cast<int>(
+      std::lround(trajectory.velocity.x * 10.0));
+    call_trace_.push_back(name_ + ":" + std::to_string(candidate));
+    if (candidate == throwing_candidate_) {
+      throw dwb_core::IllegalTrajectoryException(
+              name_, "scripted rejection");
+    }
+    return raw_scores_.at(static_cast<std::size_t>(candidate));
+  }
+
+private:
+  std::vector<double> raw_scores_;
+  int throwing_candidate_{-1};
+  std::vector<std::string> & call_trace_;
+};
+
+class BaseCorePlannerAdapter final : public dwb_core::DWBLocalPlanner
+{
+public:
+  void set_test_components(
+    dwb_core::TrajectoryGenerator::Ptr generator,
+    std::vector<dwb_core::TrajectoryCritic::Ptr> critics)
+  {
+    traj_generator_ = std::move(generator);
+    critics_ = std::move(critics);
+    short_circuit_trajectory_evaluation_ = true;
+    debug_trajectory_details_ = false;
+  }
+
+  dwb_msgs::msg::TrajectoryScore run_core()
+  {
+    geometry_msgs::msg::Pose2D pose;
+    nav_2d_msgs::msg::Twist2D velocity;
+    std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> results;
+    return dwb_core::DWBLocalPlanner::coreScoringAlgorithm(
+      pose, velocity, results);
+  }
+};
+
 class ScorePlannerAdapter final : public CertifiedDWBLocalPlanner
 {
 public:
+  using TestDiagnosticPublication = DiagnosticPublication;
+
   void set_test_critics(
     std::vector<dwb_core::TrajectoryCritic::Ptr> critics,
     const bool short_circuit)
@@ -209,12 +410,65 @@ public:
     short_circuit_trajectory_evaluation_ = short_circuit;
   }
 
+  void set_test_components(
+    dwb_core::TrajectoryGenerator::Ptr generator,
+    std::vector<dwb_core::TrajectoryCritic::Ptr> critics)
+  {
+    traj_generator_ = std::move(generator);
+    critics_ = std::move(critics);
+    short_circuit_trajectory_evaluation_ = true;
+    debug_trajectory_details_ = false;
+  }
+
+  dwb_msgs::msg::TrajectoryScore run_local_core()
+  {
+    geometry_msgs::msg::Pose2D pose;
+    nav_2d_msgs::msg::Twist2D velocity;
+    std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> results;
+    return coreScoringAlgorithm(pose, velocity, results);
+  }
+
   dwb_msgs::msg::TrajectoryScore reference_score(
     const dwb_msgs::msg::Trajectory2D & trajectory,
     const double best_score)
   {
     return dwb_core::DWBLocalPlanner::scoreTrajectory(
       trajectory, best_score);
+  }
+
+  dwb_msgs::msg::TrajectoryScore total_only_score(
+    const dwb_msgs::msg::Trajectory2D & trajectory,
+    const double best_score)
+  {
+    dwb_msgs::msg::TrajectoryScore score;
+    score_trajectory_components(
+      trajectory, best_score, score, false, nullptr);
+    return score;
+  }
+
+  visualization_msgs::msg::MarkerArray candidate_markers(
+    const dwb_msgs::msg::LocalPlanEvaluation & evaluation) const
+  {
+    return build_candidate_markers(evaluation);
+  }
+
+  static bool coalesce_stale_marker(
+    std::deque<TestDiagnosticPublication> & publications,
+    TestDiagnosticPublication publication)
+  {
+    return coalesce_stale_marker_publication(
+      publications, std::move(publication));
+  }
+
+  static constexpr std::size_t maximum_pending_full_evaluations()
+  {
+    return kMaximumPendingFullEvaluations;
+  }
+
+  static bool full_evaluation_capacity(
+    const std::size_t pending_full_evaluations)
+  {
+    return has_full_evaluation_capacity(pending_full_evaluations);
   }
 };
 
@@ -270,6 +524,340 @@ TEST_F(NativeInputTrajectoryGeneratorTest, JerkGeneratorRollsOut165Candidates)
   generator.initialize(node, kPluginName);
 
   expect_finite_trajectory(generator);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  AccelerationSamples165DistinctFullHorizonFeasibleRolloutsAtVelocityLimit)
+{
+  constexpr double kControlPeriod = 0.05;
+  constexpr int kRolloutStepCount = 48;
+  const auto node = make_node(
+    "acceleration_horizon_sampling_test", true, false, false, 0.0,
+    0.6, 0.6, kControlPeriod);
+  AccelerationTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  PlanningSnapshot acceleration_snapshot =
+    make_observable_zero_snapshot(node->now());
+  acceleration_snapshot.current_state.velocity.x = 0.6;
+  acceleration_snapshot.activation_state.velocity.x = 0.6;
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(acceleration_snapshot));
+
+  const AxisLimits linear_limits{0.0, 0.6, -1.2, 1.2, -1.2, 1.2};
+  const AxisLimits angular_limits{-0.6, 0.6, -1.57, 1.57, -1.57, 1.57};
+  const AxisState initial_linear_state{0.6, 0.0};
+  const AxisState initial_angular_state{0.0, 0.0};
+  const FeasibleInterval linear_interval =
+    held_acceleration_input_interval(
+    initial_linear_state, linear_limits, kControlPeriod,
+    kRolloutStepCount);
+  const FeasibleInterval angular_interval =
+    held_acceleration_input_interval(
+    initial_angular_state, angular_limits, kControlPeriod,
+    kRolloutStepCount);
+  ASSERT_TRUE(linear_interval.feasible);
+  ASSERT_TRUE(angular_interval.feasible);
+  EXPECT_NEAR(linear_interval.lower, -0.25, 1.0e-12);
+  EXPECT_NEAR(linear_interval.upper, 0.0, 1.0e-12);
+  EXPECT_NEAR(angular_interval.lower, -0.25, 1.0e-12);
+  EXPECT_NEAR(angular_interval.upper, 0.25, 1.0e-12);
+  const auto expected_linear_inputs = uniform_samples(linear_interval, 11);
+  const auto expected_angular_inputs = uniform_samples(angular_interval, 15);
+
+  nav_2d_msgs::msg::Twist2D current_velocity;
+  current_velocity.x = 0.6;
+  generator.startNewIteration(current_velocity);
+  geometry_msgs::msg::Pose2D start_pose;
+  start_pose.x = 0.37;
+  start_pose.y = -0.19;
+  start_pose.theta = 0.41;
+  std::set<std::vector<double>> distinct_rollouts;
+  std::size_t candidate_count = 0u;
+  double minimum_linear_input = std::numeric_limits<double>::infinity();
+  double maximum_linear_input = -std::numeric_limits<double>::infinity();
+  double minimum_angular_input = std::numeric_limits<double>::infinity();
+  double maximum_angular_input = -std::numeric_limits<double>::infinity();
+  while (generator.hasMoreTwists()) {
+    const auto command = generator.nextTwist();
+    const auto command_state = generator.active_candidate_command_state();
+    ASSERT_TRUE(command_state.has_value());
+    const double linear_input = command_state->linear_state.acceleration;
+    const double angular_input = command_state->angular_state.acceleration;
+    const auto canonical_index =
+      generator.active_candidate_canonical_index();
+    ASSERT_TRUE(canonical_index.has_value());
+    ASSERT_EQ(*canonical_index, candidate_count);
+    const std::size_t linear_index = *canonical_index / 15u;
+    const std::size_t angular_index = *canonical_index % 15u;
+    ASSERT_LT(linear_index, expected_linear_inputs.size());
+    ASSERT_LT(angular_index, expected_angular_inputs.size());
+    EXPECT_NEAR(
+      linear_input, expected_linear_inputs[linear_index], 1.0e-12);
+    EXPECT_NEAR(
+      angular_input, expected_angular_inputs[angular_index], 1.0e-12);
+    minimum_linear_input = std::min(minimum_linear_input, linear_input);
+    maximum_linear_input = std::max(maximum_linear_input, linear_input);
+    minimum_angular_input = std::min(minimum_angular_input, angular_input);
+    maximum_angular_input = std::max(maximum_angular_input, angular_input);
+
+    const auto trajectory = generator.generateTrajectory(
+      start_pose, current_velocity, command);
+    ASSERT_EQ(trajectory.poses.size(), 50u);
+    EXPECT_DOUBLE_EQ(trajectory.poses.front().x, start_pose.x);
+    EXPECT_DOUBLE_EQ(trajectory.poses.front().y, start_pose.y);
+    EXPECT_DOUBLE_EQ(trajectory.poses.front().theta, start_pose.theta);
+    distinct_rollouts.insert(trajectory_signature(trajectory));
+
+    AxisState linear_state = initial_linear_state;
+    AxisState angular_state = initial_angular_state;
+    geometry_msgs::msg::Pose2D reference_pose = start_pose;
+    for (int remaining_steps = kRolloutStepCount;
+      remaining_steps > 0; --remaining_steps)
+    {
+      const auto linear_step = project_held_acceleration_step(
+        linear_state, linear_limits, linear_input, kControlPeriod,
+        remaining_steps);
+      const auto angular_step = project_held_acceleration_step(
+        angular_state, angular_limits, angular_input, kControlPeriod,
+        remaining_steps);
+      ASSERT_TRUE(linear_step.feasible);
+      ASSERT_TRUE(angular_step.feasible);
+      EXPECT_NEAR(linear_step.applied_native_input, linear_input, 1.0e-12);
+      EXPECT_NEAR(angular_step.applied_native_input, angular_input, 1.0e-12);
+      linear_state = linear_step.state;
+      angular_state = angular_step.state;
+      expect_axis_state_within_limits(linear_state, linear_limits);
+      expect_axis_state_within_limits(angular_state, angular_limits);
+      nav_2d_msgs::msg::Twist2D reference_velocity;
+      reference_velocity.x = linear_state.velocity;
+      reference_velocity.theta = angular_state.velocity;
+      reference_pose = legacy_compute_new_position(
+        reference_pose, reference_velocity, kControlPeriod);
+      const std::size_t pose_index =
+        static_cast<std::size_t>(
+        kRolloutStepCount - remaining_steps + 1);
+      ASSERT_LT(pose_index, trajectory.poses.size());
+      EXPECT_NEAR(trajectory.poses[pose_index].x, reference_pose.x, 1.0e-12);
+      EXPECT_NEAR(trajectory.poses[pose_index].y, reference_pose.y, 1.0e-12);
+      EXPECT_NEAR(
+        trajectory.poses[pose_index].theta, reference_pose.theta, 1.0e-12);
+    }
+    const auto final_pose_index =
+      static_cast<std::size_t>(kRolloutStepCount);
+    EXPECT_DOUBLE_EQ(
+      trajectory.poses.back().x, trajectory.poses[final_pose_index].x);
+    EXPECT_DOUBLE_EQ(
+      trajectory.poses.back().y, trajectory.poses[final_pose_index].y);
+    EXPECT_DOUBLE_EQ(
+      trajectory.poses.back().theta,
+      trajectory.poses[final_pose_index].theta);
+    ++candidate_count;
+  }
+
+  EXPECT_EQ(candidate_count, 165u);
+  EXPECT_EQ(distinct_rollouts.size(), 165u);
+  EXPECT_NEAR(minimum_linear_input, linear_interval.lower, 1.0e-12);
+  EXPECT_NEAR(maximum_linear_input, linear_interval.upper, 1.0e-12);
+  EXPECT_NEAR(minimum_angular_input, angular_interval.lower, 1.0e-12);
+  EXPECT_NEAR(maximum_angular_input, angular_interval.upper, 1.0e-12);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  JerkSamples165DistinctFullHorizonFeasibleRolloutsAtVelocityLimit)
+{
+  constexpr double kControlPeriod = 0.05;
+  constexpr int kRolloutStepCount = 48;
+  constexpr double kMaximumJerk = 1.57;
+  const auto node = make_node(
+    "jerk_horizon_sampling_test", true, false, false, 0.0,
+    0.6, 0.6, kControlPeriod);
+  JerkTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  PlanningSnapshot jerk_snapshot =
+    make_observable_zero_snapshot(node->now());
+  jerk_snapshot.current_state.velocity.x = 0.6;
+  jerk_snapshot.activation_state.velocity.x = 0.6;
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(jerk_snapshot));
+
+  const AxisLimits linear_limits{
+    0.0, 0.6, -1.2, 1.2, -kMaximumJerk, kMaximumJerk};
+  const AxisLimits angular_limits{
+    -0.6, 0.6, -1.57, 1.57, -kMaximumJerk, kMaximumJerk};
+  const AxisState initial_linear_state{0.6, 0.0};
+  const AxisState initial_angular_state{0.0, 0.0};
+  const FeasibleInterval linear_interval = held_jerk_input_interval(
+    initial_linear_state, linear_limits, kControlPeriod,
+    kRolloutStepCount);
+  const FeasibleInterval angular_interval = held_jerk_input_interval(
+    initial_angular_state, angular_limits, kControlPeriod,
+    kRolloutStepCount);
+  ASSERT_TRUE(linear_interval.feasible);
+  ASSERT_TRUE(angular_interval.feasible);
+  EXPECT_NEAR(linear_interval.lower, -0.2040816326530612, 1.0e-12);
+  EXPECT_NEAR(linear_interval.upper, 0.0, 1.0e-12);
+  EXPECT_NEAR(angular_interval.lower, -0.2040816326530612, 1.0e-12);
+  EXPECT_NEAR(angular_interval.upper, 0.2040816326530612, 1.0e-12);
+  const auto expected_linear_inputs = uniform_samples(linear_interval, 11);
+  const auto expected_angular_inputs = uniform_samples(angular_interval, 15);
+
+  nav_2d_msgs::msg::Twist2D current_velocity;
+  current_velocity.x = 0.6;
+  generator.startNewIteration(current_velocity);
+  geometry_msgs::msg::Pose2D start_pose;
+  start_pose.x = 0.37;
+  start_pose.y = -0.19;
+  start_pose.theta = 0.41;
+  std::set<std::vector<double>> distinct_rollouts;
+  std::size_t candidate_count = 0u;
+  double minimum_linear_input = std::numeric_limits<double>::infinity();
+  double maximum_linear_input = -std::numeric_limits<double>::infinity();
+  double minimum_angular_input = std::numeric_limits<double>::infinity();
+  double maximum_angular_input = -std::numeric_limits<double>::infinity();
+  while (generator.hasMoreTwists()) {
+    const auto command = generator.nextTwist();
+    const auto command_state = generator.active_candidate_command_state();
+    ASSERT_TRUE(command_state.has_value());
+    const double linear_input =
+      command_state->linear_state.acceleration / kControlPeriod;
+    const double angular_input =
+      command_state->angular_state.acceleration / kControlPeriod;
+    const auto canonical_index =
+      generator.active_candidate_canonical_index();
+    ASSERT_TRUE(canonical_index.has_value());
+    ASSERT_EQ(*canonical_index, candidate_count);
+    const std::size_t linear_index = *canonical_index / 15u;
+    const std::size_t angular_index = *canonical_index % 15u;
+    ASSERT_LT(linear_index, expected_linear_inputs.size());
+    ASSERT_LT(angular_index, expected_angular_inputs.size());
+    EXPECT_NEAR(
+      linear_input, expected_linear_inputs[linear_index], 1.0e-12);
+    EXPECT_NEAR(
+      angular_input, expected_angular_inputs[angular_index], 1.0e-12);
+    EXPECT_LE(std::abs(linear_input), kMaximumJerk + 1.0e-12);
+    EXPECT_LE(std::abs(angular_input), kMaximumJerk + 1.0e-12);
+    minimum_linear_input = std::min(minimum_linear_input, linear_input);
+    maximum_linear_input = std::max(maximum_linear_input, linear_input);
+    minimum_angular_input = std::min(minimum_angular_input, angular_input);
+    maximum_angular_input = std::max(maximum_angular_input, angular_input);
+
+    const auto trajectory = generator.generateTrajectory(
+      start_pose, current_velocity, command);
+    ASSERT_EQ(trajectory.poses.size(), 50u);
+    EXPECT_DOUBLE_EQ(trajectory.poses.front().x, start_pose.x);
+    EXPECT_DOUBLE_EQ(trajectory.poses.front().y, start_pose.y);
+    EXPECT_DOUBLE_EQ(trajectory.poses.front().theta, start_pose.theta);
+    distinct_rollouts.insert(trajectory_signature(trajectory));
+
+    AxisState linear_state = initial_linear_state;
+    AxisState angular_state = initial_angular_state;
+    geometry_msgs::msg::Pose2D reference_pose = start_pose;
+    for (int remaining_steps = kRolloutStepCount;
+      remaining_steps > 0; --remaining_steps)
+    {
+      const auto linear_step = project_held_jerk_step(
+        linear_state, linear_limits, linear_input, kControlPeriod,
+        remaining_steps);
+      const auto angular_step = project_held_jerk_step(
+        angular_state, angular_limits, angular_input, kControlPeriod,
+        remaining_steps);
+      ASSERT_TRUE(linear_step.feasible);
+      ASSERT_TRUE(angular_step.feasible);
+      EXPECT_NEAR(linear_step.applied_native_input, linear_input, 1.0e-12);
+      EXPECT_NEAR(angular_step.applied_native_input, angular_input, 1.0e-12);
+      EXPECT_LE(
+        std::abs(linear_step.applied_native_input),
+        kMaximumJerk + 1.0e-12);
+      EXPECT_LE(
+        std::abs(angular_step.applied_native_input),
+        kMaximumJerk + 1.0e-12);
+      linear_state = linear_step.state;
+      angular_state = angular_step.state;
+      expect_axis_state_within_limits(linear_state, linear_limits);
+      expect_axis_state_within_limits(angular_state, angular_limits);
+      nav_2d_msgs::msg::Twist2D reference_velocity;
+      reference_velocity.x = linear_state.velocity;
+      reference_velocity.theta = angular_state.velocity;
+      reference_pose = legacy_compute_new_position(
+        reference_pose, reference_velocity, kControlPeriod);
+      const std::size_t pose_index =
+        static_cast<std::size_t>(
+        kRolloutStepCount - remaining_steps + 1);
+      ASSERT_LT(pose_index, trajectory.poses.size());
+      EXPECT_NEAR(trajectory.poses[pose_index].x, reference_pose.x, 1.0e-12);
+      EXPECT_NEAR(trajectory.poses[pose_index].y, reference_pose.y, 1.0e-12);
+      EXPECT_NEAR(
+        trajectory.poses[pose_index].theta, reference_pose.theta, 1.0e-12);
+    }
+    const auto final_pose_index =
+      static_cast<std::size_t>(kRolloutStepCount);
+    EXPECT_DOUBLE_EQ(
+      trajectory.poses.back().x, trajectory.poses[final_pose_index].x);
+    EXPECT_DOUBLE_EQ(
+      trajectory.poses.back().y, trajectory.poses[final_pose_index].y);
+    EXPECT_DOUBLE_EQ(
+      trajectory.poses.back().theta,
+      trajectory.poses[final_pose_index].theta);
+    ++candidate_count;
+  }
+
+  EXPECT_EQ(candidate_count, 165u);
+  EXPECT_EQ(distinct_rollouts.size(), 165u);
+  EXPECT_NEAR(minimum_linear_input, linear_interval.lower, 1.0e-12);
+  EXPECT_NEAR(maximum_linear_input, linear_interval.upper, 1.0e-12);
+  EXPECT_NEAR(minimum_angular_input, angular_interval.lower, 1.0e-12);
+  EXPECT_NEAR(maximum_angular_input, angular_interval.upper, 1.0e-12);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  AccelerationAndJerkRetainOneZeroCandidateAtRest)
+{
+  constexpr double kControlPeriod = 0.05;
+  const auto acceleration_node = make_node(
+    "acceleration_zero_candidate_test", true, false, false, 0.0,
+    0.6, 0.6, kControlPeriod);
+  const auto jerk_node = make_node(
+    "jerk_zero_candidate_test", true, false, false, 0.0,
+    0.6, 0.6, kControlPeriod);
+  AccelerationTrajectoryGenerator acceleration_generator;
+  JerkTrajectoryGenerator jerk_generator;
+  acceleration_generator.initialize(acceleration_node, kPluginName);
+  jerk_generator.initialize(jerk_node, kPluginName);
+
+  const auto zero_candidate_indices = [](
+    NativeInputTrajectoryGenerator & generator)
+    {
+      nav_2d_msgs::msg::Twist2D current_velocity;
+      generator.startNewIteration(current_velocity);
+      std::size_t candidate_count = 0u;
+      std::vector<std::size_t> indices;
+      while (generator.hasMoreTwists()) {
+        const auto command = generator.nextTwist();
+        if (std::abs(command.x) <= 1.0e-12 &&
+          std::abs(command.theta) <= 1.0e-12)
+        {
+          const auto canonical_index =
+            generator.active_candidate_canonical_index();
+          EXPECT_TRUE(canonical_index.has_value());
+          if (canonical_index.has_value()) {
+            indices.push_back(*canonical_index);
+          }
+        }
+        ++candidate_count;
+      }
+      EXPECT_EQ(candidate_count, 165u);
+      return indices;
+    };
+
+  EXPECT_EQ(
+    zero_candidate_indices(acceleration_generator),
+    std::vector<std::size_t>({7u}));
+  EXPECT_EQ(
+    zero_candidate_indices(jerk_generator),
+    std::vector<std::size_t>({7u}));
 }
 
 TEST_F(NativeInputTrajectoryGeneratorTest, FirGeneratorRollsOut165Candidates)
@@ -400,6 +988,367 @@ TEST_F(
   ASSERT_EQ(actual.scores.size(), 1u);
   EXPECT_EQ(first->call_count(), 2);
   EXPECT_EQ(skipped->call_count(), 0);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  LocalVelocityCoreMatchesBaseCandidateOrderShortCircuitTieAndCommand)
+{
+  const std::vector<double> candidate_velocities{0.1, 0.2, 0.3, 0.4, 0.5};
+  const std::vector<double> first_scores{0.0, 10.0, 0.0, 1.0, 4.0, 1.0};
+  const std::vector<double> second_scores{0.0, 0.0, 0.0, 2.0, 99.0, 2.0};
+  std::vector<std::string> base_trace;
+  std::vector<std::string> local_trace;
+  auto base_generator =
+    std::make_shared<ScriptedVelocityGenerator>(candidate_velocities);
+  auto local_generator =
+    std::make_shared<ScriptedVelocityGenerator>(candidate_velocities);
+  BaseCorePlannerAdapter base;
+  base.set_test_components(
+    base_generator,
+    {std::make_shared<ScriptedScoreCritic>(
+        "First", first_scores, 2, base_trace),
+      std::make_shared<ScriptedScoreCritic>(
+        "Second", second_scores, -1, base_trace)});
+  ScorePlannerAdapter local;
+  local.set_test_components(
+    local_generator,
+    {std::make_shared<ScriptedScoreCritic>(
+        "First", first_scores, 2, local_trace),
+      std::make_shared<ScriptedScoreCritic>(
+        "Second", second_scores, -1, local_trace)});
+
+  const auto base_best = base.run_core();
+  const auto local_best = local.run_local_core();
+
+  EXPECT_EQ(local_generator->generated_velocities(), candidate_velocities);
+  EXPECT_EQ(
+    local_generator->generated_velocities(),
+    base_generator->generated_velocities());
+  EXPECT_EQ(local_trace, base_trace);
+  EXPECT_EQ(
+    std::count(local_trace.begin(), local_trace.end(), "Second:4"), 0);
+  EXPECT_EQ(
+    std::count(local_trace.begin(), local_trace.end(), "Second:2"), 0);
+  EXPECT_DOUBLE_EQ(local_best.total, base_best.total);
+  EXPECT_DOUBLE_EQ(local_best.total, 3.0);
+  EXPECT_DOUBLE_EQ(local_best.traj.velocity.x, base_best.traj.velocity.x);
+  // Candidates 0.3 and 0.5 tie at 3.0. Base DWB retains the first, and the
+  // local loop must retain the same command rather than changing the study.
+  EXPECT_DOUBLE_EQ(local_best.traj.velocity.x, 0.3);
+  EXPECT_EQ(
+    trajectory_signature(local_best.traj),
+    trajectory_signature(base_best.traj));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  LocalVelocityCoreMatchesBaseAllIllegalException)
+{
+  const std::vector<double> candidate_velocities{0.2};
+  const std::vector<double> scores{0.0, 0.0, 0.0};
+  std::vector<std::string> base_trace;
+  std::vector<std::string> local_trace;
+  auto base_generator =
+    std::make_shared<ScriptedVelocityGenerator>(candidate_velocities);
+  auto local_generator =
+    std::make_shared<ScriptedVelocityGenerator>(candidate_velocities);
+  BaseCorePlannerAdapter base;
+  base.set_test_components(
+    base_generator,
+    {std::make_shared<ScriptedScoreCritic>(
+        "Reject", scores, 2, base_trace)});
+  ScorePlannerAdapter local;
+  local.set_test_components(
+    local_generator,
+    {std::make_shared<ScriptedScoreCritic>(
+        "Reject", scores, 2, local_trace)});
+
+  std::string base_error;
+  std::string local_error;
+  try {
+    (void)base.run_core();
+    FAIL() << "base DWB unexpectedly accepted an illegal candidate";
+  } catch (const dwb_core::NoLegalTrajectoriesException & exception) {
+    base_error = exception.what();
+  }
+  try {
+    (void)local.run_local_core();
+    FAIL() << "local DWB unexpectedly accepted an illegal candidate";
+  } catch (const dwb_core::NoLegalTrajectoriesException & exception) {
+    local_error = exception.what();
+  }
+
+  EXPECT_EQ(local_trace, base_trace);
+  EXPECT_EQ(local_error, base_error);
+  EXPECT_EQ(
+    local_generator->generated_velocities(),
+    base_generator->generated_velocities());
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  TotalOnlySweepPreservesCandidatesSignaturesAndCanonicalBest)
+{
+  const auto node = make_node("total_only_candidate_sweep_test");
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+
+  nav_2d_msgs::msg::Twist2D current_velocity;
+  generator.startNewIteration(current_velocity);
+  geometry_msgs::msg::Pose2D start_pose;
+  start_pose.x = 0.23;
+  start_pose.y = -0.11;
+  start_pose.theta = 0.37;
+
+  struct Candidate
+  {
+    std::size_t canonical_index;
+    dwb_msgs::msg::Trajectory2D trajectory;
+    std::vector<double> signature;
+  };
+  std::vector<Candidate> candidates;
+  while (generator.hasMoreTwists()) {
+    const auto command = generator.nextTwist();
+    const auto canonical_index =
+      generator.active_candidate_canonical_index();
+    ASSERT_TRUE(canonical_index.has_value());
+    auto trajectory = generator.generateTrajectory(
+      start_pose, current_velocity, command);
+    candidates.push_back(
+      Candidate{
+        *canonical_index, trajectory, trajectory_signature(trajectory)});
+  }
+  ASSERT_EQ(candidates.size(), 165u);
+  std::set<std::vector<double>> distinct_signatures;
+  for (const auto & candidate : candidates) {
+    distinct_signatures.insert(candidate.signature);
+  }
+  ASSERT_EQ(distinct_signatures.size(), candidates.size());
+
+  geometry_msgs::msg::Pose2D early_target;
+  early_target.x = 0.8;
+  early_target.y = 0.05;
+  early_target.theta = -0.25;
+  geometry_msgs::msg::Pose2D final_target;
+  final_target.x = 1.4;
+  final_target.y = 0.28;
+  final_target.theta = -0.35;
+  std::vector<std::string> detailed_call_trace;
+  std::vector<std::string> total_only_call_trace;
+  auto detailed_first = std::make_shared<EndpointScoreCritic>(
+    "FirstEndpointCritic", 1.8, early_target, detailed_call_trace);
+  auto detailed_disabled =
+    std::make_shared<FixedScoreCritic>("DisabledCritic", 0.0, 100.0);
+  auto detailed_last = std::make_shared<EndpointScoreCritic>(
+    "LastEndpointCritic", 0.6, final_target, detailed_call_trace);
+  auto total_only_first = std::make_shared<EndpointScoreCritic>(
+    "FirstEndpointCritic", 1.8, early_target, total_only_call_trace);
+  auto total_only_disabled =
+    std::make_shared<FixedScoreCritic>("DisabledCritic", 0.0, 100.0);
+  auto total_only_last = std::make_shared<EndpointScoreCritic>(
+    "LastEndpointCritic", 0.6, final_target, total_only_call_trace);
+  ScorePlannerAdapter detailed_planner;
+  detailed_planner.set_test_critics(
+    {detailed_first, detailed_disabled, detailed_last}, true);
+  ScorePlannerAdapter total_only_planner;
+  total_only_planner.set_test_critics(
+    {total_only_first, total_only_disabled, total_only_last}, true);
+
+  double detailed_best_score = -1.0;
+  double total_only_best_score = -1.0;
+  std::size_t detailed_best_index =
+    std::numeric_limits<std::size_t>::max();
+  std::size_t total_only_best_index =
+    std::numeric_limits<std::size_t>::max();
+  std::size_t detailed_candidate_count = 0u;
+  std::size_t total_only_candidate_count = 0u;
+  for (const auto & candidate : candidates) {
+    const auto detailed_score = detailed_planner.scoreTrajectory(
+      candidate.trajectory, detailed_best_score);
+    const auto total_only_score = total_only_planner.total_only_score(
+      candidate.trajectory, total_only_best_score);
+    ++detailed_candidate_count;
+    ++total_only_candidate_count;
+
+    EXPECT_DOUBLE_EQ(total_only_score.total, detailed_score.total);
+    EXPECT_TRUE(total_only_score.scores.empty());
+    EXPECT_EQ(total_only_score.scores.capacity(), 0u);
+    EXPECT_EQ(
+      trajectory_signature(candidate.trajectory), candidate.signature);
+
+    if (detailed_best_score < 0.0 ||
+      detailed_score.total < detailed_best_score ||
+      (detailed_score.total == detailed_best_score &&
+      candidate.canonical_index < detailed_best_index))
+    {
+      detailed_best_score = detailed_score.total;
+      detailed_best_index = candidate.canonical_index;
+    }
+    if (total_only_best_score < 0.0 ||
+      total_only_score.total < total_only_best_score ||
+      (total_only_score.total == total_only_best_score &&
+      candidate.canonical_index < total_only_best_index))
+    {
+      total_only_best_score = total_only_score.total;
+      total_only_best_index = candidate.canonical_index;
+    }
+  }
+
+  EXPECT_EQ(detailed_candidate_count, candidates.size());
+  EXPECT_EQ(total_only_candidate_count, candidates.size());
+  EXPECT_DOUBLE_EQ(total_only_best_score, detailed_best_score);
+  EXPECT_EQ(total_only_best_index, detailed_best_index);
+  EXPECT_NE(
+    detailed_best_index, std::numeric_limits<std::size_t>::max());
+  EXPECT_EQ(total_only_call_trace, detailed_call_trace);
+  EXPECT_EQ(detailed_first->call_count(), total_only_first->call_count());
+  EXPECT_EQ(detailed_last->call_count(), total_only_last->call_count());
+  EXPECT_LT(detailed_last->call_count(), detailed_first->call_count());
+  EXPECT_EQ(detailed_disabled->call_count(), 0);
+  EXPECT_EQ(total_only_disabled->call_count(), 0);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  MarkerOnlySweepKeepsCriticScoreStorageUnallocated)
+{
+  auto first = std::make_shared<FixedScoreCritic>(
+    "FirstCriticWithANameLongEnoughToRequireStringStorage", 1.75, 0.5);
+  auto disabled = std::make_shared<FixedScoreCritic>(
+    "DisabledCriticWithANameLongEnoughToRequireStringStorage", 0.0, 9.0);
+  auto last = std::make_shared<FixedScoreCritic>(
+    "LastCriticWithANameLongEnoughToRequireStringStorage", 0.25, 0.75);
+  ScorePlannerAdapter planner;
+  planner.set_test_critics({first, disabled, last}, false);
+
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.velocity.x = 0.2;
+  trajectory.poses.resize(4u);
+  trajectory.time_offsets.resize(3u);
+  const auto full_diagnostic = planner.scoreTrajectory(trajectory, -1.0);
+  ASSERT_EQ(full_diagnostic.scores.size(), 3u);
+  EXPECT_EQ(full_diagnostic.scores[0u].name, first->getName());
+  EXPECT_EQ(full_diagnostic.scores[1u].name, disabled->getName());
+  EXPECT_EQ(full_diagnostic.scores[2u].name, last->getName());
+
+  constexpr std::size_t kCommonCandidateCount = 165u;
+  for (std::size_t index = 0u; index < kCommonCandidateCount; ++index) {
+    const auto marker_only = planner.total_only_score(trajectory, -1.0);
+    EXPECT_DOUBLE_EQ(marker_only.total, full_diagnostic.total);
+    EXPECT_TRUE(marker_only.scores.empty());
+    // No CriticScore vector storage means no per-critic name/string payload
+    // can be allocated on a marker-only control cycle.
+    EXPECT_EQ(marker_only.scores.capacity(), 0u);
+  }
+  EXPECT_EQ(disabled->call_count(), 0u);
+  EXPECT_EQ(first->call_count(), kCommonCandidateCount + 1u);
+  EXPECT_EQ(last->call_count(), kCommonCandidateCount + 1u);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  MarkerOnlyPayloadProducesBitIdenticalPublicMarkers)
+{
+  ScorePlannerAdapter planner;
+  dwb_msgs::msg::LocalPlanEvaluation full;
+  full.header.frame_id = "odom";
+  full.header.stamp.sec = 41;
+  full.header.stamp.nanosec = 37u;
+  full.best_index = 0;
+  full.worst_index = 0;
+
+  dwb_msgs::msg::TrajectoryScore selected;
+  selected.total = 1.25;
+  selected.traj.poses.resize(3u);
+  selected.traj.poses[0u].x = 0.1;
+  selected.traj.poses[1u].x = 0.2;
+  selected.traj.poses[2u].x = 0.3;
+  dwb_msgs::msg::CriticScore selected_detail;
+  selected_detail.name = "PathAlign";
+  selected_detail.scale = 8.0;
+  selected_detail.raw_score = 0.125;
+  selected.scores.push_back(selected_detail);
+  full.twists.push_back(selected);
+
+  dwb_msgs::msg::TrajectoryScore rejected;
+  rejected.total = -1.0;
+  rejected.traj.poses.resize(3u);
+  rejected.traj.poses[0u].y = 0.1;
+  rejected.traj.poses[1u].y = 0.2;
+  rejected.traj.poses[2u].y = 0.3;
+  dwb_msgs::msg::CriticScore rejection;
+  rejection.name = "ObstacleFootprint";
+  rejection.raw_score = -1.0;
+  rejected.scores.push_back(rejection);
+  dwb_msgs::msg::CriticScore rejection_detail;
+  rejection_detail.name = "__rejection_detail__:collision";
+  rejected.scores.push_back(rejection_detail);
+  dwb_msgs::msg::CriticScore native_detail;
+  native_detail.name = "__candidate_native__:canonical_index=9";
+  rejected.scores.push_back(native_detail);
+  full.twists.push_back(rejected);
+
+  auto marker_only = full;
+  marker_only.twists[0u].scores.clear();
+  marker_only.twists[1u].scores.erase(
+    marker_only.twists[1u].scores.begin() + 1,
+    marker_only.twists[1u].scores.end());
+
+  const auto full_markers = planner.candidate_markers(full);
+  const auto lean_markers = planner.candidate_markers(marker_only);
+  EXPECT_EQ(lean_markers, full_markers);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  DiagnosticBacklogPreservesFullEvaluationsAndCoalescesOnlyStaleMarkers)
+{
+  using Publication = ScorePlannerAdapter::TestDiagnosticPublication;
+  auto first_full =
+    std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+  auto stale_marker =
+    std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+  auto second_full =
+    std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+  auto latest_marker =
+    std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+  first_full->header.stamp.sec = 1;
+  stale_marker->header.stamp.sec = 2;
+  second_full->header.stamp.sec = 3;
+  latest_marker->header.stamp.sec = 4;
+
+  std::deque<Publication> publications{
+    Publication{first_full, true, true},
+    Publication{stale_marker, false, true},
+    Publication{second_full, true, true}};
+  EXPECT_EQ(
+    ScorePlannerAdapter::maximum_pending_full_evaluations(), 2u);
+  EXPECT_TRUE(ScorePlannerAdapter::full_evaluation_capacity(0u));
+  EXPECT_TRUE(ScorePlannerAdapter::full_evaluation_capacity(1u));
+  EXPECT_FALSE(ScorePlannerAdapter::full_evaluation_capacity(2u));
+  ASSERT_TRUE(ScorePlannerAdapter::coalesce_stale_marker(
+      publications, Publication{latest_marker, false, true}));
+  ASSERT_EQ(publications.size(), 3u);
+  EXPECT_EQ(publications[0u].evaluation, first_full);
+  EXPECT_TRUE(publications[0u].publish_full_evaluation);
+  EXPECT_EQ(publications[1u].evaluation, second_full);
+  EXPECT_TRUE(publications[1u].publish_full_evaluation);
+  EXPECT_EQ(publications[2u].evaluation, latest_marker);
+  EXPECT_FALSE(publications[2u].publish_full_evaluation);
+  EXPECT_EQ(
+    std::count_if(
+      publications.begin(), publications.end(),
+      [](const Publication & publication) {
+        return publication.publish_full_evaluation;
+      }),
+    2);
+
+  const auto third_full =
+    std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+  EXPECT_FALSE(ScorePlannerAdapter::coalesce_stale_marker(
+      publications, Publication{third_full, true, true}));
+  EXPECT_EQ(publications.size(), 3u);
 }
 
 TEST_F(
@@ -813,6 +1762,38 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
+  ActiveCandidateDiagnosticsExposeNativeInputAndIterationState)
+{
+  const auto node = make_node("active_candidate_diagnostics_test");
+  JerkTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  nav_2d_msgs::msg::Twist2D current_velocity;
+  current_velocity.x = 0.2;
+  current_velocity.theta = -0.1;
+  generator.startNewIteration(current_velocity);
+
+  ASSERT_FALSE(generator.active_candidate_diagnostics().has_value());
+  const auto command = generator.nextTwist();
+  const auto diagnostics = generator.active_candidate_diagnostics();
+  ASSERT_TRUE(diagnostics.has_value());
+  EXPECT_EQ(diagnostics->canonical_index, 0u);
+  // J-DWA intentionally starts from the previously dispatched native state,
+  // not the odometry argument. No command has been dispatched in this test,
+  // so the observable ledger is the reset zero state.
+  EXPECT_DOUBLE_EQ(diagnostics->initial_linear_velocity, 0.0);
+  EXPECT_DOUBLE_EQ(diagnostics->initial_angular_velocity, 0.0);
+  EXPECT_TRUE(std::isfinite(diagnostics->linear_native_input));
+  EXPECT_TRUE(std::isfinite(diagnostics->angular_native_input));
+  EXPECT_TRUE(diagnostics->first_command_state.valid);
+  EXPECT_DOUBLE_EQ(
+    diagnostics->first_command_state.command_velocity.x, command.x);
+  EXPECT_DOUBLE_EQ(
+    diagnostics->first_command_state.command_velocity.theta,
+    command.theta);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
   PreviousSelectionIsEvaluatedFirstWhenEnabled)
 {
   const auto node = make_node("warm_start_order_test", true, false, true);
@@ -947,6 +1928,418 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
+  FirDispatchSkipsControllerResultsThatWereNeverPublished)
+{
+  const auto node = make_node("fir_unpublished_result_test", true, true);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  PlanningSnapshot snapshot = make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(snapshot);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(snapshot));
+  generator.startNewIteration(nav_2d_msgs::msg::Twist2D());
+
+  nav_2d_msgs::msg::Twist2D first_command;
+  nav_2d_msgs::msg::Twist2D published_command;
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
+  first_state;
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
+  published_state;
+  while (generator.hasMoreTwists()) {
+    const auto candidate = generator.nextTwist();
+    const auto state = generator.active_candidate_command_state();
+    if (!state.has_value()) {
+      continue;
+    }
+    if (!first_state.has_value()) {
+      first_command = candidate;
+      first_state = state;
+    } else {
+      if (std::abs(candidate.x - first_command.x) > 1.0e-12 ||
+        std::abs(candidate.theta - first_command.theta) > 1.0e-12)
+      {
+        published_command = candidate;
+        published_state = state;
+        break;
+      }
+    }
+  }
+  ASSERT_TRUE(first_state.has_value());
+  ASSERT_TRUE(published_state.has_value());
+
+  generator.select_command_for_dispatch(first_state);
+  generator.commit_selected_command(first_command, node->now());
+  generator.select_command_for_dispatch(published_state);
+  generator.commit_selected_command(published_command, node->now());
+
+  f_dwa_controller::msg::CommandDispatch dispatch;
+  dispatch.header.stamp = node->now();
+  dispatch.command.linear.x = published_command.x;
+  dispatch.command.angular.z = published_command.theta;
+  dispatch.has_sequence = true;
+  generator.observe_command_dispatch(dispatch, false, 1u);
+
+  PlanningSnapshot observed = make_observable_zero_snapshot(node->now());
+  observed.current_state.velocity = published_command;
+  observed.activation_state.velocity = published_command;
+  generator.enrich_planning_snapshot(observed);
+  EXPECT_TRUE(observed.valid);
+  EXPECT_TRUE(observed.current_state.native_state_valid);
+  EXPECT_EQ(
+    observed.current_state.linear_fir_history,
+    published_state->linear_fir_history);
+  EXPECT_EQ(
+    observed.current_state.angular_fir_history,
+    published_state->angular_fir_history);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  JerkExpectedControllerStopKeepsRepeatedFailureZerosInFifoOrder)
+{
+  const auto node = make_node("jerk_expected_stop_fifo_test", true, true);
+  JerkTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  PlanningSnapshot snapshot =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(snapshot);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(snapshot));
+  nav_2d_msgs::msg::Twist2D odom_velocity;
+  generator.startNewIteration(odom_velocity);
+
+  nav_2d_msgs::msg::Twist2D nonzero_command;
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
+  nonzero_state;
+  while (generator.hasMoreTwists()) {
+    const nav_2d_msgs::msg::Twist2D candidate = generator.nextTwist();
+    if (std::abs(candidate.x) > 1.0e-12 ||
+      std::abs(candidate.theta) > 1.0e-12)
+    {
+      nonzero_command = candidate;
+      nonzero_state = generator.active_candidate_command_state();
+      break;
+    }
+  }
+  ASSERT_TRUE(nonzero_state.has_value());
+
+  const rclcpp::Time issued_at = node->now();
+  generator.select_command_for_dispatch(nonzero_state);
+  generator.commit_selected_command(nonzero_command, issued_at);
+  ASSERT_TRUE(generator.commit_expected_controller_stop(issued_at));
+  ASSERT_TRUE(generator.commit_expected_controller_stop(issued_at));
+
+  PlanningSnapshot retry_snapshot =
+    make_observable_zero_snapshot(node->now());
+  retry_snapshot.committed_commands.push_back(
+    ScheduledCommand{issued_at, nonzero_command, false});
+  retry_snapshot.committed_commands.push_back(
+    ScheduledCommand{
+      issued_at, nav_2d_msgs::msg::Twist2D(), true});
+  retry_snapshot.committed_commands.push_back(
+    ScheduledCommand{
+      issued_at, nav_2d_msgs::msg::Twist2D(), true});
+  generator.enrich_planning_snapshot(retry_snapshot);
+  ASSERT_TRUE(retry_snapshot.valid);
+  EXPECT_TRUE(retry_snapshot.activation_state.native_state_valid);
+  EXPECT_DOUBLE_EQ(
+    retry_snapshot.activation_state.linear_acceleration, 0.0);
+  EXPECT_DOUBLE_EQ(
+    retry_snapshot.activation_state.angular_acceleration, 0.0);
+
+  f_dwa_controller::msg::CommandDispatch dispatch;
+  dispatch.header.stamp = node->now();
+  dispatch.command.linear.x = nonzero_command.x;
+  dispatch.command.angular.z = nonzero_command.theta;
+  dispatch.has_sequence = true;
+  generator.observe_command_dispatch(dispatch);
+  dispatch.header.stamp = node->now();
+  dispatch.command = geometry_msgs::msg::Twist();
+  generator.observe_command_dispatch(dispatch);
+  dispatch.header.stamp = node->now();
+  generator.observe_command_dispatch(dispatch);
+
+  PlanningSnapshot after_dispatch =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(after_dispatch);
+  EXPECT_TRUE(after_dispatch.valid);
+  EXPECT_TRUE(after_dispatch.current_state.native_state_valid);
+  EXPECT_DOUBLE_EQ(after_dispatch.current_state.linear_acceleration, 0.0);
+  EXPECT_DOUBLE_EQ(after_dispatch.current_state.angular_acceleration, 0.0);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  FirFailureStopPreservesHistoryAndPostBarrierMetadata)
+{
+  const auto node = make_node("fir_failure_stop_retry_test", true, true);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  PlanningSnapshot initial_snapshot =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(initial_snapshot);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(initial_snapshot));
+  nav_2d_msgs::msg::Twist2D odom_velocity;
+  generator.startNewIteration(odom_velocity);
+
+  nav_2d_msgs::msg::Twist2D initial_command;
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
+  initial_state;
+  while (generator.hasMoreTwists()) {
+    const auto candidate = generator.nextTwist();
+    if (std::abs(candidate.x) > 1.0e-12 ||
+      std::abs(candidate.theta) > 1.0e-12)
+    {
+      initial_command = candidate;
+      initial_state = generator.active_candidate_command_state();
+      break;
+    }
+  }
+  ASSERT_TRUE(initial_state.has_value());
+
+  const rclcpp::Time issued_at = node->now();
+  generator.select_command_for_dispatch(initial_state);
+  generator.commit_selected_command(initial_command, issued_at);
+  f_dwa_controller::msg::CommandDispatch dispatch;
+  dispatch.header.stamp = node->now();
+  dispatch.command.linear.x = initial_command.x;
+  dispatch.command.angular.z = initial_command.theta;
+  dispatch.has_sequence = true;
+  generator.observe_command_dispatch(dispatch);
+
+  ASSERT_TRUE(generator.commit_expected_controller_stop(node->now()));
+  PlanningSnapshot retry_snapshot =
+    make_observable_zero_snapshot(node->now());
+  retry_snapshot.current_state.velocity = initial_command;
+  retry_snapshot.activation_state.velocity = nav_2d_msgs::msg::Twist2D();
+  retry_snapshot.committed_commands.push_back(
+    ScheduledCommand{
+      node->now(), nav_2d_msgs::msg::Twist2D(), true});
+  generator.enrich_planning_snapshot(retry_snapshot);
+  ASSERT_TRUE(retry_snapshot.valid);
+  EXPECT_DOUBLE_EQ(
+    retry_snapshot.current_state.velocity.x, initial_command.x);
+  EXPECT_DOUBLE_EQ(
+    retry_snapshot.current_state.velocity.theta, initial_command.theta);
+  EXPECT_DOUBLE_EQ(retry_snapshot.activation_state.velocity.x, 0.0);
+  EXPECT_DOUBLE_EQ(retry_snapshot.activation_state.velocity.theta, 0.0);
+  EXPECT_DOUBLE_EQ(
+    retry_snapshot.activation_state.linear_acceleration,
+    -initial_command.x / 0.03);
+  EXPECT_DOUBLE_EQ(
+    retry_snapshot.activation_state.angular_acceleration,
+    -initial_command.theta / 0.03);
+  EXPECT_EQ(
+    retry_snapshot.activation_state.linear_fir_history,
+    initial_state->linear_fir_history);
+  EXPECT_EQ(
+    retry_snapshot.activation_state.angular_fir_history,
+    initial_state->angular_fir_history);
+
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(retry_snapshot));
+  generator.startNewIteration(odom_velocity);
+  nav_2d_msgs::msg::Twist2D retry_command;
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
+  retry_state;
+  while (generator.hasMoreTwists()) {
+    const auto candidate = generator.nextTwist();
+    if (std::abs(candidate.x) > 1.0e-12 ||
+      std::abs(candidate.theta) > 1.0e-12)
+    {
+      retry_command = candidate;
+      retry_state = generator.active_candidate_command_state();
+      break;
+    }
+  }
+  ASSERT_TRUE(retry_state.has_value());
+  generator.select_command_for_dispatch(retry_state);
+  generator.commit_selected_command(retry_command, node->now());
+
+  dispatch.header.stamp = node->now();
+  dispatch.command = geometry_msgs::msg::Twist();
+  generator.observe_command_dispatch(dispatch);
+  dispatch.header.stamp = node->now();
+  dispatch.command.linear.x = retry_command.x;
+  dispatch.command.angular.z = retry_command.theta;
+  generator.observe_command_dispatch(dispatch);
+
+  PlanningSnapshot after_retry_dispatch =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(after_retry_dispatch);
+  ASSERT_TRUE(after_retry_dispatch.valid);
+  EXPECT_TRUE(after_retry_dispatch.current_state.native_state_valid);
+  EXPECT_NEAR(
+    after_retry_dispatch.current_state.linear_acceleration,
+    retry_state->linear_state.acceleration, 1.0e-12);
+  EXPECT_NEAR(
+    after_retry_dispatch.current_state.angular_acceleration,
+    retry_state->angular_state.acceleration, 1.0e-12);
+  EXPECT_EQ(
+    after_retry_dispatch.current_state.linear_fir_history,
+    retry_state->linear_fir_history);
+  EXPECT_EQ(
+    after_retry_dispatch.current_state.angular_fir_history,
+    retry_state->angular_fir_history);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  FirSequencedExternalStopPrecedesPendingCommandWithoutResettingHistory)
+{
+  const auto node = make_node("fir_sequenced_external_stop_test", true, true);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  PlanningSnapshot initial = make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(initial);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(initial));
+  generator.startNewIteration(nav_2d_msgs::msg::Twist2D());
+
+  nav_2d_msgs::msg::Twist2D applied_command;
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
+  applied_state;
+  while (generator.hasMoreTwists()) {
+    const auto candidate = generator.nextTwist();
+    if (candidate.x > 1.0e-12) {
+      applied_command = candidate;
+      applied_state = generator.active_candidate_command_state();
+      break;
+    }
+  }
+  ASSERT_TRUE(applied_state.has_value());
+  const rclcpp::Time issued_at(1, 0, RCL_ROS_TIME);
+  generator.select_command_for_dispatch(applied_state);
+  generator.commit_selected_command(applied_command, issued_at);
+
+  f_dwa_controller::msg::CommandDispatch applied;
+  applied.header.stamp = rclcpp::Time(1, 10000000, RCL_ROS_TIME);
+  applied.command.linear.x = applied_command.x;
+  applied.command.angular.z = applied_command.theta;
+  applied.has_sequence = true;
+  generator.observe_command_dispatch(applied);
+
+  PlanningSnapshot next = make_observable_zero_snapshot(node->now());
+  next.current_state.velocity = applied_command;
+  next.activation_state.velocity = applied_command;
+  generator.enrich_planning_snapshot(next);
+  ASSERT_TRUE(next.valid);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(next));
+  generator.startNewIteration(applied_command);
+  ASSERT_TRUE(generator.hasMoreTwists());
+  const auto unpublished_command = generator.nextTwist();
+  const auto unpublished_state = generator.active_candidate_command_state();
+  ASSERT_TRUE(unpublished_state.has_value());
+  generator.select_command_for_dispatch(unpublished_state);
+  generator.commit_selected_command(
+    unpublished_command, rclcpp::Time(1, 20000000, RCL_ROS_TIME));
+
+  ASSERT_TRUE(generator.commit_observed_controller_stop_before_pending(
+      rclcpp::Time(1, 60000000, RCL_ROS_TIME)));
+  f_dwa_controller::msg::CommandDispatch stopped;
+  stopped.header.stamp = rclcpp::Time(1, 60000000, RCL_ROS_TIME);
+  stopped.has_sequence = true;
+  generator.observe_command_dispatch(stopped);
+
+  PlanningSnapshot observed = make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(observed);
+  ASSERT_TRUE(observed.valid);
+  EXPECT_TRUE(observed.current_state.native_state_valid);
+  EXPECT_DOUBLE_EQ(observed.current_state.velocity.x, 0.0);
+  EXPECT_NEAR(
+    observed.current_state.linear_acceleration,
+    -applied_command.x / 0.05, 1.0e-12);
+  EXPECT_EQ(
+    observed.current_state.linear_fir_history,
+    applied_state->linear_fir_history);
+  EXPECT_EQ(
+    observed.current_state.angular_fir_history,
+    applied_state->angular_fir_history);
+
+  f_dwa_controller::msg::CommandDispatch published_after_stop;
+  published_after_stop.header.stamp =
+    rclcpp::Time(1, 110000000, RCL_ROS_TIME);
+  published_after_stop.command.linear.x = unpublished_command.x;
+  published_after_stop.command.angular.z = unpublished_command.theta;
+  published_after_stop.has_sequence = true;
+  generator.observe_command_dispatch(published_after_stop);
+
+  PlanningSnapshot after_pending = make_observable_zero_snapshot(node->now());
+  after_pending.current_state.velocity = unpublished_command;
+  after_pending.activation_state.velocity = unpublished_command;
+  generator.enrich_planning_snapshot(after_pending);
+  ASSERT_TRUE(after_pending.valid);
+  EXPECT_TRUE(after_pending.current_state.native_state_valid);
+  EXPECT_EQ(
+    after_pending.current_state.linear_fir_history,
+    unpublished_state->linear_fir_history);
+  EXPECT_EQ(
+    after_pending.current_state.angular_fir_history,
+    unpublished_state->angular_fir_history);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  FirRejectsOutOfOrderZeroMatchingOnlyALaterExpectedStop)
+{
+  const auto node = make_node("fir_out_of_order_stop_test", true, true);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  PlanningSnapshot snapshot =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(snapshot);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(snapshot));
+  nav_2d_msgs::msg::Twist2D odom_velocity;
+  generator.startNewIteration(odom_velocity);
+
+  nav_2d_msgs::msg::Twist2D nonzero_command;
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
+  nonzero_state;
+  while (generator.hasMoreTwists()) {
+    const nav_2d_msgs::msg::Twist2D candidate = generator.nextTwist();
+    if (std::abs(candidate.x) > 1.0e-12 ||
+      std::abs(candidate.theta) > 1.0e-12)
+    {
+      nonzero_command = candidate;
+      nonzero_state = generator.active_candidate_command_state();
+      break;
+    }
+  }
+  ASSERT_TRUE(nonzero_state.has_value());
+
+  const rclcpp::Time issued_at = node->now();
+  generator.select_command_for_dispatch(nonzero_state);
+  generator.commit_selected_command(nonzero_command, issued_at);
+  ASSERT_TRUE(generator.commit_expected_controller_stop(issued_at));
+
+  f_dwa_controller::msg::CommandDispatch dispatch;
+  dispatch.header.stamp = node->now();
+  dispatch.has_sequence = true;
+  generator.observe_command_dispatch(dispatch);
+
+  PlanningSnapshot after_out_of_order_dispatch =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(after_out_of_order_dispatch);
+  EXPECT_FALSE(after_out_of_order_dispatch.valid);
+  EXPECT_FALSE(
+    after_out_of_order_dispatch.current_state.native_state_valid);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
   FirStateRejectsUncorrelatedNonzeroDispatch)
 {
   const auto node = make_node("fir_uncorrelated_dispatch_test", true, true);
@@ -965,6 +2358,136 @@ TEST_F(
   generator.enrich_planning_snapshot(snapshot);
   EXPECT_FALSE(snapshot.valid);
   EXPECT_FALSE(snapshot.current_state.native_state_valid);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  AccelerationSafetyReductionUsesActuallyAppliedCommandState)
+{
+  const auto node = make_node("acceleration_safety_reduction_test", true, true);
+  AccelerationTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  f_dwa_controller::msg::CommandDispatch reset;
+  reset.header.stamp = rclcpp::Time(1, 0, RCL_ROS_TIME);
+  reset.has_sequence = false;
+  generator.observe_command_dispatch(reset);
+
+  PlanningSnapshot snapshot =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(snapshot);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(snapshot));
+  generator.startNewIteration(nav_2d_msgs::msg::Twist2D());
+
+  nav_2d_msgs::msg::Twist2D issued;
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState> state;
+  while (generator.hasMoreTwists()) {
+    const auto candidate = generator.nextTwist();
+    if (std::abs(candidate.x) > 1.0e-12 ||
+      std::abs(candidate.theta) > 1.0e-12)
+    {
+      issued = candidate;
+      state = generator.active_candidate_command_state();
+      break;
+    }
+  }
+  ASSERT_TRUE(state.has_value());
+  generator.select_command_for_dispatch(state);
+  generator.commit_selected_command(
+    issued, rclcpp::Time(1, 0, RCL_ROS_TIME));
+
+  f_dwa_controller::msg::CommandDispatch applied;
+  applied.header.stamp = rclcpp::Time(1, 50000000, RCL_ROS_TIME);
+  applied.command.linear.x = 0.8 * issued.x;
+  applied.command.angular.z = 0.8 * issued.theta;
+  applied.has_sequence = true;
+  generator.observe_command_dispatch(applied, true);
+
+  PlanningSnapshot observed =
+    make_observable_zero_snapshot(node->now());
+  observed.current_state.velocity.x = applied.command.linear.x;
+  observed.current_state.velocity.theta = applied.command.angular.z;
+  observed.activation_state.velocity = observed.current_state.velocity;
+  generator.enrich_planning_snapshot(observed);
+  ASSERT_TRUE(observed.valid);
+  EXPECT_TRUE(observed.current_state.native_state_valid);
+  EXPECT_NEAR(observed.current_state.velocity.x, 0.8 * issued.x, 1.0e-12);
+  EXPECT_NEAR(
+    observed.current_state.velocity.theta,
+    0.8 * issued.theta, 1.0e-12);
+  EXPECT_NEAR(
+    observed.current_state.linear_acceleration,
+    0.8 * issued.x / 0.05, 1.0e-10);
+  EXPECT_NEAR(
+    observed.current_state.angular_acceleration,
+    0.8 * issued.theta / 0.05, 1.0e-10);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  FirSafetyReductionPreservesRawHistoryAndUsesAppliedVelocity)
+{
+  const auto node = make_node("fir_safety_reduction_test", true, true);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  generator.reset_trial_state();
+
+  f_dwa_controller::msg::CommandDispatch reset;
+  reset.header.stamp = rclcpp::Time(1, 0, RCL_ROS_TIME);
+  reset.has_sequence = false;
+  generator.observe_command_dispatch(reset);
+
+  PlanningSnapshot snapshot =
+    make_observable_zero_snapshot(node->now());
+  generator.enrich_planning_snapshot(snapshot);
+  generator.set_planning_snapshot(
+    std::make_shared<const PlanningSnapshot>(snapshot));
+  generator.startNewIteration(nav_2d_msgs::msg::Twist2D());
+
+  nav_2d_msgs::msg::Twist2D issued;
+  std::optional<NativeInputTrajectoryGenerator::NativeCommandState> state;
+  while (generator.hasMoreTwists()) {
+    const auto candidate = generator.nextTwist();
+    if (std::abs(candidate.x) > 1.0e-12 ||
+      std::abs(candidate.theta) > 1.0e-12)
+    {
+      issued = candidate;
+      state = generator.active_candidate_command_state();
+      break;
+    }
+  }
+  ASSERT_TRUE(state.has_value());
+  generator.select_command_for_dispatch(state);
+  generator.commit_selected_command(
+    issued, rclcpp::Time(1, 0, RCL_ROS_TIME));
+
+  f_dwa_controller::msg::CommandDispatch applied;
+  applied.header.stamp = rclcpp::Time(1, 50000000, RCL_ROS_TIME);
+  applied.command.linear.x = 0.8 * issued.x;
+  applied.command.angular.z = 0.8 * issued.theta;
+  applied.has_sequence = true;
+  generator.observe_command_dispatch(applied, true);
+
+  PlanningSnapshot observed =
+    make_observable_zero_snapshot(node->now());
+  observed.current_state.velocity.x = applied.command.linear.x;
+  observed.current_state.velocity.theta = applied.command.angular.z;
+  observed.activation_state.velocity = observed.current_state.velocity;
+  generator.enrich_planning_snapshot(observed);
+  ASSERT_TRUE(observed.valid);
+  EXPECT_TRUE(observed.current_state.native_state_valid);
+  EXPECT_NEAR(observed.current_state.velocity.x, 0.8 * issued.x, 1.0e-12);
+  EXPECT_NEAR(
+    observed.current_state.velocity.theta,
+    0.8 * issued.theta, 1.0e-12);
+  EXPECT_EQ(
+    observed.current_state.linear_fir_history,
+    state->linear_fir_history);
+  EXPECT_EQ(
+    observed.current_state.angular_fir_history,
+    state->angular_fir_history);
 }
 
 }  // namespace f_dwa_controller

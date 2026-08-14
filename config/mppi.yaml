@@ -14,10 +14,10 @@ controller_server:
       regenerate_noises: false
 
       motion_model: "DiffDrive"
-      vx_max: 1.2  # 0.6 for the initial real-robot limit
+      vx_max: 0.6
       vx_min: 0.0
       vy_max: 0.0
-      wz_max: 1.57
+      wz_max: 0.6
       ax_max: 1.2
       ax_min: -1.2
       ay_max: 0.0
@@ -56,7 +56,10 @@ controller_server:
       CostCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.81
+        # R1 reached the known-free room entrance but then selected no further
+        # progress. Keep footprint collision_cost unchanged and reduce only the
+        # soft inflated-cost ranking term for the corner-entry ablation.
+        cost_weight: 1.0
         consider_footprint: true
         collision_cost: 1000000.0
         critical_cost: 300.0

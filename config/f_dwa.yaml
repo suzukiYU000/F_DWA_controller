@@ -3,16 +3,15 @@ controller_server:
     FollowPath:
       plugin: "f_dwa_controller::FDwaController"
       trajectory_generator_name: "f_dwa_controller::FirTrajectoryGenerator"
-      enable_certification: true
+      enable_certification: false
       native_input_control_period: 0.05
       require_applied_command_state: true
       max_linear_raw_input: 1.2
       max_angular_raw_input: 1.57
       # Score a short raw-input action followed by zero input, as in the ROS 1
       # finite-pulse profile. Nav2 executes only its first 50 ms step and
-      # replans, while the independent stop certificate still checks the full
-      # delayed stopping sequence. Use 0.0 for the former 2.4 s held-input
-      # profile when running that ablation.
+      # replans. Use 0.0 for the former 2.4 s held-input profile when running
+      # that ablation. Terminal-stop certification is disabled independently.
       fir_prediction_pulse_duration: 0.15
       # fir_prediction_pulse_duration: 0.30  # longer-pulse ablation
 

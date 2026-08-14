@@ -4,10 +4,15 @@ The common file contains parameters shared by V-DWB, A-DWA, J-DWA, F-DWA,
 and the MPPI comparison baseline.
 Method files should contain only the plugin and native-dynamics differences.
 
-`enable_certification: true` adds the common terminal-stop certificate and
-retained-backup revalidation. It can be disabled through the research launch
-for an ablation, while the common 70 ms nominal command-history rollout remains
-enabled. DWB-derived native-input generators keep the selected candidate's
+`enable_certification` is `false` in every normal controller configuration.
+Setting it to `true` is reserved for an explicit terminal-stop-certificate
+ablation; normal experiments do not add or reject candidates with that
+certificate. `terminal_stop_goal_capture_distance` is also `0.0` in the common
+comparison Config. This disables generation and retention of the separate
+goal-capture stop sequence even when certification is off; a positive value is
+an independently reported terminal-stop-policy ablation. The common nominal
+command-history rollout remains enabled.
+DWB-derived native-input generators keep the selected candidate's
 internal acceleration, jerk, or FIR state correlated with the observable
 dispatch ledger in either mode; disabling certification changes neither the
 candidate dynamics nor state ownership.
@@ -26,6 +31,9 @@ The common dispatch-state parameters are:
   events (`f_dwa_controller/msg/CommandDispatch`)
 - `transport_valid_topic`: latched transport validity
 - `require_command_dispatch_state`: reject planning before observable state
+- `allow_safety_command_reduction`: real-mode-only permission to correlate one
+  same-sequence FIFO-head command that a downstream safety monitor only reduced
+  or zeroed; simulation keeps this `false` and requires exact command equality
 - `nominal_delay_preview_seconds`: future nominal delay; no future jitter sample
 - `terminal_stop_command_delay_seconds`: delay included before terminal stop
 - `terminal_stop_velocity_threshold`: common numerical capture threshold for
@@ -34,11 +42,13 @@ The common dispatch-state parameters are:
 - `terminal_stop_maximum_time`: upper bound for constructing a certified stop,
   not a commanded stop duration; the common 12 s bound accommodates the F-8
   filter-history drain and each sequence ends as soon as capture is reached
+- `terminal_stop_goal_capture_distance`: `0.0` for normal V/A/J/F comparisons,
+  so no separate terminal-stop suffix is generated or retained
 - `stop_capture_velocity`: planned-stop completion threshold
 - `planning_deadline_seconds`: 0.05 s deadline at the common 20 Hz control rate
 
 `forward_prune_distance` is 4 m for every DWB-derived method. This exceeds the
-maximum nominal travel of a 1.2 m/s, 2.4 s candidate (2.88 m) while remaining
+maximum nominal travel of a 0.6 m/s, 2.4 s candidate (1.44 m) while remaining
 inside the 10 m square local costmap. The path critics therefore see a real
 Path segment rather than an artificial 2 m transformed-Path endpoint.
 
@@ -51,11 +61,13 @@ command is within the same stopped threshold, then rechecks pose, yaw, and
 measured odometry. If delayed commands moved the robot outside the goal
 condition, the runner resends the same saved Path within the original run
 deadline. A new setPlan resets stateful DWB components before control resumes.
-The research-common `RotateToGoal.xy_goal_tolerance_release_margin` is 0.03 m:
-the rotate-only latch entered at 0.20 m is released beyond 0.23 m, inside the
-0.25 m stopped-goal acceptance boundary. Its upstream-compatible default is
--1.0 (no automatic release), and the goal acceptance tolerance remains
-0.25 m. This behavior is exported by
+The research-common stopping critic and GoalChecker both use the same 0.25 m
+position window.  Its
+`RotateToGoal.xy_goal_tolerance_release_margin` is 0.0 m, so the rotate-only
+latch is released immediately outside the GoalChecker acceptance boundary.
+This avoids a band where translation is rejected although the non-stateful
+GoalChecker cannot yet succeed.  The upstream-compatible release-margin
+default is -1.0 (no automatic release). This behavior is exported by
 `f_dwa_controller::HysteresisRotateToGoalCritic`; Navigation2 source remains
 unchanged.
 The dispatch publisher is Reliable during a run and retains only its latest

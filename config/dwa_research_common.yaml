@@ -19,19 +19,21 @@ controller_server:
       # A shortest angular distance never exceeds pi, so yaw cannot prevent
       # success while angular velocity must still settle below 0.01 rad/s.
       yaw_goal_tolerance: 3.141592653589793
+      xy_goal_tolerance: 0.25
     FollowPath:
       debug_trajectory_details: true
-      # Define the position window where the common stopping critic starts
-      # reducing translational and angular speed.
-      xy_goal_tolerance: 0.20
+      # Match the GoalChecker position window.  A smaller stopping window left
+      # a 0.20--0.25 m band where Nav2 could accept the position but the common
+      # critic would not settle angular velocity.
+      xy_goal_tolerance: 0.25
       trans_stopped_velocity: 0.01
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 1.2  # 0.6 for the initial real-robot limit
+      max_vel_x: 0.6
       max_vel_y: 0.0
-      max_vel_theta: 1.57
+      max_vel_theta: 0.6
       min_speed_xy: 0.0
-      max_speed_xy: 1.2  # 0.6 for the initial real-robot limit
+      max_speed_xy: 0.6
       min_speed_theta: 0.0
       acc_lim_x: 1.2
       acc_lim_y: 0.0
@@ -45,11 +47,15 @@ controller_server:
       # Fifteen improves steering resolution without changing the upstream
       # generator algorithms or introducing a method-specific advantage.
       vtheta_samples: 15
-      sim_time: 2.4
-      # Keep the transformed Path longer than the maximum 1.2 m/s x 2.4 s
+      # The 2026-08-07 doorway runs showed one-cycle 165/165 footprint
+      # rejection with only a 0.6 m maximum rollout. A common 1.6 s horizon
+      # exposes up to 0.96 m while keeping J-DWA's first executable velocity
+      # increment above the common 0.001 m/s threshold.
+      sim_time: 1.6
+      # Keep the transformed Path longer than the maximum 0.6 m/s x 1.6 s
       # nominal rollout. The 4 m segment remains inside the 5 m half-width of
-      # the common local costmap and prevents a fast candidate from being
-      # scored against an artificially clipped Path endpoint.
+      # the common local costmap and prevents a candidate from being scored
+      # against an artificially clipped Path endpoint.
       forward_prune_distance: 4.0
       discretize_by_time: true
       time_granularity: 0.05
@@ -64,7 +70,15 @@ controller_server:
       transport_valid_topic: "/dwa_experiment/transport_valid"
       transport_invalidation_service: "/command_delay_transport/invalidate_trial"
       require_command_dispatch_state: true
+      # Real launch enables this only for a same-sequence, FIFO-head command
+      # reduction observed after Collision Monitor. Simulation keeps strict
+      # value equality so transport corruption cannot masquerade as safety.
+      allow_safety_command_reduction: false
       certification_control_period: 0.05
+      # Primary V/A/J/F comparison: never generate or inject an additional
+      # stop suffix. NoValidControl is reported by upstream Nav2, while the
+      # common candidate set and physical-footprint gate remain observable.
+      enable_no_valid_control_deceleration_fallback: false
       # F-8's 46 effective taps retain 2.3 s of raw-input history at 20 Hz.
       # Twelve seconds lets the projected stop drain that state after braking;
       # this is only a search bound, and the generated sequence ends as soon
@@ -81,10 +95,10 @@ controller_server:
       terminal_stop_goal_distance_scale: 24.0
       terminal_stop_distance_target: path_progress
       terminal_stop_path_lookahead_distance: 1.5
-      # Once an already-certified stop ends inside this terminal set, retain
-      # and revalidate its remaining suffix instead of replanning braking away.
-      # Set to 0.0 to disable the capture policy.
-      terminal_stop_goal_capture_distance: 0.10
+      # The normal V/A/J/F comparison must not generate or retain an additional
+      # terminal-stop sequence. A positive value is reserved for an explicitly
+      # reported terminal-stop-policy ablation.
+      terminal_stop_goal_capture_distance: 0.0
       # Ignore terminal yaw when retaining a certified stop. The periodic yaw
       # error is at most pi, matching the position-and-speed GoalChecker.
       terminal_stop_goal_capture_yaw_tolerance: 3.141592653589793
@@ -92,11 +106,11 @@ controller_server:
       # Certification rounds this upward to complete 50 ms controller ticks
       # (70 ms -> 2 ticks) for every DWB-derived method.
       terminal_stop_command_delay_seconds: 0.07
-      # This is an additional certificate reserve outside the common 0.10 m
-      # planning footprint padding. Recovery from reserve intrusion is off by
+      # This is an optional certificate reserve outside the measured physical
+      # footprint. Recovery from reserve intrusion is off by
       # default and will be implemented as a separate switchable policy.
       minimum_certified_margin: 0.02
-      # Optional reserve-only recovery never relaxes the common 0.10 m
+      # Optional reserve-only recovery never relaxes the physical
       # planning footprint. It is an ablation and remains off for the primary
       # comparison; when enabled, the candidate must move toward and clear
       # only the additional 0.02 m reserve.
@@ -131,7 +145,11 @@ controller_server:
       publish_trajectories: false
       stateful: true
       critics:
+        # Evaluate the physical hard constraint before soft short-circuiting,
+        # so every trajectory reported as valid has passed the footprint gate.
+        - ObstacleFootprint
         - RotateToGoal
+        - TerminalApproach
         - GoalAlign
         - PathAlign
         - MeanPathDist
@@ -145,51 +163,124 @@ controller_server:
         # for the next receding-horizon cycle. This never replaces or relaxes
         # the common swept-footprint SafetyCertificate.
         - ForwardObstacle
+        # Soft footprint-aware clearance ranking. This never changes the
+        # physical footprint or hard collision rejection; the GUI exposes
+        # only its zero-cost margin for common V/A/J/F/DWB comparisons.
+        - FootprintClearance
         # The common certification layer performs exact swept-footprint safety
         # checks. Use the standard center-cell critic only for the continuous
         # inflation gradient used in candidate ranking.
         - BaseObstacle
-      # Preserve the full-trajectory inflation gradient. Candidate diagnostics
-      # showed that 0.025 reversed an 8.7-cost path/progress advantage by a
-      # 9.3-cost obstacle difference; 0.020 keeps the trajectory observable
-      # while allowing the earlier steering reversal by about 1.2 cost.
-      BaseObstacle.scale: 0.020
+      # R1 diagnostics found valid, collision-free moving candidates at the
+      # room approach, but the 2.4 s accumulated inflation gradient made the
+      # stationary candidate cheapest until PoseProgressChecker expired.
+      # Keep the polygon hard-rejection critic unchanged and reduce only this
+      # soft center-cell ranking term. Preserve the former 1.0 s integrated
+      # exposure after the horizon increase: 0.005 * 1.0 / 1.6.
+      BaseObstacle.scale: 0.003125
       # BaseObstacle.scale: 0.15  # stronger-clearance ablation; recording invalid
       BaseObstacle.sum_scores: true
-      PathAlign.scale: 2.0
-      PathAlign.forward_point_distance: 0.325
-      GoalAlign.scale: 1.5
-      GoalAlign.forward_point_distance: 0.325
+      # Keep the heading/path observation terms identical to the passing Nav2
+      # DWB baseline.  R1 evidence showed that the former research-only values
+      # (PathAlign 2.0, GoalAlign 1.5, 0.325 m) underweighted the north-room
+      # bend: V/A/J reversed a small positive turn and stopped at the doorway,
+      # while baseline DWB selected about +0.28 rad/s before the same bend.
+      # These are critic parameters only; each method's dynamics remain native.
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.6
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.6
       MeanPathDist.class: "f_dwa_controller::MeanPathDistCritic"
-      # MapGridCritic's effective scale is resolution * 0.5 * scale.
-      # A value of 80 therefore gives an interpretable 40 * mean_distance_m.
-      # R30--R32 used this same value in Straight, Env2, and Corridor: it
-      # restored whole-trajectory Path tracking without preventing the lateral
-      # departures required to pass alternating LiDAR-only obstacles.
-      MeanPathDist.scale: 80.0
+      # Match the upstream DWB path-distance exposure. The former value 80
+      # charged a 0.5 m doorway detour about 20 cost while the entire forward
+      # obstacle signal was capped at 2, making an exact stop cheaper than a
+      # safe path departure in run05.
+      MeanPathDist.scale: 32.0
       GoalDist.scale: 24.0
       TrajectoryProgress.class: "f_dwa_controller::TrajectoryProgressCritic"
-      # 1.2 m/s x 2.4 s. Near the goal, the critic automatically uses the
+      # 0.6 m/s x 1.6 s. Near the goal, the critic automatically uses the
       # shorter remaining Path length.
-      TrajectoryProgress.lookahead_distance: 2.88
+      TrajectoryProgress.lookahead_distance: 0.96
       TrajectoryProgress.scale: 12.0
       MeanSpeed.class: "f_dwa_controller::MeanSpeedCritic"
-      MeanSpeed.target_speed: 1.2
+      MeanSpeed.target_speed: 0.6
       MeanSpeed.scale: 4.0
       ForwardObstacle.class: "f_dwa_controller::ForwardObstacleCritic"
-      ForwardObstacle.lookahead_distance: 1.2
+      # Common total spatial observation distance. Unlike the former endpoint
+      # +2 m ray, this does not grow when sim_time changes.
+      ForwardObstacle.risk_distance: 2.5
+      # Build every soft risk path from the same native-model prefix. Longer
+      # 1.6/1.8 s rollout suffixes remain available to the physical hard gate,
+      # but cannot change this 2.5 m terminal-value prediction.
+      ForwardObstacle.risk_seed_time: 1.4
+      # After the common 1.4 s native prefix, preserve the candidate's spatial
+      # turn for a fixed 0.50 m maneuver phase, then merge its heading back to
+      # the plan over this common physical distance. The complete 0.50 + 1.0 m
+      # transition fits beyond a 0.84 m maximum-speed seed in the 2.5 m risk
+      # horizon and is independent of sim_time.
+      ForwardObstacle.heading_relaxation_distance: 1.0
       ForwardObstacle.sample_resolution: 0.05
-      # Raw cost is normalized to [0, 1].
+      # Weight a hit near the candidate endpoint more than the same hit at the
+      # end of the observable extension. This removes the former binary
+      # saturation where every slight turn scored exactly 1.0 until it had
+      # already cleared the obstacle completely.
+      ForwardObstacle.distance_weighting_power: 1.0
+      # Blend a peak guard with the fixed-distance exposure integral.  A pure
+      # maximum gives every ray that touches one inflated obstacle nearly the
+      # same score and cannot initiate an early detour.
+      ForwardObstacle.peak_weight: 0.25
       ForwardObstacle.scale: 8.0
+      FootprintClearance.class: "f_dwa_controller::FootprintClearanceCritic"
+      FootprintClearance.clearance_margin: 0.45
+      FootprintClearance.clearance_bands: 9
+      FootprintClearance.risk_distance: 2.5
+      FootprintClearance.risk_seed_time: 1.4
+      FootprintClearance.heading_relaxation_distance: 1.0
+      FootprintClearance.sample_resolution: 0.10
+      FootprintClearance.source_layer: ""
+      FootprintClearance.exclude_layer: ""
+      FootprintClearance.exclude_layer_tolerance: 0.0
+      FootprintClearance.penalty_power: 3.0
+      FootprintClearance.peak_weight: 0.25
+      FootprintClearance.scale: 75.0
+      ObstacleFootprint.class: "f_dwa_controller::HorizonObstacleFootprintCritic"
+      # Deprecated compatibility input: this value is still validated but no
+      # longer truncates the hard gate or contributes a soft score. The critic
+      # checks the complete nominal rollout and returns raw zero when legal;
+      # ForwardObstacle, FootprintClearance and BaseObstacle provide ranking.
+      ObstacleFootprint.score_time_horizon: 1.6
+      # Spatial interpolation interval for swept physical-footprint checks.
+      # A longer sim_time still checks a longer suffix and can therefore
+      # change the hard legal candidate set.
+      ObstacleFootprint.maximum_swept_distance: 0.025
+      # Keep a non-zero scale for configuration/provenance compatibility;
+      # every legal candidate has neutral raw score zero.
+      ObstacleFootprint.scale: 0.4
       RotateToGoal.scale: 32.0
       RotateToGoal.class: "f_dwa_controller::HysteresisRotateToGoalCritic"
       RotateToGoal.slowing_factor: 5.0
       # Preserve the stopping behavior without ranking the configured goal
       # orientation. Angular motion is instead reduced around the current yaw.
       RotateToGoal.ignore_goal_orientation: true
-      # Keep 0.03 m hysteresis against delayed-command position drift.
-      RotateToGoal.xy_goal_tolerance_release_margin: 0.03
+      # Do not latch outside the GoalChecker window.  A positive release
+      # margin would create another position band where translation is
+      # rejected although the non-stateful GoalChecker cannot yet succeed.
+      RotateToGoal.xy_goal_tolerance_release_margin: 0.0
       RotateToGoal.lookahead_time: 1.25
+      TerminalApproach.class: "f_dwa_controller::TerminalApproachCritic"
+      # Keep obstacle/path ranking unchanged outside the terminal region. The
+      # smooth 1.5--0.65 m transition avoids a discontinuous command choice.
+      # Every horizon evaluates the same 1.4 s rollout prefix and projects its
+      # measured speed from that pose to a soft predicted stopping position.
+      TerminalApproach.evaluation_time: 1.4
+      TerminalApproach.outer_distance: 1.5
+      TerminalApproach.full_weight_distance: 0.65
+      # Recorded V/A/J/F stopping responses, including their native state
+      # dynamics and past-command transport, were 0.109--0.163 m/s^2.  Using
+      # the physical 0.6 m/s^2 value underestimated the observed stopping
+      # distance by four to six times and activated useful ranking too late.
+      TerminalApproach.reference_deceleration: 0.15
+      TerminalApproach.scale: 24.0
 
 velocity_smoother:
   ros__parameters:
@@ -197,8 +288,8 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [1.2, 0.0, 1.57]  # [0.6, 0.0, 1.57] on the real robot
-    min_velocity: [0.0, 0.0, -1.57]
+    max_velocity: [0.6, 0.0, 0.6]
+    min_velocity: [0.0, 0.0, -0.6]
     max_accel: [1.2, 0.0, 1.57]
     max_decel: [-1.2, 0.0, -1.57]
     odom_topic: "/whill/odom"
@@ -225,12 +316,17 @@ local_costmap:
       resolution: 0.05
       width: 10
       height: 10
-      # Rectangle is the default research footprint. The 0.10 m padding is
-      # the planning margin and is not treated as physical contact.
+      # Rectangle is the measured physical research footprint. Clearance
+      # outside it is represented by the inflation gradient below.
       footprint: "[[-0.2, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.2, 0.3]]"
-      footprint_padding: 0.10
+      # Use the measured WHILL body rectangle as the hard planning boundary.
+      # A previous 0.05 m padding marked the 1.5 m room entrance as lethal even
+      # when the physical footprint was collision-free, rejecting every DWA
+      # sample and causing PATIENCE_EXCEEDED.  Inflation still supplies a soft
+      # clearance cost; physical-footprint collision remains a hard rejection.
+      footprint_padding: 0.0
       inflation_layer:
-        # Covers the padded rectangle's 0.984886 m circumscribed radius, so
+        # Covers the rectangle's 0.854401 m circumscribed radius, so
         # footprint collision checks cannot be skipped from a free center cell.
         inflation_radius: 1.0
       voxel_layer:
@@ -246,7 +342,9 @@ global_costmap:
     ros__parameters:
       resolution: 0.05
       footprint: "[[-0.2, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.2, 0.3]]"
-      footprint_padding: 0.10
+      # Keep the global and local planning geometry identical so all research
+      # Controllers compare against the same measured physical footprint.
+      footprint_padding: 0.0
       # Corridor posts are deliberately local-LiDAR obstacles. Generated
       # global paths therefore remain independent of post observations.
       obstacle_layer:

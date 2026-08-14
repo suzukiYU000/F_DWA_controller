@@ -3,7 +3,7 @@ controller_server:
     FollowPath:
       plugin: "f_dwa_controller::CertifiedDWBLocalPlanner"
       trajectory_generator_name: "f_dwa_controller::VStandardTrajectoryGenerator"
-      enable_certification: true
+      enable_certification: false
       # StandardTrajectoryGenerator otherwise returns the distant target
       # velocity rather than its first acceleration-limited executable sample.
       limit_vel_cmd_in_traj: true

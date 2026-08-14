@@ -3,6 +3,19 @@ controller_server:
     FollowPath:
       plugin: "f_dwa_controller::CertifiedDWBLocalPlanner"
       trajectory_generator_name: "f_dwa_controller::VLimitedAccelTrajectoryGenerator"
-      enable_certification: true
+      # Keep the dispatched-command state model, but do not append or reject
+      # candidates using the optional terminal-stop certificate.
+      enable_certification: false
       # Match the common Nav2 Controller Server frequency.
       sim_period: 0.05
+      # PathAlign and GoalAlign inherit the common values shared with A/J/F
+      # and the Nav2 DWB baseline.  Keep V-DWA differences confined to its
+      # dispatched-command velocity state model.
+
+# At 0.60 m/s with the real-run 0.20 m/s^2 deceleration cap, the nominal
+# stopping distance is 0.90 m.  A 2.0 s approach horizon observes 1.20 m at
+# maximum speed and remains the controller-independent live-sensor guard.
+collision_monitor:
+  ros__parameters:
+    FootprintApproach:
+      time_before_collision: 2.0

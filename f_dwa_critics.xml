@@ -12,15 +12,26 @@
     type="f_dwa_controller::HorizonObstacleFootprintCritic"
     base_class_type="dwb_core::TrajectoryCritic">
     <description>
-      Nav2 swept-footprint collision checking over the full trajectory with
-      soft obstacle-cost accumulation limited to a configurable horizon.
+      Nav2 swept physical-footprint hard checking over the complete nominal
+      trajectory. Legal trajectories receive a neutral raw score.
     </description>
   </class>
   <class
     type="f_dwa_controller::ForwardObstacleCritic"
     base_class_type="dwb_core::TrajectoryCritic">
     <description>
-      Soft local-costmap lookahead beyond the candidate endpoint.
+      Soft fixed-distance local-costmap lookahead whose spatial candidate turn
+      is held for a bounded maneuver phase, then relaxes continuously back to
+      the prepared reference plan.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::FootprintClearanceCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Bounded soft cost for lethal cells inside configurable bands outside the
+      physical robot footprint along the same maneuver-then-relax risk path;
+      hard collision rejection remains independent.
     </description>
   </class>
   <class
@@ -28,6 +39,13 @@
     base_class_type="dwb_core::TrajectoryCritic">
     <description>
       Non-negative lack-of-progress cost measured along the observable Path.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::TerminalApproachCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Goal-local soft projected stopping-pose ranking from a fixed-time state.
     </description>
   </class>
   <class

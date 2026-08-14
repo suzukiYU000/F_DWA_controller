@@ -38,6 +38,7 @@ struct DelayedCommand
 {
   geometry_msgs::msg::Twist command;
   rclcpp::Time received_at;
+  uint64_t received_steady_time_ns;
   rclcpp::Time eligible_at;
   uint64_t sequence;
   double sampled_delay_ms;
@@ -52,7 +53,7 @@ struct CommandDelayParameters
   double zero_threshold{0.0};
   // Three bounded-delay entries, one normal callback-order entry, and one
   // delayed-timer scheduling slot. A further backlog is transport_invalid.
-  std::size_t max_queue_depth{5};
+  std::size_t max_queue_depth{24};
   uint64_t random_seed{0};
 };
 
@@ -63,7 +64,8 @@ public:
 
   [[nodiscard]] bool enqueue(
     const geometry_msgs::msg::Twist & command,
-    const rclcpp::Time & received_at);
+    const rclcpp::Time & received_at,
+    uint64_t received_steady_time_ns);
 
   [[nodiscard]] std::optional<DelayedCommand> pop_due(const rclcpp::Time & now);
   [[nodiscard]] std::size_t size() const;

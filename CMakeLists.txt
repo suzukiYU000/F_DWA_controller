@@ -23,6 +23,7 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 set(library_name f_dwa_controller_core)
 set(transport_library_name f_dwa_transport)
@@ -46,15 +47,19 @@ add_library(${library_name} SHARED
   src/certified_dwb_local_planner.cpp
   src/dwa_controllers.cpp
   src/fir_input_dynamics.cpp
+  src/fixed_distance_risk_path.cpp
+  src/footprint_clearance_critic.cpp
   src/forward_obstacle_critic.cpp
   src/horizon_obstacle_footprint_critic.cpp
   src/hysteresis_rotate_to_goal_critic.cpp
+  src/issued_command_ledger.cpp
   src/mean_path_dist_critic.cpp
   src/mean_speed_critic.cpp
   src/native_input_dynamics.cpp
   src/native_input_trajectory_generator.cpp
   src/path_subgoal.cpp
   src/path_subgoal_dist_critic.cpp
+  src/terminal_approach_critic.cpp
   src/terminal_stop_dynamics.cpp
   src/trajectory_progress_critic.cpp
   src/trajectory_certifier.cpp
@@ -62,6 +67,7 @@ add_library(${library_name} SHARED
 )
 
 add_library(${transport_library_name} SHARED
+  src/command_envelope_node.cpp
   src/command_delay_node.cpp
   src/command_delay_queue.cpp
 )
@@ -104,6 +110,7 @@ ament_target_dependencies(${library_name}
   rclcpp_lifecycle
   std_srvs
   tf2_ros
+  visualization_msgs
 )
 
 ament_target_dependencies(${transport_library_name}
@@ -120,6 +127,13 @@ add_executable(command_delay_transport
 target_compile_features(command_delay_transport PUBLIC cxx_std_17)
 target_link_libraries(command_delay_transport ${transport_library_name})
 ament_target_dependencies(command_delay_transport rclcpp)
+
+add_executable(command_envelope
+  src/command_envelope_main.cpp
+)
+target_compile_features(command_envelope PUBLIC cxx_std_17)
+target_link_libraries(command_envelope ${transport_library_name})
+ament_target_dependencies(command_envelope rclcpp)
 
 pluginlib_export_plugin_description_file(nav2_core f_dwa_controller.xml)
 pluginlib_export_plugin_description_file(
@@ -140,7 +154,7 @@ install(
 
 # ROS 2 launch resolves package executables from lib/${PROJECT_NAME}.
 install(
-  TARGETS command_delay_transport
+  TARGETS command_delay_transport command_envelope
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -181,6 +195,24 @@ if(BUILD_TESTING)
       rclcpp
       std_srvs
     )
+  endif()
+
+  ament_add_gtest(test_issued_command_ledger
+    test/test_issued_command_ledger.cpp
+  )
+  if(TARGET test_issued_command_ledger)
+    target_link_libraries(test_issued_command_ledger ${library_name})
+    ament_target_dependencies(test_issued_command_ledger
+      nav_2d_msgs
+      rclcpp
+    )
+  endif()
+
+  ament_add_gtest(test_dispatch_epoch_gate
+    test/test_dispatch_epoch_gate.cpp
+  )
+  if(TARGET test_dispatch_epoch_gate)
+    target_include_directories(test_dispatch_epoch_gate PRIVATE src)
   endif()
 
   ament_add_gtest(test_native_input_dynamics
@@ -237,6 +269,7 @@ if(BUILD_TESTING)
       dwb_msgs
       geometry_msgs
       nav_2d_msgs
+      nav2_costmap_2d
     )
   endif()
 

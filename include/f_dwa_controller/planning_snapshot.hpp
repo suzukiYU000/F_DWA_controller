@@ -34,6 +34,7 @@ struct ScheduledCommand
 {
   rclcpp::Time activation_time;
   nav_2d_msgs::msg::Twist2D command;
+  bool is_controller_failure_stop{false};
 };
 
 struct ActivationState

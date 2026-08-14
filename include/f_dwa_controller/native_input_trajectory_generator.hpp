@@ -61,6 +61,18 @@ public:
     bool valid{false};
   };
 
+  struct ActiveCandidateDiagnostics
+  {
+    std::size_t canonical_index{0u};
+    double linear_native_input{0.0};
+    double angular_native_input{0.0};
+    double initial_linear_velocity{0.0};
+    double initial_angular_velocity{0.0};
+    double initial_linear_acceleration{0.0};
+    double initial_angular_acceleration{0.0};
+    NativeCommandState first_command_state;
+  };
+
   explicit NativeInputTrajectoryGenerator(NativeInputOrder input_order);
   ~NativeInputTrajectoryGenerator() override = default;
 
@@ -75,15 +87,24 @@ public:
   void set_planning_snapshot(
     std::shared_ptr<const PlanningSnapshot> snapshot);
   void observe_command_dispatch(
-    const f_dwa_controller::msg::CommandDispatch & dispatch);
+    const f_dwa_controller::msg::CommandDispatch & dispatch,
+    bool safety_reduction = false,
+    std::size_t skipped_unpublished_commands = 0u);
   [[nodiscard]] std::optional<NativeCommandState>
   active_candidate_command_state() const;
   [[nodiscard]] std::optional<std::size_t>
   active_candidate_canonical_index() const;
+  [[nodiscard]] std::optional<ActiveCandidateDiagnostics>
+  active_candidate_diagnostics() const;
   void select_command_for_dispatch(
     const std::optional<NativeCommandState> & command_state);
   void commit_selected_command(
     const nav_2d_msgs::msg::Twist2D & command,
+    const rclcpp::Time & issued_at);
+  [[nodiscard]] bool commit_expected_controller_stop(
+    const rclcpp::Time & issued_at,
+    std::size_t skipped_unpublished_commands = 0u);
+  [[nodiscard]] bool commit_observed_controller_stop_before_pending(
     const rclcpp::Time & issued_at);
   void startNewIteration(
     const nav_2d_msgs::msg::Twist2D & current_velocity) override;
@@ -177,16 +198,18 @@ protected:
     double native_input_reference,
     double time_step,
     int remaining_steps) const;
-  FeasibleInterval input_interval(
+  FeasibleInterval held_input_interval(
     const AxisState & state,
     const AxisLimits & limits,
-    double time_step) const;
+    double time_step,
+    int remaining_steps) const;
 
 private:
   struct PendingNativeCommand
   {
     rclcpp::Time issued_at;
     NativeCommandState state;
+    bool is_controller_failure_stop{false};
   };
 
   AxisLimits linear_limits() const;

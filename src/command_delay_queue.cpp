@@ -84,7 +84,8 @@ CommandDelayQueue::CommandDelayQueue(const CommandDelayParameters & parameters)
 
 bool CommandDelayQueue::enqueue(
   const geometry_msgs::msg::Twist & command,
-  const rclcpp::Time & received_at)
+  const rclcpp::Time & received_at,
+  const uint64_t received_steady_time_ns)
 {
   if (queue_.size() >= parameters_.max_queue_depth) {
     return false;
@@ -97,6 +98,7 @@ bool CommandDelayQueue::enqueue(
     DelayedCommand{
       normalized_command(command, parameters_.zero_threshold),
       received_at,
+      received_steady_time_ns,
       received_at + delay,
       next_sequence_,
       delay_ms});

@@ -24,14 +24,19 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <exception>
 #include <functional>
+#include <iomanip>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "dispatch_epoch_gate.hpp"
 #include "dwb_core/exceptions.hpp"
 #include "dwb_core/illegal_trajectory_tracker.hpp"
 #include "f_dwa_controller/native_input_trajectory_generator.hpp"
@@ -50,6 +55,14 @@ namespace f_dwa_controller
 
 namespace
 {
+
+uint64_t steady_time_nanoseconds(
+  const std::chrono::steady_clock::time_point time_point)
+{
+  const auto count = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    time_point.time_since_epoch()).count();
+  return count > 0 ? static_cast<uint64_t>(count) : 0u;
+}
 
 geometry_msgs::msg::Pose2D integrate_pose(
   const geometry_msgs::msg::Pose2D & pose,
@@ -72,14 +85,58 @@ bool is_positive_finite(const double value)
   return std::isfinite(value) && value > 0.0;
 }
 
+std::string candidate_diagnostic_metadata(
+  const NativeInputTrajectoryGenerator::ActiveCandidateDiagnostics & value)
+{
+  std::ostringstream stream;
+  stream << std::setprecision(17)
+         << "canonical_index=" << value.canonical_index
+         << ";linear_native_input=" << value.linear_native_input
+         << ";angular_native_input=" << value.angular_native_input
+         << ";initial_linear_velocity=" << value.initial_linear_velocity
+         << ";initial_angular_velocity=" << value.initial_angular_velocity
+         << ";initial_linear_acceleration="
+         << value.initial_linear_acceleration
+         << ";initial_angular_acceleration="
+         << value.initial_angular_acceleration
+         << ";first_linear_velocity="
+         << value.first_command_state.linear_state.velocity
+         << ";first_angular_velocity="
+         << value.first_command_state.angular_state.velocity
+         << ";first_linear_acceleration="
+         << value.first_command_state.linear_state.acceleration
+         << ";first_angular_acceleration="
+         << value.first_command_state.angular_state.acceleration;
+  return stream.str();
+}
+
+constexpr double kCommandMatchTolerance = 1.0e-9;
+
 bool commands_match(
   const nav_2d_msgs::msg::Twist2D & first,
   const nav_2d_msgs::msg::Twist2D & second)
 {
-  constexpr double kCommandMatchTolerance = 1.0e-9;
   return std::abs(first.x - second.x) <= kCommandMatchTolerance &&
          std::abs(first.y - second.y) <= kCommandMatchTolerance &&
          std::abs(first.theta - second.theta) <= kCommandMatchTolerance;
+}
+
+bool is_safety_command_reduction(
+  const nav_2d_msgs::msg::Twist2D & issued,
+  const nav_2d_msgs::msg::Twist2D & applied)
+{
+  const auto axis_is_reduced =
+    [](const double expected, const double observed) {
+      if (std::abs(expected) <= kCommandMatchTolerance) {
+        return std::abs(observed) <= kCommandMatchTolerance;
+      }
+      return expected * observed >= -kCommandMatchTolerance &&
+             std::abs(observed) <=
+             std::abs(expected) + kCommandMatchTolerance;
+    };
+  return axis_is_reduced(issued.x, applied.x) &&
+         axis_is_reduced(issued.y, applied.y) &&
+         axis_is_reduced(issued.theta, applied.theta);
 }
 
 void append_integrated_motion(
@@ -119,6 +176,11 @@ double quantile(
 
 }  // namespace
 
+CertifiedDWBLocalPlanner::~CertifiedDWBLocalPlanner()
+{
+  stop_diagnostic_publisher();
+}
+
 void CertifiedDWBLocalPlanner::configure(
   const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
   std::string name,
@@ -128,6 +190,14 @@ void CertifiedDWBLocalPlanner::configure(
   const auto node = parent.lock();
   if (!node) {
     throw nav2_core::ControllerException("Unable to lock controller server node");
+  }
+  bool publish_zero_velocity = false;
+  if (!node->get_parameter("publish_zero_velocity", publish_zero_velocity) ||
+    !publish_zero_velocity)
+  {
+    throw nav2_core::ControllerException(
+            "CertifiedDWBLocalPlanner requires Controller Server "
+            "publish_zero_velocity=true for failure-stop FIFO tracking");
   }
 
   nav2_util::declare_parameter_if_not_declared(
@@ -146,6 +216,9 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".require_command_dispatch_state",
     rclcpp::ParameterValue(true));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".allow_safety_command_reduction",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".transport_valid_topic",
     rclcpp::ParameterValue("/dwa_experiment/transport_valid"));
   nav2_util::declare_parameter_if_not_declared(
@@ -154,6 +227,9 @@ void CertifiedDWBLocalPlanner::configure(
   nav2_util::declare_parameter_if_not_declared(
     node, name + ".certification_control_period",
     rclcpp::ParameterValue(0.03));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".enable_no_valid_control_deceleration_fallback",
+    rclcpp::ParameterValue(false));
   nav2_util::declare_parameter_if_not_declared(
     node, name + ".terminal_stop_maximum_time",
     rclcpp::ParameterValue(8.0));
@@ -208,8 +284,14 @@ void CertifiedDWBLocalPlanner::configure(
   nav2_util::declare_parameter_if_not_declared(
     node, name + ".evaluation_publish_frequency",
     rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".publish_candidate_markers",
+    rclcpp::ParameterValue(true));
 
   node->get_parameter(name + ".enable_certification", certification_enabled_);
+  node->get_parameter(
+    name + ".enable_no_valid_control_deceleration_fallback",
+    no_valid_control_deceleration_fallback_enabled_);
   node->get_parameter(
     name + ".enable_nominal_delay_preview",
     nominal_delay_preview_enabled_);
@@ -219,6 +301,9 @@ void CertifiedDWBLocalPlanner::configure(
   node->get_parameter(
     name + ".require_command_dispatch_state",
     require_command_dispatch_state_);
+  node->get_parameter(
+    name + ".allow_safety_command_reduction",
+    allow_safety_command_reduction_);
   node->get_parameter(
     name + ".certification_control_period",
     certification_control_period_);
@@ -287,6 +372,9 @@ void CertifiedDWBLocalPlanner::configure(
   node->get_parameter(
     name + ".evaluation_publish_frequency",
     evaluation_publish_frequency_);
+  node->get_parameter(
+    name + ".publish_candidate_markers",
+    publish_candidate_markers_);
   const std::string command_dispatch_topic =
     node->get_parameter(name + ".command_dispatch_topic").as_string();
   const std::string transport_valid_topic =
@@ -349,6 +437,10 @@ void CertifiedDWBLocalPlanner::configure(
   evaluation_publisher_ =
     node->create_publisher<dwb_msgs::msg::LocalPlanEvaluation>(
     "evaluation", rclcpp::QoS(20));
+  candidate_marker_publisher_ =
+    node->create_publisher<visualization_msgs::msg::MarkerArray>(
+    "dwb_candidate_trajectories_realtime",
+    rclcpp::QoS(1).best_effort());
   command_dispatch_subscriber_ =
     node->create_subscription<f_dwa_controller::msg::CommandDispatch>(
     command_dispatch_topic,
@@ -377,21 +469,27 @@ void CertifiedDWBLocalPlanner::activate()
 {
   dwb_core::DWBLocalPlanner::activate();
   evaluation_publisher_->on_activate();
+  candidate_marker_publisher_->on_activate();
+  start_diagnostic_publisher();
 }
 
 void CertifiedDWBLocalPlanner::deactivate()
 {
+  stop_diagnostic_publisher();
   evaluation_publisher_->on_deactivate();
+  candidate_marker_publisher_->on_deactivate();
   dwb_core::DWBLocalPlanner::deactivate();
 }
 
 void CertifiedDWBLocalPlanner::cleanup()
 {
+  stop_diagnostic_publisher();
   command_dispatch_subscriber_.reset();
   transport_valid_subscriber_.reset();
   transport_invalidation_client_.reset();
   reset_trial_service_.reset();
   evaluation_publisher_.reset();
+  candidate_marker_publisher_.reset();
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
@@ -419,10 +517,18 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
   const auto planning_started_at = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
   std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> evaluation;
-  if (should_publish_evaluation()) {
+  const bool publish_full_evaluation = should_publish_evaluation();
+  const bool publish_candidate_markers =
+    should_publish_candidate_markers();
+  if (publish_full_evaluation || publish_candidate_markers) {
     evaluation =
       std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
   }
+  // Candidate markers depend on trajectories, legality, and the rejecting
+  // critic, not on every CriticScore string. Keep the full message bit-for-bit
+  // compatible on its configured publication cycles while avoiding that
+  // allocation graph on the intervening 20 Hz marker cycles.
+  record_full_evaluation_details_ = publish_full_evaluation;
   try {
     nav2_costmap_2d::Costmap2D * costmap =
       costmap_ros_->getCostmap();
@@ -532,19 +638,32 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
       activation_pose,
       planning_snapshot_->activation_state.velocity,
       evaluation);
-    publish_evaluation(evaluation);
+    enqueue_diagnostic_publication(
+      evaluation, publish_full_evaluation, publish_candidate_markers);
     geometry_msgs::msg::TwistStamped command;
     command.twist =
       nav_2d_utils::twist2Dto3D(command_2d.velocity);
     if (certification_costmap_lock.owns_lock()) {
       certification_costmap_lock.unlock();
     }
+    const uint64_t issued_steady_time_ns =
+      steady_time_nanoseconds(std::chrono::steady_clock::now());
     const rclcpp::Time issued_at = clock_->now();
-    record_issued_command(command, issued_at);
+    record_issued_command(command, issued_at, issued_steady_time_ns);
     record_planning_duration(planning_started_at);
     return command;
+  } catch (const nav2_core::NoValidControl &) {
+    enqueue_diagnostic_publication(
+      evaluation, publish_full_evaluation, publish_candidate_markers);
+    record_planning_duration(planning_started_at);
+    // Do not predict a Controller Server zero here. On the final retry Nav2
+    // may convert this exception to PatienceExceeded before publishing zero.
+    // Only an actually applied CommandDispatch is allowed to change the
+    // observable dynamics state or the command ledger.
+    throw;
   } catch (...) {
-    publish_evaluation(evaluation);
+    enqueue_diagnostic_publication(
+      evaluation, publish_full_evaluation, publish_candidate_markers);
     record_planning_duration(planning_started_at);
     throw;
   }
@@ -564,18 +683,50 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
   std::lock_guard<std::mutex> controller_lock(controller_state_mutex_);
   const nav_2d_msgs::msg::Twist2D dispatched =
     nav_2d_utils::twist3Dto2D(message->command);
+  const rclcpp::Time transport_received_at(message->received_at);
+  const rclcpp::Time transport_dispatched_at(message->header.stamp);
+  const uint64_t transport_received_steady_time_ns =
+    message->received_steady_time_ns;
+  if (message->has_sequence &&
+    (transport_received_steady_time_ns == 0u ||
+    transport_received_at > transport_dispatched_at))
+  {
+    request_transport_invalidation(
+      transport_received_steady_time_ns == 0u ?
+      "command-dispatch lacks monotonic reception provenance" :
+      "command-dispatch reception time follows dispatch time");
+    return;
+  }
   bool dispatch_is_valid = true;
+  bool dispatch_precedes_reset_boundary = false;
   bool ordered_external_stop = false;
   bool sequence_was_ready = false;
   bool sequence_was_valid = false;
   bool command_was_matched = false;
+  bool safety_reduction_was_accepted = false;
+  std::size_t skipped_unpublished_command_count = 0u;
+  std::size_t eligible_pending_count = 0u;
   uint64_t expected_sequence = 0;
   std::size_t pending_command_count = 0;
   double nearest_command_error = std::numeric_limits<double>::infinity();
   nav_2d_msgs::msg::Twist2D nearest_pending_command;
   {
     std::lock_guard<std::mutex> command_lock(command_state_mutex_);
-    if (!message->has_sequence) {
+    const detail::DispatchEpochAction epoch_action =
+      detail::classify_dispatch_epoch(
+      message->has_sequence, expected_dispatch_sequence_ready_);
+    if (epoch_action ==
+      detail::DispatchEpochAction::kIgnoreBeforeResetBoundary)
+    {
+      // A long Controller computation can leave sequenced dispatch callbacks
+      // queued while the lifecycle manager tears this plugin down.  On the
+      // next configure those callbacks belong to the previous trial: there is
+      // no reset boundary or issued-command ledger with which to correlate
+      // them.  Ignore them until the transport publishes its explicit
+      // has_sequence=false reset state.  Treating them as a current mismatch
+      // would invalidate an otherwise stopped, recoverable transport.
+      dispatch_precedes_reset_boundary = true;
+    } else if (epoch_action == detail::DispatchEpochAction::kApplyResetBoundary) {
       pending_issued_commands_.clear();
       expected_dispatch_sequence_ = 0;
       expected_dispatch_sequence_ready_ = true;
@@ -600,37 +751,53 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
           nearest_pending_command = issued_command.command;
         }
       }
-      const auto matching_pending_command = std::find_if(
-        pending_issued_commands_.begin(),
-        pending_issued_commands_.end(),
-        [&dispatched](const IssuedCommand & issued_command) {
-          return commands_match(issued_command.command, dispatched);
-        });
-      const bool matches_pending_command =
-        matching_pending_command != pending_issued_commands_.end();
+      eligible_pending_count = eligible_command_prefix_size(
+        pending_issued_commands_, transport_received_steady_time_ns);
+      const auto matching_index = find_eligible_command_index(
+        pending_issued_commands_, transport_received_steady_time_ns, dispatched,
+        kCommandMatchTolerance);
+      const bool matches_pending_command = matching_index.has_value();
+      if (matches_pending_command) {
+        skipped_unpublished_command_count = *matching_index;
+      }
       command_was_matched = matches_pending_command;
-      // Controller Server may emit an exact zero without calling the plugin
-      // while it applies control-failure patience or completes an action.
-      // A plugin-selected zero still has native-input metadata and is matched
-      // normally.
+      // Collision Monitor is the only real-mode post-processor. It may reduce
+      // a command after the plugin returns it. Accept that observable result
+      // only when provenance remains unambiguous: the sequence is the next
+      // expected one, exactly one FIFO entry is pending, no axis grows or
+      // reverses direction, and the real-only launch opt-in is enabled.
+      const bool is_accepted_safety_reduction =
+        !matches_pending_command &&
+        allow_safety_command_reduction_ &&
+        sequence_is_valid &&
+        eligible_pending_count == 1u &&
+        is_safety_command_reduction(
+        pending_issued_commands_.front().command, dispatched);
+      safety_reduction_was_accepted = is_accepted_safety_reduction;
+      // Controller Server may publish zero after NoValidControl without a
+      // plugin return value to record. The transport sequence is authoritative:
+      // accept only the zero that was actually applied, leave later issued
+      // candidates pending, and update native dynamics from this dispatch.
       const bool is_ordered_external_stop =
         !matches_pending_command &&
         commands_match(dispatched, nav_2d_msgs::msg::Twist2D());
       ordered_external_stop = is_ordered_external_stop;
       dispatch_is_valid =
         sequence_is_valid &&
-        (matches_pending_command || is_ordered_external_stop);
+        (matches_pending_command || is_accepted_safety_reduction ||
+        is_ordered_external_stop);
       if (dispatch_is_valid) {
-        if (matches_pending_command) {
-          pending_issued_commands_.erase(
-            pending_issued_commands_.begin(),
-            std::next(matching_pending_command));
+        if (matches_pending_command || is_accepted_safety_reduction) {
+          if (matches_pending_command) {
+            pending_issued_commands_.erase(
+              pending_issued_commands_.begin(),
+              std::next(
+                pending_issued_commands_.begin(),
+                static_cast<std::ptrdiff_t>(*matching_index + 1u)));
+          } else {
+            pending_issued_commands_.pop_front();
+          }
         }
-        // Do not clear pending entries for an unmatched Controller Server
-        // zero. Its delayed dispatch callback can run after a later plugin
-        // command has already been computed and recorded. FIFO guarantees
-        // that commands preceding the zero were dispatched first; therefore
-        // any remaining entries belong after this external zero.
         ++expected_dispatch_sequence_;
         command_ledger_valid_ = true;
       } else {
@@ -644,12 +811,22 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
     }
   }
 
+  if (dispatch_precedes_reset_boundary) {
+    RCLCPP_DEBUG(
+      logger_,
+      "Ignoring command dispatch sequence=%" PRIu64
+      " until the next explicit transport reset boundary",
+      message->sequence_id);
+    return;
+  }
+
   if (!dispatch_is_valid) {
     RCLCPP_ERROR(
       logger_,
       "Command dispatch ledger mismatch: has_sequence=%s sequence=%" PRIu64
       " expected=%" PRIu64 " sequence_ready=%s sequence_valid=%s"
-      " matched=%s pending=%zu dispatched=(%.17g, %.17g, %.17g)"
+      " matched=%s pending=%zu eligible=%zu received_steady_ns=%" PRIu64
+      " dispatched=(%.17g, %.17g, %.17g)"
       " nearest=(%.17g, %.17g, %.17g) max_error=%.17g",
       message->has_sequence ? "true" : "false",
       message->sequence_id,
@@ -658,6 +835,8 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
       sequence_was_valid ? "true" : "false",
       command_was_matched ? "true" : "false",
       pending_command_count,
+      eligible_pending_count,
+      transport_received_steady_time_ns,
       dispatched.x,
       dispatched.y,
       dispatched.theta,
@@ -668,20 +847,49 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
     request_transport_invalidation("command-dispatch ledger mismatch");
     return;
   }
+  if (safety_reduction_was_accepted) {
+    RCLCPP_WARN(
+      logger_,
+      "Robot-facing safety post-processor reduced command: sequence=%" PRIu64
+      " issued=(%.17g, %.17g, %.17g) applied=(%.17g, %.17g, %.17g); "
+      "the applied command is now the observable state",
+      message->sequence_id,
+      nearest_pending_command.x,
+      nearest_pending_command.y,
+      nearest_pending_command.theta,
+      dispatched.x,
+      dispatched.y,
+      dispatched.theta);
+  }
+  if (skipped_unpublished_command_count > 0u) {
+    RCLCPP_DEBUG(
+      logger_,
+      "Applied sequence=%" PRIu64 " matched after %zu Controller results "
+      "that were not published to the command transport",
+      message->sequence_id, skipped_unpublished_command_count);
+  }
   auto native_generator =
     std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
     traj_generator_);
   if (native_generator) {
     if (ordered_external_stop) {
-      // Controller Server's normal completion zero is observable but has no
-      // native-input candidate metadata. Once every issued candidate has
-      // drained, treat this exact applied zero as the new observable dynamics
-      // origin so planning can resume if the post-drain pose check fails.
-      f_dwa_controller::msg::CommandDispatch stopped_dispatch = *message;
-      stopped_dispatch.has_sequence = false;
-      native_generator->observe_command_dispatch(stopped_dispatch);
-    } else {
+      // This is an observed sequenced Controller Server zero, not a trial
+      // reset. It can be dispatched after a later plugin result has already
+      // been recorded, so insert its metadata before every pending result.
+      // This preserves F-DWA history and reconstructs A/J acceleration from
+      // the actually applied zero without discarding the following command.
+      if (!native_generator->commit_observed_controller_stop_before_pending(
+          rclcpp::Time(message->header.stamp)))
+      {
+        request_transport_invalidation(
+          "unable to correlate Controller Server stop with native state");
+        return;
+      }
       native_generator->observe_command_dispatch(*message);
+    } else {
+      native_generator->observe_command_dispatch(
+        *message, safety_reduction_was_accepted,
+        skipped_unpublished_command_count);
     }
   }
 }
@@ -774,7 +982,9 @@ CertifiedDWBLocalPlanner::build_planning_snapshot(
     }
     rollout_velocity = issued.command;
     snapshot.committed_commands.push_back(
-      ScheduledCommand{activation_time, issued.command});
+      ScheduledCommand{
+        activation_time, issued.command,
+        issued.is_controller_failure_stop});
   }
   if (snapshot.activation_time > rollout_time) {
     append_integrated_motion(
@@ -792,7 +1002,8 @@ CertifiedDWBLocalPlanner::build_planning_snapshot(
 
 void CertifiedDWBLocalPlanner::record_issued_command(
   const geometry_msgs::msg::TwistStamped & command,
-  const rclcpp::Time & issued_at)
+  const rclcpp::Time & issued_at,
+  const uint64_t issued_steady_time_ns)
 {
   const nav_2d_msgs::msg::Twist2D command_2d =
     nav_2d_utils::twist3Dto2D(command.twist);
@@ -806,7 +1017,7 @@ void CertifiedDWBLocalPlanner::record_issued_command(
       ledger_overflow = true;
     } else {
       pending_issued_commands_.push_back(
-        IssuedCommand{issued_at, command_2d});
+        IssuedCommand{issued_at, issued_steady_time_ns, command_2d, false});
     }
   }
   if (ledger_overflow) {
@@ -903,6 +1114,37 @@ void CertifiedDWBLocalPlanner::report_planning_metrics(
       certification_rejections_.lethal_obstacle,
       certification_rejections_.unknown_space);
   }
+  uint64_t publication_count = 0u;
+  uint64_t full_evaluation_count = 0u;
+  uint64_t candidate_marker_count = 0u;
+  uint64_t deferred_full_evaluation_count = 0u;
+  uint64_t coalesced_stale_marker_count = 0u;
+  std::size_t pending_full_evaluation_count = 0u;
+  std::size_t maximum_backlog = 0u;
+  double maximum_publication_seconds = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(diagnostic_publication_mutex_);
+    publication_count = diagnostic_publication_count_;
+    full_evaluation_count = full_evaluation_publication_count_;
+    candidate_marker_count = candidate_marker_publication_count_;
+    deferred_full_evaluation_count = deferred_full_evaluation_count_;
+    coalesced_stale_marker_count = coalesced_stale_marker_count_;
+    pending_full_evaluation_count = pending_full_evaluation_count_;
+    maximum_backlog = maximum_diagnostic_backlog_;
+    maximum_publication_seconds =
+      maximum_diagnostic_publication_seconds_;
+  }
+  RCLCPP_INFO(
+    logger_,
+    "diagnostic_timing scope=%s jobs=%" PRIu64
+    " full_evaluations=%" PRIu64 " candidate_markers=%" PRIu64
+    " deferred_full=%" PRIu64 " coalesced_stale_markers=%" PRIu64
+    " pending_full=%zu maximum_backlog=%zu worker_max=%.6f",
+    scope, publication_count, full_evaluation_count,
+    candidate_marker_count, deferred_full_evaluation_count,
+    coalesced_stale_marker_count, pending_full_evaluation_count,
+    maximum_backlog,
+    maximum_publication_seconds);
 }
 
 bool CertifiedDWBLocalPlanner::should_publish_evaluation()
@@ -910,31 +1152,364 @@ bool CertifiedDWBLocalPlanner::should_publish_evaluation()
   if (!publish_evaluation_) {
     return false;
   }
-  if (evaluation_publish_frequency_ <= 0.0) {
-    return true;
-  }
   const rclcpp::Time current_time = clock_->now();
-  const double minimum_period = 1.0 / evaluation_publish_frequency_;
-  if (has_evaluation_publish_time_ &&
-    current_time >= last_evaluation_publish_time_ &&
-    (current_time - last_evaluation_publish_time_).seconds() <
-    minimum_period)
+  if (evaluation_publish_frequency_ > 0.0) {
+    const double minimum_period = 1.0 / evaluation_publish_frequency_;
+    if (has_evaluation_publish_time_ &&
+      current_time >= last_evaluation_publish_time_ &&
+      (current_time - last_evaluation_publish_time_).seconds() <
+      minimum_period)
+    {
+      return false;
+    }
+  }
   {
-    return false;
+    std::lock_guard<std::mutex> lock(diagnostic_publication_mutex_);
+    if (!has_full_evaluation_capacity(
+        pending_full_evaluation_count_))
+    {
+      // Do not allocate another full payload while DDS is still handling the
+      // previous samples. The timestamp is deliberately not advanced, so the
+      // next control cycle captures the due sample as soon as a slot frees.
+      ++deferred_full_evaluation_count_;
+      return false;
+    }
   }
   last_evaluation_publish_time_ = current_time;
   has_evaluation_publish_time_ = true;
   return true;
 }
 
-void CertifiedDWBLocalPlanner::publish_evaluation(
-  const std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & evaluation)
+bool CertifiedDWBLocalPlanner::has_full_evaluation_capacity(
+  const std::size_t pending_full_evaluation_count)
 {
-  if (evaluation && evaluation_publisher_ &&
+  return pending_full_evaluation_count <
+         kMaximumPendingFullEvaluations;
+}
+
+bool CertifiedDWBLocalPlanner::coalesce_stale_marker_publication(
+  std::deque<DiagnosticPublication> & publications,
+  DiagnosticPublication publication)
+{
+  if (publication.publish_full_evaluation) {
+    return false;
+  }
+  const auto stale = std::find_if(
+    publications.begin(), publications.end(),
+    [](const DiagnosticPublication & queued) {
+      return !queued.publish_full_evaluation;
+    });
+  if (stale == publications.end()) {
+    return false;
+  }
+  publications.erase(stale);
+  publications.push_back(std::move(publication));
+  return true;
+}
+
+void CertifiedDWBLocalPlanner::enqueue_diagnostic_publication(
+  const std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & evaluation,
+  const bool publish_full_evaluation,
+  const bool publish_candidate_markers)
+{
+  if (!evaluation) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(diagnostic_publication_mutex_);
+    if (stop_diagnostic_publisher_) {
+      return;
+    }
+    DiagnosticPublication publication{
+      evaluation, publish_full_evaluation, publish_candidate_markers};
+    if (coalesce_stale_marker_publication(
+        diagnostic_publications_, publication))
+    {
+      ++coalesced_stale_marker_count_;
+      diagnostic_publication_condition_.notify_one();
+      return;
+    }
+    if (publish_full_evaluation) {
+      // should_publish_evaluation() is the only producer-side admission path,
+      // so a full sample always has one of these two reserved practical slots.
+      if (!has_full_evaluation_capacity(
+          pending_full_evaluation_count_))
+      {
+        RCLCPP_ERROR(
+          logger_,
+          "Full diagnostic admission invariant was violated");
+        return;
+      }
+      ++pending_full_evaluation_count_;
+    }
+    diagnostic_publications_.push_back(std::move(publication));
+    maximum_diagnostic_backlog_ = std::max(
+      maximum_diagnostic_backlog_, diagnostic_publications_.size());
+  }
+  diagnostic_publication_condition_.notify_one();
+}
+
+void CertifiedDWBLocalPlanner::start_diagnostic_publisher()
+{
+  stop_diagnostic_publisher();
+  {
+    std::lock_guard<std::mutex> lock(diagnostic_publication_mutex_);
+    stop_diagnostic_publisher_ = false;
+  }
+  diagnostic_publisher_thread_ = std::thread(
+    &CertifiedDWBLocalPlanner::diagnostic_publisher_loop, this);
+}
+
+void CertifiedDWBLocalPlanner::stop_diagnostic_publisher()
+{
+  {
+    std::lock_guard<std::mutex> lock(diagnostic_publication_mutex_);
+    stop_diagnostic_publisher_ = true;
+  }
+  diagnostic_publication_condition_.notify_all();
+  if (diagnostic_publisher_thread_.joinable()) {
+    diagnostic_publisher_thread_.join();
+  }
+}
+
+void CertifiedDWBLocalPlanner::diagnostic_publisher_loop()
+{
+  while (true) {
+    DiagnosticPublication publication;
+    {
+      std::unique_lock<std::mutex> lock(diagnostic_publication_mutex_);
+      diagnostic_publication_condition_.wait(
+        lock,
+        [this]() {
+          return stop_diagnostic_publisher_ ||
+                 !diagnostic_publications_.empty();
+        });
+      if (diagnostic_publications_.empty()) {
+        if (stop_diagnostic_publisher_) {
+          return;
+        }
+        continue;
+      }
+      publication = std::move(diagnostic_publications_.front());
+      diagnostic_publications_.pop_front();
+    }
+    const auto publication_started_at = std::chrono::steady_clock::now();
+    try {
+      publish_diagnostics_now(publication);
+    } catch (const std::exception & exception) {
+      RCLCPP_ERROR(
+        logger_, "Asynchronous diagnostic publication failed: %s",
+        exception.what());
+    } catch (...) {
+      RCLCPP_ERROR(
+        logger_, "Asynchronous diagnostic publication failed");
+    }
+    const double publication_seconds =
+      std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - publication_started_at).count();
+    {
+      std::lock_guard<std::mutex> lock(diagnostic_publication_mutex_);
+      ++diagnostic_publication_count_;
+      if (publication.publish_full_evaluation) {
+        ++full_evaluation_publication_count_;
+      }
+      if (publication.publish_candidate_markers) {
+        ++candidate_marker_publication_count_;
+      }
+      if (publication.publish_full_evaluation &&
+        pending_full_evaluation_count_ > 0u)
+      {
+        --pending_full_evaluation_count_;
+      }
+      maximum_diagnostic_publication_seconds_ = std::max(
+        maximum_diagnostic_publication_seconds_, publication_seconds);
+    }
+  }
+}
+
+void CertifiedDWBLocalPlanner::publish_diagnostics_now(
+  const DiagnosticPublication & publication)
+{
+  if (!publication.evaluation) {
+    return;
+  }
+  if (publication.publish_full_evaluation && evaluation_publisher_ &&
     evaluation_publisher_->is_activated())
   {
-    evaluation_publisher_->publish(*evaluation);
+    evaluation_publisher_->publish(*publication.evaluation);
   }
+  if (publication.publish_candidate_markers &&
+    candidate_marker_publisher_ &&
+    candidate_marker_publisher_->is_activated())
+  {
+    publish_candidate_markers(*publication.evaluation);
+  }
+}
+
+bool CertifiedDWBLocalPlanner::should_publish_candidate_markers() const
+{
+  return publish_candidate_markers_ && candidate_marker_publisher_ &&
+         candidate_marker_publisher_->is_activated() &&
+         candidate_marker_publisher_->get_subscription_count() > 0u;
+}
+
+void CertifiedDWBLocalPlanner::publish_candidate_markers(
+  const dwb_msgs::msg::LocalPlanEvaluation & evaluation)
+{
+  candidate_marker_publisher_->publish(
+    build_candidate_markers(evaluation));
+}
+
+visualization_msgs::msg::MarkerArray
+CertifiedDWBLocalPlanner::build_candidate_markers(
+  const dwb_msgs::msg::LocalPlanEvaluation & evaluation) const
+{
+  visualization_msgs::msg::Marker clear;
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+
+  visualization_msgs::msg::Marker valid;
+  valid.header = evaluation.header;
+  valid.ns = "dwb_candidates_valid";
+  valid.id = 0;
+  valid.type = visualization_msgs::msg::Marker::LINE_LIST;
+  valid.action = visualization_msgs::msg::Marker::ADD;
+  valid.pose.orientation.w = 1.0;
+  valid.scale.x = 0.018;
+  valid.color.r = 0.20F;
+  valid.color.g = 0.64F;
+  valid.color.b = 1.0F;
+  valid.color.a = 0.28F;
+  valid.lifetime.sec = 0;
+  valid.lifetime.nanosec = 150000000u;
+
+  visualization_msgs::msg::Marker rejected = valid;
+  rejected.ns = "dwb_candidates_rejected";
+  rejected.id = 1;
+  rejected.color.r = 1.0F;
+  rejected.color.g = 0.23F;
+  rejected.color.b = 0.19F;
+  rejected.color.a = 0.48F;
+
+  visualization_msgs::msg::Marker best = valid;
+  best.ns = "dwb_candidate_selected";
+  best.id = 2;
+  best.type = visualization_msgs::msg::Marker::LINE_STRIP;
+  best.scale.x = 0.060;
+  best.color.r = 0.20F;
+  best.color.g = 0.84F;
+  best.color.b = 0.29F;
+  best.color.a = 0.96F;
+
+  visualization_msgs::msg::Marker status = valid;
+  status.ns = "dwb_candidate_status_realtime";
+  status.id = 3;
+  status.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+  status.scale.x = 0.0;
+  status.scale.y = 0.0;
+  status.scale.z = 0.16;
+  status.color.a = 0.96F;
+
+  const int best_index = evaluation.best_index;
+  std::size_t valid_count = 0u;
+  std::map<std::string, std::size_t> rejection_counts;
+  bool status_position_set = false;
+  bool selected_no_valid_control_fallback = false;
+  for (std::size_t index = 0; index < evaluation.twists.size(); ++index) {
+    const auto & score = evaluation.twists[index];
+    const auto & poses = score.traj.poses;
+    if (poses.size() < 2u) {
+      continue;
+    }
+    const bool legal = std::isfinite(score.total) && score.total >= 0.0;
+    if (legal) {
+      ++valid_count;
+    } else if (!score.scores.empty()) {
+      const auto rejection = std::find_if(
+        score.scores.rbegin(), score.scores.rend(),
+        [](const dwb_msgs::msg::CriticScore & critic_score) {
+          return critic_score.raw_score < 0.0 &&
+                 critic_score.name.rfind("__", 0u) != 0u;
+        });
+      ++rejection_counts[
+        rejection == score.scores.rend() ?
+        std::string("unknown") : rejection->name];
+    }
+    if (!status_position_set && !poses.empty()) {
+      status.pose.position.x = poses.front().x;
+      status.pose.position.y = poses.front().y;
+      status.pose.position.z = 0.45;
+      status_position_set = true;
+    }
+    const bool selected = legal && static_cast<int>(index) == best_index;
+    if (selected) {
+      selected_no_valid_control_fallback = std::any_of(
+        score.scores.begin(), score.scores.end(),
+        [](const dwb_msgs::msg::CriticScore & critic_score) {
+          return critic_score.name ==
+                 "RetainedNoValidControlDeceleration";
+        });
+      best.points.reserve(poses.size());
+      for (const auto & pose : poses) {
+        geometry_msgs::msg::Point point;
+        point.x = pose.x;
+        point.y = pose.y;
+        point.z = 0.04;
+        best.points.push_back(point);
+      }
+      continue;
+    }
+    auto & points = legal ? valid.points : rejected.points;
+    points.reserve(points.size() + 2u * (poses.size() - 1u));
+    for (std::size_t pose_index = 1; pose_index < poses.size(); ++pose_index) {
+      const auto & first = poses[pose_index - 1u];
+      const auto & second = poses[pose_index];
+      if (std::hypot(second.x - first.x, second.y - first.y) <= 1.0e-5) {
+        continue;
+      }
+      geometry_msgs::msg::Point first_point;
+      first_point.x = first.x;
+      first_point.y = first.y;
+      first_point.z = 0.02;
+      geometry_msgs::msg::Point second_point;
+      second_point.x = second.x;
+      second_point.y = second.y;
+      second_point.z = 0.02;
+      points.push_back(first_point);
+      points.push_back(second_point);
+    }
+  }
+  if (selected_no_valid_control_fallback) {
+    status.color.r = 1.0F;
+    status.color.g = 0.64F;
+    status.color.b = 0.10F;
+    status.text =
+      "NoValidControl fallback: revalidated method-native deceleration";
+  } else if (valid_count == 0u) {
+    const auto dominant = std::max_element(
+      rejection_counts.begin(), rejection_counts.end(),
+      [](const auto & first, const auto & second) {
+        return first.second < second.second;
+      });
+    status.color.r = 1.0F;
+    status.color.g = 0.23F;
+    status.color.b = 0.19F;
+    status.text = "No legal trajectory: " +
+      (dominant == rejection_counts.end() ? std::string("unknown") : dominant->first);
+  } else {
+    status.color.r = 0.20F;
+    status.color.g = 0.84F;
+    status.color.b = 0.29F;
+    status.text = "DWB candidates: " + std::to_string(valid_count) + "/" +
+      std::to_string(evaluation.twists.size()) + " valid";
+  }
+  visualization_msgs::msg::MarkerArray markers;
+  markers.markers.reserve(5u);
+  markers.markers.push_back(std::move(clear));
+  markers.markers.push_back(std::move(valid));
+  markers.markers.push_back(std::move(rejected));
+  markers.markers.push_back(std::move(best));
+  markers.markers.push_back(std::move(status));
+  return markers;
 }
 
 void CertifiedDWBLocalPlanner::setPlan(const nav_msgs::msg::Path & path)
@@ -1053,12 +1628,10 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
     throw nav2_core::ControllerTFError(
             "Unable to prepare terminal-stop distance target");
   }
-  // Native generators must retain the selected candidate's internal state
-  // even when terminal-stop certification is disabled for an ablation.
-  if (!certification_enabled_ && !native_generator) {
-    return dwb_core::DWBLocalPlanner::coreScoringAlgorithm(
-      pose, velocity, results);
-  }
+  // Keep the scoring loop local even for Nav2's velocity generators. Besides
+  // preserving the exact DWB ordering and total, this lets marker-only cycles
+  // omit CriticScore payloads; delegating to base DWB would allocate the full
+  // diagnostic graph merely because RViz subscribes to candidate markers.
 
   // A feasible stop that has entered the goal capture set is a terminal
   // policy. Revalidate its remaining suffix against the latest costmap, but do
@@ -1098,7 +1671,6 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   std::size_t evaluation_index = 0u;
   dwb_msgs::msg::Trajectory2D trajectory_scratch;
   dwb_msgs::msg::TrajectoryScore score_scratch;
-  score_scratch.scores.reserve(critics_.size() + 1u);
 
   traj_generator_->startNewIteration(velocity);
   while (traj_generator_->hasMoreTwists()) {
@@ -1122,7 +1694,8 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       score_trajectory_components(
         trajectory_scratch,
         best_uses_reserve_recovery ? -1.0 : best.total,
-        score_scratch, &candidate_uses_reserve_recovery);
+        score_scratch, record_full_evaluation_details_,
+        &candidate_uses_reserve_recovery);
       const bool is_best =
         best.total < 0.0 ||
         (!candidate_uses_reserve_recovery &&
@@ -1151,7 +1724,6 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           best = score_scratch;
         } else {
           best.total = score_scratch.total;
-          best.scores.swap(score_scratch.scores);
           best.traj.velocity = trajectory_scratch.velocity;
           best.traj.poses.swap(trajectory_scratch.poses);
           best.traj.time_offsets.swap(trajectory_scratch.time_offsets);
@@ -1177,6 +1749,25 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         critic_score.name = exception.getCriticName();
         critic_score.raw_score = -1.0;
         failed_score.scores.push_back(critic_score);
+        if (record_full_evaluation_details_ && native_generator) {
+          dwb_msgs::msg::CriticScore rejection_detail;
+          rejection_detail.name =
+            std::string{"__rejection_detail__:"} + exception.what();
+          rejection_detail.raw_score = 0.0;
+          rejection_detail.scale = 0.0;
+          failed_score.scores.push_back(std::move(rejection_detail));
+          const auto diagnostics =
+            native_generator->active_candidate_diagnostics();
+          if (diagnostics) {
+            dwb_msgs::msg::CriticScore candidate_detail;
+            candidate_detail.name =
+              std::string{"__candidate_native__:"} +
+            candidate_diagnostic_metadata(*diagnostics);
+            candidate_detail.raw_score = 0.0;
+            candidate_detail.scale = 0.0;
+            failed_score.scores.push_back(std::move(candidate_detail));
+          }
+        }
         failed_score.total = -1.0;
         results->twists.push_back(std::move(failed_score));
       }
@@ -1189,7 +1780,43 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       retained_backup_commands_.clear();
       retained_backup_states_.clear();
       terminal_stop_goal_capture_active_ = false;
-      native_generator->select_command_for_dispatch(best_command_state);
+      if (native_generator) {
+        native_generator->select_command_for_dispatch(best_command_state);
+      }
+      if (no_valid_control_deceleration_fallback_enabled_) {
+        std::vector<geometry_msgs::msg::Pose2D> fallback_poses;
+        const std::optional<std::size_t> native_candidate_index =
+          native_generator ?
+          std::make_optional(best_canonical_index) : std::nullopt;
+        const bool fallback_materialized = build_stop_trajectory(
+          best.traj, fallback_poses, &best_stop_velocities,
+          &best_stop_states, native_candidate_index);
+        const bool state_count_is_valid =
+          !native_generator ||
+          best_stop_states.size() == best_stop_velocities.size();
+        if (fallback_materialized && state_count_is_valid &&
+          best_stop_velocities.size() > 1u)
+        {
+          const CertificationResult physical_footprint_result =
+            certify_pose_sequence(
+            *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
+            fallback_poses, maximum_swept_distance_);
+          if (physical_footprint_result.safe) {
+            // The first entry is the command returned in this cycle. Retain
+            // only the future suffix. It is revalidated against the newest
+            // costmap before use if the next cycle has no legal nominal
+            // trajectory.
+            retained_backup_commands_.assign(
+              best_stop_velocities.begin() + 1,
+              best_stop_velocities.end());
+            if (native_generator) {
+              retained_backup_states_.assign(
+                std::make_move_iterator(best_stop_states.begin() + 1),
+                std::make_move_iterator(best_stop_states.end()));
+            }
+          }
+        }
+      }
       return best;
     }
     std::vector<geometry_msgs::msg::Pose2D> best_stop_poses;
@@ -1274,6 +1901,10 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
     if (retained_backup_states_.size() > 1u) {
       retained_backup_states_.erase(retained_backup_states_.begin());
     }
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "All nominal trajectories were invalid; dispatching the next "
+      "physical-footprint-revalidated deceleration command");
     return backup_score;
   }
 
@@ -1296,7 +1927,8 @@ CertifiedDWBLocalPlanner::scoreTrajectory(
 {
   dwb_msgs::msg::TrajectoryScore score;
   score.traj = trajectory;
-  score_trajectory_components(trajectory, best_score, score, nullptr);
+  score_trajectory_components(
+    trajectory, best_score, score, true, nullptr);
   return score;
 }
 
@@ -1304,6 +1936,7 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
   const dwb_msgs::msg::Trajectory2D & trajectory,
   const double best_score,
   dwb_msgs::msg::TrajectoryScore & score,
+  const bool record_score_details,
   bool * used_reserve_recovery)
 {
   if (used_reserve_recovery) {
@@ -1315,23 +1948,33 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     certification_enabled_ &&
     terminal_stop_goal_distance_scale_ > 0.0 &&
     current_terminal_distance_target_pose_valid_;
-  score.scores.reserve(
-    critics_.size() + (score_terminal_stop ? 1u : 0u) +
-    (certification_enabled_ ? 2u : 0u));
+  if (record_score_details) {
+    score.scores.reserve(
+      critics_.size() + (score_terminal_stop ? 1u : 0u) +
+      (certification_enabled_ ? 2u : 0u));
+  }
   for (dwb_core::TrajectoryCritic::Ptr & critic : critics_) {
-    dwb_msgs::msg::CriticScore critic_score;
-    critic_score.name = critic->getName();
-    critic_score.scale = critic->getScale();
-    if (critic_score.scale == 0.0) {
-      score.scores.push_back(critic_score);
+    const double critic_scale = critic->getScale();
+    if (critic_scale == 0.0) {
+      if (record_score_details) {
+        dwb_msgs::msg::CriticScore critic_score;
+        critic_score.name = critic->getName();
+        critic_score.scale = critic_scale;
+        score.scores.push_back(std::move(critic_score));
+      }
       continue;
     }
 
     const double raw_score =
       critic->scoreTrajectory(trajectory);
-    critic_score.raw_score = raw_score;
-    score.scores.push_back(critic_score);
-    score.total += raw_score * critic_score.scale;
+    if (record_score_details) {
+      dwb_msgs::msg::CriticScore critic_score;
+      critic_score.name = critic->getName();
+      critic_score.scale = critic_scale;
+      critic_score.raw_score = raw_score;
+      score.scores.push_back(std::move(critic_score));
+    }
+    score.total += raw_score * critic_scale;
     if (short_circuit_trajectory_evaluation_ &&
       best_score > 0.0 && score.total > best_score)
     {
@@ -1359,33 +2002,38 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     if (score_terminal_stop) {
       const geometry_msgs::msg::Pose2D & terminal_pose =
         stop_pose_scratch_.back();
-      dwb_msgs::msg::CriticScore stop_goal_score;
+      const char * stop_goal_score_name = nullptr;
+      double stop_goal_raw_score = 0.0;
       switch (terminal_stop_score_mode_) {
         case TerminalStopScoreMode::kPathSubgoalProgress:
-          stop_goal_score.name = "TerminalStopPathProgress";
-          stop_goal_score.raw_score = path_subgoal_progress_cost(
+          stop_goal_score_name = "TerminalStopPathProgress";
+          stop_goal_raw_score = path_subgoal_progress_cost(
             terminal_pose, current_terminal_distance_target_pose_);
           break;
         case TerminalStopScoreMode::kPathSubgoalForwardRay:
-          stop_goal_score.name = "TerminalStopPathProgressRay";
-          stop_goal_score.raw_score = path_subgoal_forward_ray_cost(
+          stop_goal_score_name = "TerminalStopPathProgressRay";
+          stop_goal_raw_score = path_subgoal_forward_ray_cost(
             terminal_pose, current_terminal_distance_target_pose_,
             terminal_stop_path_lateral_weight_);
           break;
         default:
-          stop_goal_score.name =
+          stop_goal_score_name =
             terminal_stop_score_mode_ ==
             TerminalStopScoreMode::kPathSubgoalDistance ?
             "TerminalStopPathSubgoalDist" : "TerminalStopGoalDist";
-          stop_goal_score.raw_score = std::hypot(
+          stop_goal_raw_score = std::hypot(
             terminal_pose.x - current_terminal_distance_target_pose_.x,
             terminal_pose.y - current_terminal_distance_target_pose_.y);
           break;
       }
-      stop_goal_score.scale = terminal_stop_goal_distance_scale_;
-      score.scores.push_back(stop_goal_score);
-      score.total +=
-        stop_goal_score.raw_score * stop_goal_score.scale;
+      if (record_score_details) {
+        dwb_msgs::msg::CriticScore stop_goal_score;
+        stop_goal_score.name = stop_goal_score_name;
+        stop_goal_score.scale = terminal_stop_goal_distance_scale_;
+        stop_goal_score.raw_score = stop_goal_raw_score;
+        score.scores.push_back(std::move(stop_goal_score));
+      }
+      score.total += stop_goal_raw_score * terminal_stop_goal_distance_scale_;
       if (
         short_circuit_trajectory_evaluation_ &&
         best_score >= 0.0 && score.total > best_score)
@@ -1407,17 +2055,21 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
               "SafetyCertificate",
               certification_failure_name(failure));
     }
-    dwb_msgs::msg::CriticScore certificate_score;
-    certificate_score.name = "SafetyCertificate";
-    certificate_score.scale = 1.0;
-    certificate_score.raw_score = 0.0;
-    score.scores.push_back(certificate_score);
+    if (record_score_details) {
+      dwb_msgs::msg::CriticScore certificate_score;
+      certificate_score.name = "SafetyCertificate";
+      certificate_score.scale = 1.0;
+      certificate_score.raw_score = 0.0;
+      score.scores.push_back(std::move(certificate_score));
+    }
     if (certificate_used_reserve_recovery) {
-      dwb_msgs::msg::CriticScore recovery_score;
-      recovery_score.name = "ReserveRecovery";
-      recovery_score.scale = 0.0;
-      recovery_score.raw_score = 1.0;
-      score.scores.push_back(recovery_score);
+      if (record_score_details) {
+        dwb_msgs::msg::CriticScore recovery_score;
+        recovery_score.name = "ReserveRecovery";
+        recovery_score.scale = 0.0;
+        recovery_score.raw_score = 1.0;
+        score.scores.push_back(std::move(recovery_score));
+      }
       if (used_reserve_recovery) {
         *used_reserve_recovery = true;
       }
@@ -1593,7 +2245,9 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
   backup_score.traj.poses = std::move(poses);
   dwb_msgs::msg::CriticScore certificate_score;
   certificate_score.name = certification_enabled_ ?
-    "RetainedSafetyBackup" : "RetainedTerminalStop";
+    "RetainedSafetyBackup" :
+    (no_valid_control_deceleration_fallback_enabled_ ?
+    "RetainedNoValidControlDeceleration" : "RetainedTerminalStop");
   certificate_score.scale = 1.0;
   certificate_score.raw_score = 0.0;
   backup_score.scores.push_back(certificate_score);
@@ -1689,6 +2343,17 @@ void CertifiedDWBLocalPlanner::reset_trial_callback(
   planning_deadline_miss_count_ = 0;
   maximum_planning_duration_seconds_ = 0.0;
   certification_rejections_ = CertificationRejectionCounters();
+  {
+    std::lock_guard<std::mutex> diagnostic_lock(
+      diagnostic_publication_mutex_);
+    diagnostic_publication_count_ = 0u;
+    full_evaluation_publication_count_ = 0u;
+    candidate_marker_publication_count_ = 0u;
+    deferred_full_evaluation_count_ = 0u;
+    coalesced_stale_marker_count_ = 0u;
+    maximum_diagnostic_backlog_ = diagnostic_publications_.size();
+    maximum_diagnostic_publication_seconds_ = 0.0;
+  }
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
   terminal_stop_goal_capture_active_ = false;

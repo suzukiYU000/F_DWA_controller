@@ -43,19 +43,22 @@ TEST(CommandDelayQueue, AppliesFixedDelayInFifoOrder)
   second.linear.x = 0.4;
 
   const rclcpp::Time start(0, 0, RCL_ROS_TIME);
-  ASSERT_TRUE(queue.enqueue(first, start));
-  ASSERT_TRUE(queue.enqueue(second, start + rclcpp::Duration::from_seconds(0.03)));
+  ASSERT_TRUE(queue.enqueue(first, start, 100u));
+  ASSERT_TRUE(queue.enqueue(
+      second, start + rclcpp::Duration::from_seconds(0.03), 130u));
 
   EXPECT_FALSE(queue.pop_due(start + rclcpp::Duration::from_seconds(0.069)).has_value());
   const auto first_due = queue.pop_due(start + rclcpp::Duration::from_seconds(0.070));
   ASSERT_TRUE(first_due.has_value());
   EXPECT_EQ(first_due->sequence, 0u);
+  EXPECT_EQ(first_due->received_steady_time_ns, 100u);
   EXPECT_DOUBLE_EQ(first_due->command.linear.x, 0.2);
 
   EXPECT_FALSE(queue.pop_due(start + rclcpp::Duration::from_seconds(0.099)).has_value());
   const auto second_due = queue.pop_due(start + rclcpp::Duration::from_seconds(0.100));
   ASSERT_TRUE(second_due.has_value());
   EXPECT_EQ(second_due->sequence, 1u);
+  EXPECT_EQ(second_due->received_steady_time_ns, 130u);
   EXPECT_DOUBLE_EQ(second_due->command.linear.x, 0.4);
 }
 
@@ -68,14 +71,14 @@ TEST(CommandDelayQueue, RejectsOverflowWithoutDroppingQueuedCommands)
   geometry_msgs::msg::Twist command;
   const rclcpp::Time now(0, 0, RCL_ROS_TIME);
 
-  ASSERT_TRUE(queue.enqueue(command, now));
-  ASSERT_TRUE(queue.enqueue(command, now));
-  EXPECT_FALSE(queue.enqueue(command, now));
+  ASSERT_TRUE(queue.enqueue(command, now, 1u));
+  ASSERT_TRUE(queue.enqueue(command, now, 2u));
+  EXPECT_FALSE(queue.enqueue(command, now, 3u));
   EXPECT_EQ(queue.size(), 2u);
   EXPECT_EQ(queue.next_sequence(), 2u);
 }
 
-TEST(CommandDelayQueue, DefaultDepthBoundsOneDelayedTimerSlot)
+TEST(CommandDelayQueue, DefaultDepthBoundsOneSecondSimulationClockStall)
 {
   CommandDelayParameters parameters;
   parameters.min_delay_ms = 0.0;
@@ -86,17 +89,18 @@ TEST(CommandDelayQueue, DefaultDepthBoundsOneDelayedTimerSlot)
   geometry_msgs::msg::Twist command;
   const rclcpp::Time now(0, 0, RCL_ROS_TIME);
 
-  // Three entries cover ceil(80 ms / 30 ms). A fourth permits normal
-  // arrival-before-timer ordering, and a fifth bounds one delayed timer.
-  for (std::size_t index = 0; index < 5u; ++index) {
-    EXPECT_TRUE(queue.enqueue(command, now));
+  // At 20 Hz, 24 entries cover the ordinary 80 ms delay plus more than one
+  // second of a bounded Gazebo /clock stall without dropping FIFO history.
+  for (std::size_t index = 0; index < 24u; ++index) {
+    EXPECT_TRUE(queue.enqueue(command, now, index + 1u));
   }
-  EXPECT_EQ(queue.size(), 5u);
+  EXPECT_EQ(queue.size(), 24u);
 
-  // A second missed service slot is not hidden by unbounded buffering.
-  EXPECT_FALSE(queue.enqueue(command, now));
-  EXPECT_EQ(queue.size(), 5u);
-  EXPECT_EQ(queue.next_sequence(), 5u);
+  // Longer clock failure is still reported instead of hidden by an
+  // unbounded queue.
+  EXPECT_FALSE(queue.enqueue(command, now, 25u));
+  EXPECT_EQ(queue.size(), 24u);
+  EXPECT_EQ(queue.next_sequence(), 24u);
 }
 
 TEST(CommandDelayQueue, TruncatedNormalStaysInsideConfiguredBounds)
@@ -111,7 +115,7 @@ TEST(CommandDelayQueue, TruncatedNormalStaysInsideConfiguredBounds)
   double delay_sum = 0.0;
   constexpr std::size_t kSamples = 10000;
   for (std::size_t index = 0; index < kSamples; ++index) {
-    ASSERT_TRUE(queue.enqueue(command, received_at));
+    ASSERT_TRUE(queue.enqueue(command, received_at, index + 1u));
     const DelayedCommand * queued = queue.front();
     ASSERT_NE(queued, nullptr);
     EXPECT_GE(queued->sampled_delay_ms, parameters.min_delay_ms);
@@ -152,7 +156,7 @@ TEST(CommandDelayQueue, TrialResetClearsStateAndRestartsSeed)
 
   std::vector<double> first_run_delays;
   for (std::size_t index = 0; index < 8u; ++index) {
-    ASSERT_TRUE(queue.enqueue(command, now));
+    ASSERT_TRUE(queue.enqueue(command, now, index + 1u));
     const DelayedCommand * queued = queue.front();
     ASSERT_NE(queued, nullptr);
     EXPECT_EQ(queued->sequence, index);
@@ -166,7 +170,7 @@ TEST(CommandDelayQueue, TrialResetClearsStateAndRestartsSeed)
 
   std::vector<double> repeated_run_delays;
   for (std::size_t index = 0; index < first_run_delays.size(); ++index) {
-    ASSERT_TRUE(queue.enqueue(command, now));
+    ASSERT_TRUE(queue.enqueue(command, now, index + 1u));
     const DelayedCommand * queued = queue.front();
     ASSERT_NE(queued, nullptr);
     EXPECT_EQ(queued->sequence, index);
@@ -187,7 +191,8 @@ TEST(CommandDelayQueue, DefaultThresholdPreservesFirStartupIncrement)
 
   geometry_msgs::msg::Twist command;
   command.linear.x = 0.001;
-  ASSERT_TRUE(queue.enqueue(command, rclcpp::Time(0, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(queue.enqueue(
+      command, rclcpp::Time(0, 0, RCL_ROS_TIME), 1u));
   const auto dispatched =
     queue.pop_due(rclcpp::Time(0, 0, RCL_ROS_TIME));
   ASSERT_TRUE(dispatched.has_value());

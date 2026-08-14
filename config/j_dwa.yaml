@@ -3,8 +3,10 @@ controller_server:
     FollowPath:
       plugin: "f_dwa_controller::JDwaController"
       trajectory_generator_name: "f_dwa_controller::JerkTrajectoryGenerator"
-      enable_certification: true
+      enable_certification: false
       native_input_control_period: 0.05
       require_applied_command_state: true
       max_linear_jerk: 1.57  # 0.758 for J-7; 3.14 for J-9
+      # The prediction horizon is inherited from the common comparison file;
+      # shortening only J-DWA would confound the V/A/J/F comparison.
       max_angular_jerk: 1.57  # 0.758 for J-7; 3.14 for J-9
