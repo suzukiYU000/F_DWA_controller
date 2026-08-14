@@ -1,7 +1,8 @@
 controller_server:
   ros__parameters:
     FollowPath:
-      plugin: "f_dwa_controller::CertifiedDWBLocalPlanner"
+      plugin: "f_dwa_controller::InstrumentedController"
+      primary_controller_type: "f_dwa_controller::CertifiedDWBLocalPlanner"
       trajectory_generator_name: "f_dwa_controller::VLimitedAccelTrajectoryGenerator"
       # Keep the dispatched-command state model, but do not append or reject
       # candidates using the optional terminal-stop certificate.

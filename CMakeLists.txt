@@ -26,10 +26,12 @@ find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
 set(library_name f_dwa_controller_core)
+set(instrumentation_library_name f_dwa_controller_instrumentation)
 set(transport_library_name f_dwa_transport)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CommandDispatch.msg"
+  "msg/ControllerComputation.msg"
   DEPENDENCIES
     builtin_interfaces
     geometry_msgs
@@ -66,6 +68,13 @@ add_library(${library_name} SHARED
   src/v_dwb_trajectory_generators.cpp
 )
 
+# Keep the wrapper separate from the concrete controller library. If it linked
+# DWB or the F-DWA implementations before its private pluginlib loader runs,
+# their factories would be registered with the wrong class-loader instance.
+add_library(${instrumentation_library_name} SHARED
+  src/instrumented_controller.cpp
+)
+
 add_library(${transport_library_name} SHARED
   src/command_envelope_node.cpp
   src/command_delay_node.cpp
@@ -78,9 +87,11 @@ rosidl_get_typesupport_target(
   rosidl_typesupport_cpp
 )
 target_link_libraries(${library_name} "${cpp_typesupport_target}")
+target_link_libraries(${instrumentation_library_name} "${cpp_typesupport_target}")
 target_link_libraries(${transport_library_name} "${cpp_typesupport_target}")
 
 target_compile_features(${library_name} PUBLIC cxx_std_17)
+target_compile_features(${instrumentation_library_name} PUBLIC cxx_std_17)
 target_compile_features(${transport_library_name} PUBLIC cxx_std_17)
 target_include_directories(${library_name}
   PUBLIC
@@ -88,6 +99,11 @@ target_include_directories(${library_name}
     $<INSTALL_INTERFACE:include>
 )
 target_include_directories(${transport_library_name}
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_include_directories(${instrumentation_library_name}
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
@@ -121,6 +137,17 @@ ament_target_dependencies(${transport_library_name}
   std_srvs
 )
 
+ament_target_dependencies(${instrumentation_library_name}
+  geometry_msgs
+  nav2_core
+  nav2_costmap_2d
+  nav2_util
+  pluginlib
+  rclcpp
+  rclcpp_lifecycle
+  tf2_ros
+)
+
 add_executable(command_delay_transport
   src/command_delay_main.cpp
 )
@@ -146,6 +173,7 @@ pluginlib_export_plugin_description_file(
 install(
   TARGETS
     ${library_name}
+    ${instrumentation_library_name}
     ${transport_library_name}
   EXPORT export_${library_name}
   ARCHIVE DESTINATION lib
@@ -379,7 +407,11 @@ if(BUILD_TESTING)
 endif()
 
 ament_export_include_directories(include)
-ament_export_libraries(${library_name} ${transport_library_name})
+ament_export_libraries(
+  ${library_name}
+  ${instrumentation_library_name}
+  ${transport_library_name}
+)
 ament_export_targets(export_${library_name} HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   angles

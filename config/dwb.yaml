@@ -3,7 +3,8 @@ controller_server:
     FollowPath:
       # Unmodified Nav2 DWB baseline. Unlike V-DWA, the dynamic-window origin
       # is the odometry velocity supplied by Controller Server.
-      plugin: "dwb_core::DWBLocalPlanner"
+      plugin: "f_dwa_controller::InstrumentedController"
+      primary_controller_type: "dwb_core::DWBLocalPlanner"
       trajectory_generator_name: "dwb_plugins::LimitedAccelGenerator"
       sim_period: 0.05
       # Canonical Navigation2 DWB critic family. The standard polygon

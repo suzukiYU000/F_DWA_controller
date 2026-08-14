@@ -1,4 +1,14 @@
 <?xml version="1.0"?>
+<class_libraries>
+<library path="f_dwa_controller_instrumentation">
+  <class
+    type="f_dwa_controller::InstrumentedController"
+    base_class_type="nav2_core::Controller">
+    <description>
+      Transparent controller wrapper that publishes per-call computation time.
+    </description>
+  </class>
+</library>
 <library path="f_dwa_controller_core">
   <class
     type="f_dwa_controller::CertifiedDWBLocalPlanner"
@@ -30,3 +40,4 @@
     </description>
   </class>
 </library>
+</class_libraries>
