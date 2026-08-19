@@ -470,6 +470,28 @@ public:
   {
     return has_full_evaluation_capacity(pending_full_evaluations);
   }
+
+  static uint64_t clearance_bucket(
+    const double risk,
+    const double admissible_risk,
+    const double resolution)
+  {
+    return clearance_constraint_bucket(
+      risk, admissible_risk, resolution);
+  }
+
+  static bool clearance_prefers_candidate(
+    const uint64_t candidate_risk_bucket,
+    const uint64_t best_risk_bucket,
+    const double candidate_total,
+    const double best_total,
+    const std::size_t candidate_index,
+    const std::size_t best_index)
+  {
+    return clearance_constraint_prefers_candidate(
+      candidate_risk_bucket, best_risk_bucket,
+      candidate_total, best_total, candidate_index, best_index);
+  }
 };
 
 void expect_scores_equal(
@@ -929,6 +951,47 @@ TEST_F(
   }
   EXPECT_FALSE(reused_generator.hasMoreTwists());
   EXPECT_EQ(candidate_count, 165u);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ClearanceConstraintKeepsAdmissibleRiskInOneEpsilonSet)
+{
+  EXPECT_EQ(ScorePlannerAdapter::clearance_bucket(0.0, 0.05, 0.01), 0u);
+  EXPECT_EQ(ScorePlannerAdapter::clearance_bucket(0.05, 0.05, 0.01), 0u);
+  EXPECT_EQ(ScorePlannerAdapter::clearance_bucket(0.0501, 0.05, 0.01), 1u);
+  EXPECT_EQ(ScorePlannerAdapter::clearance_bucket(0.06, 0.05, 0.01), 1u);
+  EXPECT_EQ(ScorePlannerAdapter::clearance_bucket(0.0601, 0.05, 0.01), 2u);
+  EXPECT_EQ(ScorePlannerAdapter::clearance_bucket(1.0, 0.05, 0.01), 95u);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ClearanceConstraintRejectsInvalidNormalization)
+{
+  EXPECT_THROW(
+    ScorePlannerAdapter::clearance_bucket(-0.01, 0.10, 0.01),
+    std::invalid_argument);
+  EXPECT_THROW(
+    ScorePlannerAdapter::clearance_bucket(0.50, 1.01, 0.01),
+    std::invalid_argument);
+  EXPECT_THROW(
+    ScorePlannerAdapter::clearance_bucket(0.50, 0.10, 0.0),
+    std::invalid_argument);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ClearanceConstraintRanksRiskBeforePathCostAndProgress)
+{
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
+      3u, 4u, 120.0, 100.0, 8u, 9u));
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
+      5u, 4u, 10.0, 100.0, 8u, 9u));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
+      4u, 4u, 99.0, 100.0, 10u, 9u));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
+      4u, 4u, 100.0, 100.0, 8u, 9u));
 }
 
 TEST_F(
@@ -1844,6 +1907,31 @@ TEST_F(NativeInputTrajectoryGeneratorTest, TrialResetRetainsFirDesign)
   generator.reset_trial_state();
 
   expect_finite_trajectory(generator);
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, TrialResetReloadsPredictionTime)
+{
+  const auto node = make_node("runtime_prediction_time_test");
+  AccelerationTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+
+  const auto update = node->set_parameter(
+    rclcpp::Parameter("FollowPath.sim_time", 1.2));
+  ASSERT_TRUE(update.successful);
+  generator.reset_trial_state();
+
+  nav_2d_msgs::msg::Twist2D current_velocity;
+  generator.startNewIteration(current_velocity);
+  ASSERT_TRUE(generator.hasMoreTwists());
+  const auto command = generator.nextTwist();
+  geometry_msgs::msg::Pose2D start_pose;
+  const auto trajectory = generator.generateTrajectory(
+    start_pose, current_velocity, command);
+  EXPECT_EQ(trajectory.poses.size(), 42u);
+  ASSERT_FALSE(trajectory.time_offsets.empty());
+  const auto & final_time = trajectory.time_offsets.back();
+  EXPECT_NEAR(
+    final_time.sec + final_time.nanosec * 1.0e-9, 1.2, 1.0e-12);
 }
 
 TEST_F(

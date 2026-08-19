@@ -322,11 +322,13 @@ public:
   bool configure(
     nav2_costmap_2d::Costmap2D * source,
     nav2_costmap_2d::Costmap2D * exclusion = nullptr,
-    const double exclusion_tolerance = 0.0)
+    const double exclusion_tolerance = 0.0,
+    const bool apply_aligned_tolerance = false)
   {
     costmap_ = source;
     exclusion_costmap_ = exclusion;
     exclude_layer_tolerance_ = exclusion_tolerance;
+    apply_exclude_tolerance_on_aligned_grids_ = apply_aligned_tolerance;
     return refreshPenalizedCellMask();
   }
 
@@ -1103,6 +1105,23 @@ TEST(FootprintClearanceCritic, PreservesAlignedStaticAdjacentProtrusion)
   EXPECT_FALSE(critic.isExcluded(protrusion_x, protrusion_y));
   EXPECT_FALSE(critic.isPenalized(5u, 5u));
   EXPECT_TRUE(critic.isPenalized(6u, 5u));
+}
+
+TEST(FootprintClearanceCritic, OptionallyExcludesAlignedStaticRegistrationError)
+{
+  nav2_costmap_2d::Costmap2D source(20, 20, 0.05, 0.0, 0.0, 0u);
+  nav2_costmap_2d::Costmap2D static_layer(20, 20, 0.05, 0.0, 0.0, 0u);
+  static_layer.setCost(5u, 5u, nav2_costmap_2d::LETHAL_OBSTACLE);
+  source.setCost(7u, 5u, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  CostmapFootprintClearanceCritic critic;
+  critic.configure(&source, &static_layer, 0.10, true);
+  double shifted_x = 0.0;
+  double shifted_y = 0.0;
+  source.mapToWorld(7u, 5u, shifted_x, shifted_y);
+
+  EXPECT_TRUE(critic.isExcluded(shifted_x, shifted_y));
+  EXPECT_FALSE(critic.isPenalized(7u, 5u));
 }
 
 TEST(FixedDistanceRiskPath, IsIndependentOfTemporalPoseSampling)

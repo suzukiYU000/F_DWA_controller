@@ -204,6 +204,24 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".enable_certification",
     rclcpp::ParameterValue(false));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".enable_clearance_constraint",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_critic_name",
+    rclcpp::ParameterValue(std::string{"FootprintClearance"}));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_trigger_critic_name",
+    rclcpp::ParameterValue(std::string{"FootprintClearance"}));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_admissible_risk",
+    rclcpp::ParameterValue(0.05));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_trigger_risk",
+    rclcpp::ParameterValue(-1.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_risk_resolution",
+    rclcpp::ParameterValue(0.01));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".enable_nominal_delay_preview",
     rclcpp::ParameterValue(true));
   nav2_util::declare_parameter_if_not_declared(
@@ -289,6 +307,23 @@ void CertifiedDWBLocalPlanner::configure(
     rclcpp::ParameterValue(true));
 
   node->get_parameter(name + ".enable_certification", certification_enabled_);
+  node->get_parameter(
+    name + ".enable_clearance_constraint", clearance_constraint_enabled_);
+  node->get_parameter(
+    name + ".clearance_constraint_critic_name",
+    clearance_constraint_critic_name_);
+  node->get_parameter(
+    name + ".clearance_constraint_trigger_critic_name",
+    clearance_constraint_trigger_critic_name_);
+  node->get_parameter(
+    name + ".clearance_constraint_admissible_risk",
+    clearance_constraint_admissible_risk_);
+  node->get_parameter(
+    name + ".clearance_constraint_trigger_risk",
+    clearance_constraint_trigger_risk_);
+  node->get_parameter(
+    name + ".clearance_constraint_risk_resolution",
+    clearance_constraint_risk_resolution_);
   node->get_parameter(
     name + ".enable_no_valid_control_deceleration_fallback",
     no_valid_control_deceleration_fallback_enabled_);
@@ -401,6 +436,14 @@ void CertifiedDWBLocalPlanner::configure(
     terminal_stop_goal_capture_yaw_tolerance_ < 0.0 ||
     !std::isfinite(minimum_certified_margin_) ||
     minimum_certified_margin_ < 0.0 ||
+    !std::isfinite(clearance_constraint_admissible_risk_) ||
+    clearance_constraint_admissible_risk_ < 0.0 ||
+    clearance_constraint_admissible_risk_ > 1.0 ||
+    !std::isfinite(clearance_constraint_trigger_risk_) ||
+    clearance_constraint_trigger_risk_ < -1.0 ||
+    clearance_constraint_trigger_risk_ > 1.0 ||
+    !is_positive_finite(clearance_constraint_risk_resolution_) ||
+    clearance_constraint_risk_resolution_ > 1.0 ||
     !is_positive_finite(maximum_swept_distance_) ||
     planning_metrics_report_interval_ <= 0 ||
     !is_positive_finite(planning_deadline_seconds_) ||
@@ -414,6 +457,46 @@ void CertifiedDWBLocalPlanner::configure(
   const std::string plugin_name = name;
   dwb_core::DWBLocalPlanner::configure(
     parent, std::move(name), std::move(tf), std::move(costmap_ros));
+
+  clearance_constraint_critic_.reset();
+  clearance_constraint_trigger_critic_.reset();
+  for (const auto & critic : critics_) {
+    const auto clearance_critic =
+      std::dynamic_pointer_cast<FootprintClearanceCritic>(critic);
+    if (!clearance_critic) {
+      continue;
+    }
+    if (clearance_critic->getName() == clearance_constraint_critic_name_) {
+      if (clearance_constraint_critic_) {
+        throw nav2_core::ControllerException(
+                "clearance_constraint_critic_name is not unique: " +
+                clearance_constraint_critic_name_);
+      }
+      clearance_constraint_critic_ = clearance_critic;
+    }
+    if (clearance_critic->getName() ==
+      clearance_constraint_trigger_critic_name_)
+    {
+      if (clearance_constraint_trigger_critic_) {
+        throw nav2_core::ControllerException(
+                "clearance_constraint_trigger_critic_name is not unique: " +
+                clearance_constraint_trigger_critic_name_);
+      }
+      clearance_constraint_trigger_critic_ = clearance_critic;
+    }
+  }
+  if (clearance_constraint_enabled_ && !clearance_constraint_critic_) {
+    throw nav2_core::ControllerException(
+            "clearance constraint critic was not found: " +
+            clearance_constraint_critic_name_);
+  }
+  if (clearance_constraint_enabled_ &&
+    !clearance_constraint_trigger_critic_)
+  {
+    throw nav2_core::ControllerException(
+            "clearance constraint trigger critic was not found: " +
+            clearance_constraint_trigger_critic_name_);
+  }
 
   node->get_parameter(
     plugin_name + ".min_vel_x", minimum_linear_velocity_);
@@ -1187,6 +1270,48 @@ bool CertifiedDWBLocalPlanner::has_full_evaluation_capacity(
          kMaximumPendingFullEvaluations;
 }
 
+uint64_t CertifiedDWBLocalPlanner::clearance_constraint_bucket(
+  const double clearance_risk,
+  const double admissible_risk,
+  const double risk_resolution)
+{
+  if (!std::isfinite(clearance_risk) || clearance_risk < 0.0 ||
+    clearance_risk > 1.0 || !std::isfinite(admissible_risk) ||
+    admissible_risk < 0.0 || admissible_risk > 1.0 ||
+    !is_positive_finite(risk_resolution))
+  {
+    throw std::invalid_argument{"invalid clearance epsilon constraint"};
+  }
+  if (clearance_risk <= admissible_risk) {
+    return 0u;
+  }
+  const double violation_bands = std::ceil(
+    (clearance_risk - admissible_risk) / risk_resolution - 1.0e-12);
+  if (violation_bands >=
+    static_cast<double>(std::numeric_limits<uint64_t>::max()))
+  {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return static_cast<uint64_t>(std::max(1.0, violation_bands));
+}
+
+bool CertifiedDWBLocalPlanner::clearance_constraint_prefers_candidate(
+  const uint64_t candidate_risk_bucket,
+  const uint64_t best_risk_bucket,
+  const double candidate_total,
+  const double best_total,
+  const std::size_t candidate_canonical_index,
+  const std::size_t best_canonical_index)
+{
+  if (candidate_risk_bucket != best_risk_bucket) {
+    return candidate_risk_bucket < best_risk_bucket;
+  }
+  if (candidate_total != best_total) {
+    return candidate_total < best_total;
+  }
+  return candidate_canonical_index < best_canonical_index;
+}
+
 bool CertifiedDWBLocalPlanner::coalesce_stale_marker_publication(
   std::deque<DiagnosticPublication> & publications,
   DiagnosticPublication publication)
@@ -1671,6 +1796,9 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   std::size_t evaluation_index = 0u;
   dwb_msgs::msg::Trajectory2D trajectory_scratch;
   dwb_msgs::msg::TrajectoryScore score_scratch;
+  uint64_t best_clearance_risk_bucket =
+    std::numeric_limits<uint64_t>::max();
+  bool clearance_constraint_triggered = false;
 
   traj_generator_->startNewIteration(velocity);
   while (traj_generator_->hasMoreTwists()) {
@@ -1690,21 +1818,96 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       evaluation_index;
     ++evaluation_index;
     try {
+      std::optional<double> precomputed_clearance_risk;
+      uint64_t candidate_clearance_risk_bucket = 0u;
+      uint64_t candidate_clearance_trigger_bucket = 0u;
+      if (clearance_constraint_enabled_) {
+        const double clearance_risk =
+          clearance_constraint_critic_->scoreTrajectory(trajectory_scratch);
+        if (!std::isfinite(clearance_risk) || clearance_risk < 0.0 ||
+          clearance_risk > 1.0 + 1.0e-9)
+        {
+          throw dwb_core::IllegalTrajectoryException(
+                  "ClearanceConstraint",
+                  "Footprint clearance risk is outside [0, 1]");
+        }
+        precomputed_clearance_risk = std::clamp(clearance_risk, 0.0, 1.0);
+        candidate_clearance_risk_bucket = clearance_constraint_bucket(
+          *precomputed_clearance_risk,
+          clearance_constraint_admissible_risk_,
+          clearance_constraint_risk_resolution_);
+        const double clearance_trigger_risk =
+          clearance_constraint_trigger_critic_.get() ==
+          clearance_constraint_critic_.get() ?
+          *precomputed_clearance_risk :
+          clearance_constraint_trigger_critic_->scoreTrajectory(
+          trajectory_scratch);
+        if (!std::isfinite(clearance_trigger_risk) ||
+          clearance_trigger_risk < 0.0 ||
+          clearance_trigger_risk > 1.0 + 1.0e-9)
+        {
+          throw dwb_core::IllegalTrajectoryException(
+                  "ClearanceConstraint",
+                  "Clearance trigger risk is outside [0, 1]");
+        }
+        const double trigger_risk =
+          clearance_constraint_trigger_risk_ >= 0.0 ?
+          clearance_constraint_trigger_risk_ :
+          clearance_constraint_admissible_risk_;
+        candidate_clearance_trigger_bucket = clearance_constraint_bucket(
+          std::clamp(clearance_trigger_risk, 0.0, 1.0),
+          trigger_risk,
+          clearance_constraint_risk_resolution_);
+        clearance_constraint_triggered = clearance_constraint_triggered ||
+          candidate_clearance_trigger_bucket > 0u;
+      }
+      const bool avoidance_constraint_context =
+        clearance_constraint_enabled_ && best.total >= 0.0 &&
+        clearance_constraint_triggered;
+      double candidate_best_score =
+        best_uses_reserve_recovery ? -1.0 : best.total;
+      if (avoidance_constraint_context) {
+        if (candidate_clearance_risk_bucket < best_clearance_risk_bucket)
+        {
+          // A lower-risk bucket can win even with a larger path-following
+          // score, so it must complete every hard check and soft score.
+          candidate_best_score = -1.0;
+        } else if (
+          candidate_clearance_risk_bucket > best_clearance_risk_bucket)
+        {
+          // Preserve the physical-footprint critic at the head of the list,
+          // then permit normal short-circuiting for a candidate which cannot
+          // enter the current epsilon-feasible clearance set.
+          candidate_best_score = std::numeric_limits<double>::min();
+        }
+      }
       bool candidate_uses_reserve_recovery = false;
+      double candidate_clearance_risk = 0.0;
       score_trajectory_components(
         trajectory_scratch,
-        best_uses_reserve_recovery ? -1.0 : best.total,
+        candidate_best_score,
         score_scratch, record_full_evaluation_details_,
-        &candidate_uses_reserve_recovery);
+        &candidate_uses_reserve_recovery, precomputed_clearance_risk,
+        &candidate_clearance_risk);
+      (void)candidate_clearance_risk;
+      const bool recovery_mode_matches =
+        candidate_uses_reserve_recovery == best_uses_reserve_recovery;
+      const bool avoidance_rank_is_better =
+        avoidance_constraint_context && recovery_mode_matches &&
+        clearance_constraint_prefers_candidate(
+        candidate_clearance_risk_bucket, best_clearance_risk_bucket,
+        score_scratch.total, best.total,
+        canonical_index, best_canonical_index);
+      const bool normal_rank_is_better =
+        !avoidance_constraint_context && recovery_mode_matches &&
+        (score_scratch.total < best.total ||
+        (score_scratch.total == best.total &&
+        canonical_index < best_canonical_index));
       const bool is_best =
         best.total < 0.0 ||
         (!candidate_uses_reserve_recovery &&
         best_uses_reserve_recovery) ||
-        (candidate_uses_reserve_recovery ==
-        best_uses_reserve_recovery &&
-        (score_scratch.total < best.total ||
-        (score_scratch.total == best.total &&
-        canonical_index < best_canonical_index)));
+        avoidance_rank_is_better || normal_rank_is_better;
       bool is_worst = worst_total < 0.0;
       if (!is_worst) {
         is_worst = score_scratch.total > worst_total;
@@ -1729,6 +1932,7 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           best.traj.time_offsets.swap(trajectory_scratch.time_offsets);
         }
         best_canonical_index = canonical_index;
+        best_clearance_risk_bucket = candidate_clearance_risk_bucket;
         best_uses_reserve_recovery =
           candidate_uses_reserve_recovery;
         if (results) {
@@ -1928,7 +2132,7 @@ CertifiedDWBLocalPlanner::scoreTrajectory(
   dwb_msgs::msg::TrajectoryScore score;
   score.traj = trajectory;
   score_trajectory_components(
-    trajectory, best_score, score, true, nullptr);
+    trajectory, best_score, score, true, nullptr, std::nullopt, nullptr);
   return score;
 }
 
@@ -1937,13 +2141,18 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
   const double best_score,
   dwb_msgs::msg::TrajectoryScore & score,
   const bool record_score_details,
-  bool * used_reserve_recovery)
+  bool * used_reserve_recovery,
+  const std::optional<double> precomputed_clearance_risk,
+  double * clearance_risk)
 {
   if (used_reserve_recovery) {
     *used_reserve_recovery = false;
   }
   score.total = 0.0;
   score.scores.clear();
+  if (clearance_risk) {
+    *clearance_risk = std::numeric_limits<double>::quiet_NaN();
+  }
   const bool score_terminal_stop =
     certification_enabled_ &&
     terminal_stop_goal_distance_scale_ > 0.0 &&
@@ -1955,18 +2164,32 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
   }
   for (dwb_core::TrajectoryCritic::Ptr & critic : critics_) {
     const double critic_scale = critic->getScale();
+    const bool is_clearance_constraint_critic =
+      clearance_constraint_critic_ &&
+      critic.get() == clearance_constraint_critic_.get();
     if (critic_scale == 0.0) {
+      const double raw_score =
+        is_clearance_constraint_critic && precomputed_clearance_risk ?
+        *precomputed_clearance_risk : 0.0;
+      if (is_clearance_constraint_critic && clearance_risk) {
+        *clearance_risk = raw_score;
+      }
       if (record_score_details) {
         dwb_msgs::msg::CriticScore critic_score;
         critic_score.name = critic->getName();
         critic_score.scale = critic_scale;
+        critic_score.raw_score = raw_score;
         score.scores.push_back(std::move(critic_score));
       }
       continue;
     }
 
     const double raw_score =
-      critic->scoreTrajectory(trajectory);
+      is_clearance_constraint_critic && precomputed_clearance_risk ?
+      *precomputed_clearance_risk : critic->scoreTrajectory(trajectory);
+    if (is_clearance_constraint_critic && clearance_risk) {
+      *clearance_risk = raw_score;
+    }
     if (record_score_details) {
       dwb_msgs::msg::CriticScore critic_score;
       critic_score.name = critic->getName();

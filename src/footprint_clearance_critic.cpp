@@ -134,6 +134,9 @@ void FootprintClearanceCritic::onInit()
     node, prefix + "exclude_layer", rclcpp::ParameterValue(std::string{}));
   nav2_util::declare_parameter_if_not_declared(
     node, prefix + "exclude_layer_tolerance", rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "apply_exclude_tolerance_on_aligned_grids",
+    rclcpp::ParameterValue(false));
   node->get_parameter(prefix + "clearance_margin", clearance_margin_);
   node->get_parameter(prefix + "clearance_bands", clearance_bands_);
   node->get_parameter(prefix + "risk_distance", risk_distance_);
@@ -148,6 +151,9 @@ void FootprintClearanceCritic::onInit()
   node->get_parameter(prefix + "exclude_layer", exclude_layer_);
   node->get_parameter(
     prefix + "exclude_layer_tolerance", exclude_layer_tolerance_);
+  node->get_parameter(
+    prefix + "apply_exclude_tolerance_on_aligned_grids",
+    apply_exclude_tolerance_on_aligned_grids_);
   if (!std::isfinite(clearance_margin_) || clearance_margin_ <= 0.0 ||
     clearance_bands_ <= 0 ||
     !std::isfinite(risk_distance_) || risk_distance_ <= 1.0e-9 ||
@@ -262,24 +268,23 @@ bool FootprintClearanceCritic::excludedByStaticLayer(
   {
     return false;
   }
-  // On the same grid, only an observation in the same static lethal cell is a
-  // duplicate. Neighbouring observed cells are real protrusions/narrowing and
-  // must retain their soft clearance penalty even when a legacy registration
-  // tolerance is configured.
+  // Exact overlap is always a duplicate. By default, neighbouring observations
+  // on an aligned grid remain real protrusions/narrowing; simulation may opt in
+  // to the bounded tolerance below to absorb known map/mesh rasterization error.
   if (exclusion_costmap_->getCost(exclusion_x, exclusion_y) ==
     nav2_costmap_2d::LETHAL_OBSTACLE)
   {
     return true;
   }
   if (exclude_layer_tolerance_ <= 0.0 ||
-    costmapGridsAreAligned(costmap_, exclusion_costmap_))
+    (costmapGridsAreAligned(costmap_, exclusion_costmap_) &&
+    !apply_exclude_tolerance_on_aligned_grids_))
   {
     return false;
   }
 
-  // Only differently registered grids use the tolerance fallback. This keeps
-  // the compatibility mechanism without erasing an adjacent obstacle on the
-  // normal shared local-costmap grid.
+  // Differently registered grids use the tolerance fallback automatically.
+  // Aligned grids reach it only through the explicit simulation opt-in above.
   const double resolution = exclusion_costmap_->getResolution();
   if (!std::isfinite(resolution) || resolution <= 0.0) {
     return false;

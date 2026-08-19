@@ -102,6 +102,7 @@ protected:
   bool prepared_{false};
   double clearance_margin_{0.25};
   double exclude_layer_tolerance_{0.0};
+  bool apply_exclude_tolerance_on_aligned_grids_{false};
   double risk_distance_{2.5};
   double risk_seed_time_{1.4};
   double heading_relaxation_distance_{1.0};

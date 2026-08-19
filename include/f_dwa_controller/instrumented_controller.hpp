@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "f_dwa_controller/msg/controller_computation.hpp"
@@ -21,6 +22,7 @@
 #include "rclcpp/clock.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "rclcpp_lifecycle/lifecycle_publisher.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include "tf2_ros/buffer.h"
 
 namespace f_dwa_controller
@@ -63,6 +65,8 @@ private:
   rclcpp_lifecycle::LifecycleNode::WeakPtr parent_;
   rclcpp_lifecycle::LifecyclePublisher<
     f_dwa_controller::msg::ControllerComputation>::SharedPtr publisher_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_trial_service_;
+  std::mutex primary_controller_mutex_;
   std::string name_;
   uint64_t sequence_{0};
 };

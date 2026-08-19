@@ -202,6 +202,23 @@ def design_fir_coefficients(profile_name: str) -> list[float]:
     return design_fir_coefficients_from_spec(design)
 
 
+def lowpass_design_for_cutoff(cutoff_hz: float) -> FirFilterDesign:
+    """Return the established 20 Hz/91-tap design at a numeric cutoff."""
+    return FirFilterDesign(
+        num_taps=91,
+        sample_frequency_hz=20.0,
+        mode='lowpass',
+        cutoff_hz=float(cutoff_hz),
+    )
+
+
+def design_fir_coefficients_for_cutoff(cutoff_hz: float) -> list[float]:
+    """Generate the F-DWA FIR from an operator-provided cutoff in Hz."""
+    return design_fir_coefficients_from_spec(
+        lowpass_design_for_cutoff(cutoff_hz)
+    )
+
+
 def coefficient_fingerprint(coefficients: Sequence[float]) -> str:
     """Return a tolerance-stable SHA-256 fingerprint for experiment logs."""
     canonical = ';'.join(f'{value:.12f}' for value in coefficients)
@@ -231,7 +248,7 @@ def inject_fir_coefficients(
     controller_name: str = 'controller_server',
     plugin_name: str = 'FollowPath',
 ) -> Optional[DesignReport]:
-    """Replace an F-DWA profile name with generated runtime parameters."""
+    """Replace an F-DWA cutoff (or legacy profile) with runtime parameters."""
     try:
         plugin_parameters = parameters[controller_name]['ros__parameters'][
             plugin_name
@@ -246,10 +263,12 @@ def inject_fir_coefficients(
     )
     uses_fir = generator_name.endswith('FirTrajectoryGenerator')
     profile_name = plugin_parameters.pop('fir_design_profile', None)
+    cutoff_hz = plugin_parameters.get('fir_cutoff_frequency_hz')
     if not uses_fir:
-        if profile_name is not None:
+        if profile_name is not None or cutoff_hz is not None:
             raise ValueError(
-                'fir_design_profile is only valid for FirTrajectoryGenerator'
+                'FIR design parameters are only valid for '
+                'FirTrajectoryGenerator'
             )
         return None
 
@@ -258,11 +277,28 @@ def inject_fir_coefficients(
             'source YAML must not contain fir_coefficients; use a Python '
             'FIR_FILTER_DESIGNS profile'
         )
-    if not isinstance(profile_name, str) or not profile_name:
-        raise ValueError('FirTrajectoryGenerator requires fir_design_profile')
-
-    coefficients = design_fir_coefficients(profile_name)
-    design = FIR_FILTER_DESIGNS[profile_name]
+    if cutoff_hz is not None:
+        if profile_name is not None:
+            raise ValueError(
+                'Specify fir_cutoff_frequency_hz or legacy '
+                'fir_design_profile, not both'
+            )
+        try:
+            cutoff_hz = float(cutoff_hz)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                'fir_cutoff_frequency_hz must be a number'
+            ) from error
+        design = lowpass_design_for_cutoff(cutoff_hz)
+        coefficients = design_fir_coefficients_from_spec(design)
+        profile_name = f'cutoff_{cutoff_hz:g}_hz'
+    else:
+        if not isinstance(profile_name, str) or not profile_name:
+            raise ValueError(
+                'FirTrajectoryGenerator requires fir_cutoff_frequency_hz'
+            )
+        coefficients = design_fir_coefficients(profile_name)
+        design = FIR_FILTER_DESIGNS[profile_name]
     (
         step_response_rise_time_seconds,
         step_response_overshoot_percent,

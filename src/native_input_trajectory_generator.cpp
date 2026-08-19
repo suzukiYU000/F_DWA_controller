@@ -86,6 +86,7 @@ void NativeInputTrajectoryGenerator::initialize(
   const std::string & plugin_name)
 {
   dwb_plugins::StandardTrajectoryGenerator::initialize(node, plugin_name);
+  node_ = node;
   plugin_name_ = plugin_name;
 
   nav2_util::declare_parameter_if_not_declared(
@@ -109,6 +110,9 @@ void NativeInputTrajectoryGenerator::initialize(
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".fir_coefficients_generated",
     rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".fir_cutoff_frequency_hz",
+    rclcpp::ParameterValue(1.2));
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".fir_prediction_pulse_duration",
     rclcpp::ParameterValue(0.0));
@@ -140,6 +144,9 @@ void NativeInputTrajectoryGenerator::initialize(
   node->get_parameter(
     plugin_name + ".fir_coefficients_generated",
     fir_coefficients_generated_);
+  node->get_parameter(
+    plugin_name + ".fir_cutoff_frequency_hz",
+    fir_cutoff_frequency_hz_);
   node->get_parameter(
     plugin_name + ".fir_prediction_pulse_duration",
     fir_prediction_pulse_duration_);
@@ -230,6 +237,9 @@ void NativeInputTrajectoryGenerator::validate_parameters() const
       maximum_linear_raw_input_ <= 0.0 ||
       !std::isfinite(maximum_angular_raw_input_) ||
       maximum_angular_raw_input_ <= 0.0 ||
+      !std::isfinite(fir_cutoff_frequency_hz_) ||
+      fir_cutoff_frequency_hz_ <= 0.0 ||
+      fir_cutoff_frequency_hz_ >= 10.0 ||
       !std::isfinite(fir_prediction_pulse_duration_) ||
       fir_prediction_pulse_duration_<0.0 ||
       fir_prediction_pulse_duration_> sim_time_ + 1.0e-12)
@@ -252,6 +262,10 @@ void NativeInputTrajectoryGenerator::reset()
 
 void NativeInputTrajectoryGenerator::reset_trial_state()
 {
+  // The controller reset service holds CertifiedDWBLocalPlanner's state mutex,
+  // so this is the safe boundary at which GUI parameter changes become active.
+  // No candidate can be evaluated with a partially updated J/F-DWA model.
+  reload_runtime_parameters();
   reset();
   std::lock_guard<std::mutex> lock(applied_command_mutex_);
   latest_applied_command_ = nav_2d_msgs::msg::Twist2D();
@@ -269,6 +283,84 @@ void NativeInputTrajectoryGenerator::reset_trial_state()
   previous_selected_velocity_.reset();
   planning_snapshot_.reset();
   applied_command_state_ready_ = true;
+}
+
+void NativeInputTrajectoryGenerator::reload_runtime_parameters()
+{
+  const auto node = node_.lock();
+  if (!node) {
+    throw std::runtime_error(plugin_name_ + " lifecycle node is unavailable");
+  }
+
+  double updated_linear_jerk = maximum_linear_jerk_;
+  double updated_angular_jerk = maximum_angular_jerk_;
+  double updated_sim_time = sim_time_;
+  double updated_pulse_duration = fir_prediction_pulse_duration_;
+  double updated_cutoff_frequency = fir_cutoff_frequency_hz_;
+  bool updated_coefficients_generated = fir_coefficients_generated_;
+  std::vector<double> updated_coefficients = fir_coefficients_;
+  node->get_parameter(
+    plugin_name_ + ".max_linear_jerk", updated_linear_jerk);
+  node->get_parameter(
+    plugin_name_ + ".max_angular_jerk", updated_angular_jerk);
+  node->get_parameter(plugin_name_ + ".sim_time", updated_sim_time);
+  if (input_order_ == NativeInputOrder::kFir) {
+    node->get_parameter(
+      plugin_name_ + ".fir_coefficients", updated_coefficients);
+    node->get_parameter(
+      plugin_name_ + ".fir_coefficients_generated",
+      updated_coefficients_generated);
+    node->get_parameter(
+      plugin_name_ + ".fir_cutoff_frequency_hz",
+      updated_cutoff_frequency);
+    node->get_parameter(
+      plugin_name_ + ".fir_prediction_pulse_duration",
+      updated_pulse_duration);
+  }
+
+  const double previous_linear_jerk = maximum_linear_jerk_;
+  const double previous_angular_jerk = maximum_angular_jerk_;
+  const double previous_sim_time = sim_time_;
+  const double previous_pulse_duration = fir_prediction_pulse_duration_;
+  const double previous_cutoff_frequency = fir_cutoff_frequency_hz_;
+  const bool previous_coefficients_generated = fir_coefficients_generated_;
+  const std::vector<double> previous_coefficients = fir_coefficients_;
+  const FirStopCoefficientResponse previous_stop_response =
+    fir_stop_coefficient_response_;
+  const std::vector<double> previous_time_steps = fixed_time_steps_;
+
+  maximum_linear_jerk_ = updated_linear_jerk;
+  maximum_angular_jerk_ = updated_angular_jerk;
+  sim_time_ = updated_sim_time;
+  fir_prediction_pulse_duration_ = updated_pulse_duration;
+  fir_cutoff_frequency_hz_ = updated_cutoff_frequency;
+  fir_coefficients_generated_ = updated_coefficients_generated;
+  fir_coefficients_ = std::move(updated_coefficients);
+  try {
+    validate_parameters();
+    fixed_time_steps_ = getTimeSteps(nav_2d_msgs::msg::Twist2D());
+    if (input_order_ == NativeInputOrder::kFir) {
+      fir_stop_coefficient_response_ =
+        prepare_fir_stop_coefficient_response(
+        fir_coefficients_, control_period_);
+      if (!fir_stop_coefficient_response_.valid) {
+        throw std::invalid_argument(
+                plugin_name_ +
+                " FIR terminal-stop coefficient response is invalid");
+      }
+    }
+  } catch (...) {
+    maximum_linear_jerk_ = previous_linear_jerk;
+    maximum_angular_jerk_ = previous_angular_jerk;
+    sim_time_ = previous_sim_time;
+    fir_prediction_pulse_duration_ = previous_pulse_duration;
+    fir_cutoff_frequency_hz_ = previous_cutoff_frequency;
+    fir_coefficients_generated_ = previous_coefficients_generated;
+    fir_coefficients_ = previous_coefficients;
+    fir_stop_coefficient_response_ = previous_stop_response;
+    fixed_time_steps_ = previous_time_steps;
+    throw;
+  }
 }
 
 void NativeInputTrajectoryGenerator::enrich_planning_snapshot(

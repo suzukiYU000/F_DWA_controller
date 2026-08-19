@@ -214,6 +214,7 @@ private:
 
   AxisLimits linear_limits() const;
   AxisLimits angular_limits() const;
+  void reload_runtime_parameters();
   void validate_parameters() const;
   const std::vector<AngularPoseIntegrationStep> &
   angular_pose_integration_steps(
@@ -245,12 +246,14 @@ private:
     std::vector<NativeCommandState> * command_states);
 
   NativeInputOrder input_order_;
+  std::weak_ptr<rclcpp_lifecycle::LifecycleNode> node_;
   std::string plugin_name_;
   double control_period_{0.03};
   double maximum_linear_jerk_{1.57};
   double maximum_angular_jerk_{1.57};
   double maximum_linear_raw_input_{1.2};
   double maximum_angular_raw_input_{1.57};
+  double fir_cutoff_frequency_hz_{1.2};
   double fir_prediction_pulse_duration_{0.0};
   double stop_capture_velocity_{0.01};
   double stop_command_delay_seconds_{0.07};

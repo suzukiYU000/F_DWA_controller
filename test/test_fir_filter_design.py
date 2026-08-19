@@ -19,14 +19,13 @@
 # SOFTWARE.
 
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
 
 from f_dwa_controller.fir_filter_design import (
     coefficient_fingerprint,
     design_fir_coefficients,
+    design_fir_coefficients_for_cutoff,
     design_fir_coefficients_from_spec,
-    FIR_FILTER_DESIGNS,
     FirFilterDesign,
     inject_fir_coefficients,
 )
@@ -44,18 +43,19 @@ def _load_f_dwa_parameters():
     return yaml.safe_load(CONFIG_PATH.read_text(encoding='utf-8'))
 
 
-def test_source_yaml_contains_design_name_not_coefficients():
+def test_source_yaml_contains_numeric_cutoff_not_coefficients():
     parameters = _load_f_dwa_parameters()
     follow_path = parameters['controller_server']['ros__parameters'][
         'FollowPath'
     ]
 
-    assert follow_path['fir_design_profile'] == 'f8'
+    assert follow_path['fir_cutoff_frequency_hz'] == pytest.approx(1.2)
+    assert 'fir_design_profile' not in follow_path
     assert 'fir_coefficients' not in follow_path
     assert 'fir_coefficients_generated' not in follow_path
 
 
-def test_named_f8_is_generated_before_controller_start():
+def test_numeric_1_2_hz_filter_is_generated_before_controller_start():
     parameters = _load_f_dwa_parameters()
 
     report = inject_fir_coefficients(parameters)
@@ -65,7 +65,7 @@ def test_named_f8_is_generated_before_controller_start():
     coefficients = follow_path['fir_coefficients']
 
     assert report is not None
-    assert report.profile_name == 'f8'
+    assert report.profile_name == 'cutoff_1.2_hz'
     assert report.requested_taps == 91
     assert report.effective_taps == 46
     assert report.sample_frequency_hz == pytest.approx(20.0)
@@ -80,6 +80,7 @@ def test_named_f8_is_generated_before_controller_start():
     assert sum(coefficients) == pytest.approx(1.0, abs=1.0e-12)
     assert follow_path['fir_coefficients_generated'] is True
     assert 'fir_design_profile' not in follow_path
+    assert follow_path['fir_cutoff_frequency_hz'] == pytest.approx(1.2)
     assert (
         coefficient_fingerprint(coefficients)
         == ROS1_F8_FINGERPRINT_12_DECIMALS
@@ -101,8 +102,8 @@ def test_f9_open_loop_step_response_is_faster_but_overshoots_more():
     f8_report = inject_fir_coefficients(f8_parameters)
     f9_parameters = _load_f_dwa_parameters()
     f9_parameters['controller_server']['ros__parameters']['FollowPath'][
-        'fir_design_profile'
-    ] = 'f9'
+        'fir_cutoff_frequency_hz'
+    ] = 2.0
     f9_report = inject_fir_coefficients(f9_parameters)
 
     assert f8_report is not None
@@ -131,19 +132,17 @@ def test_attenuation_bands_can_be_defined_in_python():
     assert sum(coefficients) == pytest.approx(1.0, abs=1.0e-12)
 
 
-def test_each_startup_regenerates_the_current_python_profile(monkeypatch):
+def test_each_startup_regenerates_the_current_numeric_cutoff():
     first_parameters = _load_f_dwa_parameters()
     first_report = inject_fir_coefficients(first_parameters)
     first_coefficients = first_parameters['controller_server'][
         'ros__parameters'
     ]['FollowPath']['fir_coefficients']
 
-    monkeypatch.setitem(
-        FIR_FILTER_DESIGNS,
-        'f8',
-        replace(FIR_FILTER_DESIGNS['f8'], cutoff_hz=1.0),
-    )
     next_parameters = _load_f_dwa_parameters()
+    next_parameters['controller_server']['ros__parameters']['FollowPath'][
+        'fir_cutoff_frequency_hz'
+    ] = 1.0
     next_report = inject_fir_coefficients(next_parameters)
     next_coefficients = next_parameters['controller_server'][
         'ros__parameters'
@@ -153,6 +152,12 @@ def test_each_startup_regenerates_the_current_python_profile(monkeypatch):
     assert next_report is not None
     assert first_coefficients != next_coefficients
     assert first_report.fingerprint != next_report.fingerprint
+
+
+def test_numeric_cutoff_matches_legacy_f8_coefficients():
+    assert design_fir_coefficients_for_cutoff(1.2) == pytest.approx(
+        design_fir_coefficients('f8'), abs=1.0e-15
+    )
 
 
 def test_direct_yaml_coefficients_are_rejected():

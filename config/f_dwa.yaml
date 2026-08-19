@@ -16,15 +16,15 @@ controller_server:
       fir_prediction_pulse_duration: 0.15
       # fir_prediction_pulse_duration: 0.30  # longer-pulse ablation
 
-      # Python generates coefficients before Nav2 starts. The named f8 design
-      # preserves the ROS 1 profile, including its 20 Hz design sample rate.
-      fir_design_profile: "f8"
+      # Python generates coefficients before Nav2 starts. A 1.2 Hz cutoff
+      # preserves the former F8 design at the established 20 Hz design rate.
+      fir_cutoff_frequency_hz: 1.2
 
       # Existing ROS 1 design-family change patterns. A wider allowed motion
       # band remains an ablation rather than an assumed agility improvement.
       # In the 2026-07-30 ground-truth Env2 diagnostic, f9 was slower than f8.
-      # fir_design_profile: "f7"  # 0.5 Hz: strongest smoothing
-      # fir_design_profile: "f9"  # 2.0 Hz: widest-band profile
+      # fir_cutoff_frequency_hz: 0.5  # former F7: strongest smoothing
+      # fir_cutoff_frequency_hz: 2.0  # former F9: widest-band profile
       #
       # Paper-design change pattern:
       # fir_design_profile: "paper"

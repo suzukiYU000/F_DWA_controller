@@ -79,6 +79,24 @@ controller_server:
       # stop suffix. NoValidControl is reported by upstream Nav2, while the
       # common candidate set and physical-footprint gate remain observable.
       enable_no_valid_control_deceleration_fallback: false
+      # The research launch enables these two constraints only in Simulation.
+      # Real-WHILL profiles remain unchanged until separately qualified.
+      enable_clearance_constraint: false
+      clearance_constraint_critic_name: "FootprintClearance"
+      clearance_constraint_trigger_critic_name: "FootprintClearance"
+      # Epsilon-constraint boundary for normalized footprint-clearance risk.
+      # Inside this admissible set, the existing path/progress objective
+      # selects the command, avoiding the trivial minimum-risk stop solution.
+      clearance_constraint_admissible_risk: 0.05
+      # Negative preserves the legacy behavior in which the admissible-risk
+      # boundary also activates the constraint. Simulation overrides this to
+      # zero so the first positive LaserScan-only risk activates it early.
+      clearance_constraint_trigger_risk: -1.0
+      # FootprintClearance is normalized to [0, 1]. Candidates in the same
+      # one-percent violation band above the epsilon boundary retain the
+      # existing weighted-score ordering; a lower violation band takes
+      # priority over path and goal following.
+      clearance_constraint_risk_resolution: 0.01
       # F-8's 46 effective taps retain 2.3 s of raw-input history at 20 Hz.
       # Twelve seconds lets the projected stop drain that state after braking;
       # this is only a search bound, and the generated sequence ends as soon

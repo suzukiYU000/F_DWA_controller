@@ -47,10 +47,10 @@ Command quantization and stop capture are separate. Simulation defaults to
 to finish a planned stop and clear its native state. This preserves F-8's small
 startup increments. Recovery candidates that start inside the certificate
 margin and move outward remain pending and are disabled by default.
-F-DWA defaults to the named ROS 1 F-8 low-pass design. Its coefficients are
-generated deterministically by Python before Nav2 starts, so no source YAML
-contains a coefficient vector. Alternative design names remain as commented
-patterns in `config/f_dwa.yaml`.
+F-DWA defaults to a numeric 1.2 Hz low-pass cutoff, which preserves the ROS 1
+F-8 design. Its coefficients are generated deterministically by Python before
+Nav2 starts, so no source YAML contains a coefficient vector. The GUI accepts
+the cutoff in Hz; the established tap count and 20 Hz design rate stay fixed.
 The nominal F-DWA rollout uses the ROS 1 finite-pulse action primitive: the
 sampled raw input is active for 0.15 s and is then zero for the remainder of
 the 2.4 s scoring horizon. Every horizon state is still checked against the
@@ -66,10 +66,11 @@ minimum-phase conversion. F-8 retains its historical 20 Hz design frequency,
 which also matches the common Nav2 Controller Server frequency. A design using
 a different frequency must receive a new name for experiment traceability.
 
-Every F-DWA research-launch startup regenerates the selected profile. No
+Every F-DWA research-launch startup regenerates the selected numeric design. No
 coefficient cache or previous temporary parameter file is reused. Coefficients
-remain frozen for the complete run; applying a changed design requires a fresh
-launch rather than an in-run lifecycle reactivation.
+remain frozen for the complete run. Between runs, the experiment GUI may set
+the cutoff, coefficients, and generated marker atomically; the trial-reset
+boundary then adopts them while no candidate evaluation or motion is active.
 
 ## Continuous simulation batches
 

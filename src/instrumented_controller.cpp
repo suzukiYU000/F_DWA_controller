@@ -47,12 +47,26 @@ void InstrumentedController::configure(
 
   primary_controller_ = controller_loader_.createUniqueInstance(primary_controller_type);
   primary_controller_->configure(parent, name_, std::move(tf), std::move(costmap_ros));
+  if (primary_controller_type == "dwb_core::DWBLocalPlanner") {
+    reset_trial_service_ = node->create_service<std_srvs::srv::Trigger>(
+      "~/" + name_ + "/reset_trial_state",
+      [this](
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+      {
+        std::lock_guard<std::mutex> lock(primary_controller_mutex_);
+        primary_controller_->reset();
+        response->success = true;
+        response->message = "DWB trial state and runtime horizon reloaded";
+      });
+  }
   publisher_ = node->create_publisher<f_dwa_controller::msg::ControllerComputation>(
     "~/computation_time", rclcpp::QoS(rclcpp::KeepLast(100)).reliable());
 }
 
 void InstrumentedController::cleanup()
 {
+  reset_trial_service_.reset();
   if (primary_controller_) {
     primary_controller_->cleanup();
   }
@@ -83,6 +97,7 @@ geometry_msgs::msg::TwistStamped InstrumentedController::computeVelocityCommands
   const geometry_msgs::msg::Twist & velocity,
   nav2_core::GoalChecker * goal_checker)
 {
+  std::lock_guard<std::mutex> lock(primary_controller_mutex_);
   const auto node = parent_.lock();
   if (!node) {
     throw std::runtime_error("Controller server node expired");
@@ -117,6 +132,7 @@ void InstrumentedController::setSpeedLimit(
 
 void InstrumentedController::reset()
 {
+  std::lock_guard<std::mutex> lock(primary_controller_mutex_);
   if (primary_controller_) {
     primary_controller_->reset();
   }

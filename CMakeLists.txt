@@ -145,6 +145,7 @@ ament_target_dependencies(${instrumentation_library_name}
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  std_srvs
   tf2_ros
 )
 

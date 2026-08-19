@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "dwb_core/dwb_local_planner.hpp"
+#include "f_dwa_controller/footprint_clearance_critic.hpp"
 #include "f_dwa_controller/issued_command_ledger.hpp"
 #include "f_dwa_controller/msg/command_dispatch.hpp"
 #include "f_dwa_controller/native_input_dynamics.hpp"
@@ -91,12 +92,25 @@ protected:
     double best_score,
     dwb_msgs::msg::TrajectoryScore & score,
     bool record_score_details,
-    bool * used_reserve_recovery = nullptr);
+    bool * used_reserve_recovery = nullptr,
+    std::optional<double> precomputed_clearance_risk = std::nullopt,
+    double * clearance_risk = nullptr);
   visualization_msgs::msg::MarkerArray build_candidate_markers(
     const dwb_msgs::msg::LocalPlanEvaluation & evaluation) const;
   static bool coalesce_stale_marker_publication(
     std::deque<DiagnosticPublication> & publications,
     DiagnosticPublication publication);
+  static uint64_t clearance_constraint_bucket(
+    double clearance_risk,
+    double admissible_risk,
+    double risk_resolution);
+  static bool clearance_constraint_prefers_candidate(
+    uint64_t candidate_risk_bucket,
+    uint64_t best_risk_bucket,
+    double candidate_total,
+    double best_total,
+    std::size_t candidate_canonical_index,
+    std::size_t best_canonical_index);
   static bool has_full_evaluation_capacity(
     std::size_t pending_full_evaluation_count);
 
@@ -198,6 +212,16 @@ private:
     transport_invalidation_client_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_trial_service_;
   bool certification_enabled_{false};
+  bool clearance_constraint_enabled_{false};
+  std::string clearance_constraint_critic_name_{"FootprintClearance"};
+  std::string clearance_constraint_trigger_critic_name_{
+    "FootprintClearance"};
+  double clearance_constraint_admissible_risk_{0.05};
+  double clearance_constraint_trigger_risk_{-1.0};
+  double clearance_constraint_risk_resolution_{0.01};
+  std::shared_ptr<FootprintClearanceCritic> clearance_constraint_critic_;
+  std::shared_ptr<FootprintClearanceCritic>
+  clearance_constraint_trigger_critic_;
   bool no_valid_control_deceleration_fallback_enabled_{false};
   bool nominal_delay_preview_enabled_{true};
   bool require_command_dispatch_state_{true};
