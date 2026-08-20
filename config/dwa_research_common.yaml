@@ -75,23 +75,24 @@ controller_server:
       # value equality so transport corruption cannot masquerade as safety.
       allow_safety_command_reduction: false
       certification_control_period: 0.05
-      # Primary V/A/J/F comparison: never generate or inject an additional
-      # stop suffix. NoValidControl is reported by upstream Nav2, while the
-      # common candidate set and physical-footprint gate remain observable.
-      enable_no_valid_control_deceleration_fallback: false
-      # The research launch enables these two constraints only in Simulation.
-      # Real-WHILL profiles remain unchanged until separately qualified.
-      enable_clearance_constraint: false
+      # Retain and revalidate a method-native deceleration suffix from the
+      # previous legal command. If the next cycle has no legal nominal
+      # trajectory, use this instead of falling straight through to Nav2's
+      # zero-velocity publication.
+      enable_no_valid_control_deceleration_fallback: true
+      # Prefer the lowest footprint-clearance-risk legal candidate whenever
+      # obstacle risk is present. The hard ObstacleFootprint gate below still
+      # rejects physical collisions and unknown/off-grid footprint crossings.
+      enable_clearance_constraint: true
       clearance_constraint_critic_name: "FootprintClearance"
       clearance_constraint_trigger_critic_name: "FootprintClearance"
       # Epsilon-constraint boundary for normalized footprint-clearance risk.
       # Inside this admissible set, the existing path/progress objective
       # selects the command, avoiding the trivial minimum-risk stop solution.
       clearance_constraint_admissible_risk: 0.05
-      # Negative preserves the legacy behavior in which the admissible-risk
-      # boundary also activates the constraint. Simulation overrides this to
-      # zero so the first positive LaserScan-only risk activates it early.
-      clearance_constraint_trigger_risk: -1.0
+      # Activate the constraint as soon as any positive risk is observed, so
+      # avoidance ranking starts before the admissible-risk boundary is crossed.
+      clearance_constraint_trigger_risk: 0.0
       # FootprintClearance is normalized to [0, 1]. Candidates in the same
       # one-percent violation band above the epsilon boundary retain the
       # existing weighted-score ordering; a lower violation band takes
