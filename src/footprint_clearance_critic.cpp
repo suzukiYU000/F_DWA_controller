@@ -172,7 +172,7 @@ void FootprintClearanceCritic::onInit()
   const auto plugins = costmap_ros_->getLayeredCostmap()->getPlugins();
   const auto find_costmap_layer =
     [plugins](const std::string & requested_name) ->
-    nav2_costmap_2d::Costmap2D *
+    nav2_costmap_2d::CostmapLayer *
     {
       for (const auto & plugin : *plugins) {
         const std::string & plugin_name = plugin->getName();
@@ -201,13 +201,57 @@ void FootprintClearanceCritic::onInit()
     }
   }
   if (!exclude_layer_.empty()) {
-    exclusion_costmap_ = find_costmap_layer(exclude_layer_);
-    if (!exclusion_costmap_) {
+    exclusion_costmap_layer_ = find_costmap_layer(exclude_layer_);
+    if (!exclusion_costmap_layer_) {
       throw std::runtime_error{
               "FootprintClearanceCritic exclude_layer was not found: " +
               exclude_layer_};
     }
+    exclusion_costmap_ = exclusion_costmap_layer_;
+    // A rolling master Costmap is expressed in its global frame, while a
+    // StaticLayer retains the original map grid and projects it only from
+    // updateCosts(). Querying that retained grid with rolling-frame
+    // coordinates silently misses every duplicate on a real AMCL stack.
+    // Reuse the layer's own projection path into a master-aligned scratch map.
+    project_exclusion_costmap_ =
+      costmap_ == costmap_ros_->getCostmap() &&
+      costmap_ros_->getLayeredCostmap()->isRolling();
   }
+}
+
+void FootprintClearanceCritic::refreshProjectedExclusionCostmap()
+{
+  if (!project_exclusion_costmap_ || !exclusion_costmap_layer_ ||
+    !costmap_)
+  {
+    return;
+  }
+  const unsigned int size_x = costmap_->getSizeInCellsX();
+  const unsigned int size_y = costmap_->getSizeInCellsY();
+  const double resolution = costmap_->getResolution();
+  if (size_x == 0u || size_y == 0u ||
+    !std::isfinite(resolution) || resolution <= 0.0)
+  {
+    return;
+  }
+  const double origin_x = costmap_->getOriginX();
+  const double origin_y = costmap_->getOriginY();
+  const bool geometry_changed =
+    projected_exclusion_costmap_.getSizeInCellsX() != size_x ||
+    projected_exclusion_costmap_.getSizeInCellsY() != size_y ||
+    projected_exclusion_costmap_.getResolution() != resolution;
+  if (geometry_changed) {
+    projected_exclusion_costmap_.resizeMap(
+      size_x, size_y, resolution, origin_x, origin_y);
+  } else {
+    projected_exclusion_costmap_.updateOrigin(origin_x, origin_y);
+  }
+  projected_exclusion_costmap_.resetMapToValue(
+    0u, 0u, size_x, size_y, nav2_costmap_2d::FREE_SPACE);
+  exclusion_costmap_layer_->updateCosts(
+    projected_exclusion_costmap_, 0, 0,
+    static_cast<int>(size_x), static_cast<int>(size_y));
+  exclusion_costmap_ = &projected_exclusion_costmap_;
 }
 
 bool FootprintClearanceCritic::prepare(
@@ -239,6 +283,7 @@ bool FootprintClearanceCritic::prepare(
   if (!refreshFootprintBoundarySamples()) {
     return false;
   }
+  refreshProjectedExclusionCostmap();
   expanded_footprints_.clear();
   expanded_footprints_.reserve(static_cast<std::size_t>(clearance_bands_));
   for (int band = 1; band <= clearance_bands_; ++band) {

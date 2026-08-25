@@ -617,6 +617,118 @@ TEST_F(CommandDelayNodeTest, NormalTwentyTicksMeetPacingRateAndMinimumInterval)
   executor.remove_node(transport);
 }
 
+TEST_F(CommandDelayNodeTest, VelocityResponseFiltersGazeboButPreservesTargetLedger)
+{
+  constexpr double kResponseGain = 0.5;
+  const std::string prefix = "/f_dwa_controller_response_transport_test";
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(
+    std::vector<rclcpp::Parameter>{
+      rclcpp::Parameter("input_topic", prefix + "/input"),
+      rclcpp::Parameter("output_topic", prefix + "/output"),
+      rclcpp::Parameter("applied_topic", prefix + "/applied"),
+      rclcpp::Parameter("dispatch_topic", prefix + "/dispatch"),
+      rclcpp::Parameter("transport_valid_topic", prefix + "/valid"),
+      rclcpp::Parameter("transport_stopped_topic", prefix + "/stopped"),
+      rclcpp::Parameter("diagnostics_topic", prefix + "/diagnostics"),
+      rclcpp::Parameter("publish_frequency_hz", 20.0),
+      rclcpp::Parameter("min_delay_ms", 0.0),
+      rclcpp::Parameter("max_delay_ms", 0.0),
+      rclcpp::Parameter("mean_delay_ms", 0.0),
+      rclcpp::Parameter("delay_stddev_ms", 0.0),
+      rclcpp::Parameter("enable_velocity_response_model", true),
+      rclcpp::Parameter(
+        "linear_velocity_response_dead_time_seconds", 0.0),
+      rclcpp::Parameter(
+        "linear_velocity_response_time_constant_seconds", 0.2),
+      rclcpp::Parameter("linear_velocity_response_gain", kResponseGain),
+      rclcpp::Parameter(
+        "angular_velocity_response_dead_time_seconds", 0.0),
+      rclcpp::Parameter(
+        "angular_velocity_response_time_constant_seconds", 0.2),
+      rclcpp::Parameter("angular_velocity_response_gain", kResponseGain)});
+
+  const auto transport = std::make_shared<CommandDelayNode>(options);
+  const auto client_node =
+    std::make_shared<rclcpp::Node>("velocity_response_transport_client_test");
+  const auto command_publisher =
+    client_node->create_publisher<geometry_msgs::msg::Twist>(
+    prefix + "/input", 10);
+  std::vector<geometry_msgs::msg::Twist> outputs;
+  std::vector<geometry_msgs::msg::Twist> applied_targets;
+  std::vector<f_dwa_controller::msg::CommandDispatch> dispatches;
+  auto output_subscriber =
+    client_node->create_subscription<geometry_msgs::msg::Twist>(
+    prefix + "/output", 10,
+    [&outputs](const geometry_msgs::msg::Twist::SharedPtr message) {
+      if (message) {
+        outputs.push_back(*message);
+      }
+    });
+  auto applied_subscriber =
+    client_node->create_subscription<geometry_msgs::msg::Twist>(
+    prefix + "/applied", 10,
+    [&applied_targets](const geometry_msgs::msg::Twist::SharedPtr message) {
+      if (message) {
+        applied_targets.push_back(*message);
+      }
+    });
+  auto dispatch_subscriber =
+    client_node->create_subscription<f_dwa_controller::msg::CommandDispatch>(
+    prefix + "/dispatch", rclcpp::QoS(10).reliable().transient_local(),
+    [&dispatches](
+      const f_dwa_controller::msg::CommandDispatch::SharedPtr message) {
+      if (message && message->has_sequence) {
+        dispatches.push_back(*message);
+      }
+    });
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(transport);
+  executor.add_node(client_node);
+  const auto match_deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (command_publisher->get_subscription_count() == 0u &&
+    std::chrono::steady_clock::now() < match_deadline)
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GT(command_publisher->get_subscription_count(), 0u);
+
+  geometry_msgs::msg::Twist target;
+  target.linear.x = 1.0;
+  target.angular.z = 1.0;
+  command_publisher->publish(target);
+  const auto response_deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while ((dispatches.empty() || outputs.empty() || applied_targets.empty() ||
+    outputs.back().linear.x <= 0.0) &&
+    std::chrono::steady_clock::now() < response_deadline)
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  ASSERT_FALSE(dispatches.empty());
+  ASSERT_FALSE(outputs.empty());
+  ASSERT_FALSE(applied_targets.empty());
+  EXPECT_DOUBLE_EQ(dispatches.back().command.linear.x, 1.0);
+  EXPECT_DOUBLE_EQ(dispatches.back().command.angular.z, 1.0);
+  EXPECT_DOUBLE_EQ(applied_targets.back().linear.x, 1.0);
+  EXPECT_DOUBLE_EQ(applied_targets.back().angular.z, 1.0);
+  EXPECT_GT(outputs.back().linear.x, 0.0);
+  EXPECT_LT(outputs.back().linear.x, kResponseGain);
+  EXPECT_GT(outputs.back().angular.z, 0.0);
+  EXPECT_LT(outputs.back().angular.z, kResponseGain);
+
+  dispatch_subscriber.reset();
+  applied_subscriber.reset();
+  output_subscriber.reset();
+  executor.remove_node(client_node);
+  executor.remove_node(transport);
+}
+
 TEST_F(CommandDelayNodeTest, LateTimerCallbackReanchorsAtRobotHandoff)
 {
   constexpr double kPeriodSeconds = 0.03;

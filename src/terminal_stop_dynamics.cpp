@@ -360,6 +360,18 @@ AxisLimits directional_limits(
   return directional;
 }
 
+AxisLimits tightened_limits(const AxisLimits & limits)
+{
+  AxisLimits tightened = limits;
+  tightened.velocity_min += kBoundTightening;
+  tightened.velocity_max -= kBoundTightening;
+  tightened.acceleration_min += kBoundTightening;
+  tightened.acceleration_max -= kBoundTightening;
+  tightened.native_input_min += kBoundTightening;
+  tightened.native_input_max -= kBoundTightening;
+  return tightened;
+}
+
 double jerk_release_velocity_loss(
   const double signed_acceleration,
   const double signed_release_jerk,
@@ -626,7 +638,8 @@ StopSequence generate_fir_stop_sequence(
   const int maximum_steps,
   const double stop_velocity_threshold,
   const bool record_fir_histories,
-  const FirStopCoefficientResponse * coefficient_response)
+  const FirStopCoefficientResponse * coefficient_response,
+  const bool allow_velocity_direction_reversal)
 {
   StopSequence sequence;
   if (!stop_problem_is_valid(
@@ -661,7 +674,8 @@ StopSequence generate_fir_stop_sequence(
   }
   const bool positive_direction = positive_stop_direction(direction_state);
   const AxisLimits stop_limits =
-    directional_limits(limits, positive_direction);
+    allow_velocity_direction_reversal ?
+    tightened_limits(limits) : directional_limits(limits, positive_direction);
   AxisState state = initial_state;
   sequence.native_inputs.reserve(static_cast<std::size_t>(maximum_steps));
   sequence.states.reserve(static_cast<std::size_t>(maximum_steps));
@@ -696,8 +710,11 @@ StopSequence generate_fir_stop_sequence(
     }
     double requested_input = 0.0;
     if (!zero_input_tail_active) {
+      const bool current_positive_direction =
+        allow_velocity_direction_reversal ?
+        positive_stop_direction(state) : positive_direction;
       const double requested_acceleration =
-        positive_direction ? acceleration_lower : acceleration_upper;
+        current_positive_direction ? acceleration_lower : acceleration_upper;
       const double free_acceleration =
         held_response.zero_input_acceleration();
       requested_input =

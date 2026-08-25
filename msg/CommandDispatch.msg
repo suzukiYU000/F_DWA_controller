@@ -1,7 +1,7 @@
 # Observable software dispatch time. This is not a motor-actuation timestamp.
 std_msgs/Header header
 # Time at which this exact command entered the delayed transport FIFO. Unlike
-# header.stamp, this precedes the sampled 60--80 ms delay and therefore
+# header.stamp, this precedes the sampled software dispatch delay and therefore
 # disambiguates later Controller results with the same numeric value.
 builtin_interfaces/Time received_at
 # Monotonic-clock epoch at FIFO reception for sequenced commands, or at the

@@ -31,7 +31,7 @@ namespace f_dwa_controller
  * penalty varies continuously with clearance instead of quantizing candidate
  * differences into the diagnostic footprint bands. prepare() refreshes a
  * linear-time Euclidean distance field from the dynamic lethal source after
- * exact static-cell exclusion, reusing it only while the exact input mask and
+ * bounded static-cell exclusion, reusing it only while the exact input mask and
  * grid geometry remain unchanged. Scoring queries that field along footprint
  * boundary probes instead of filling every expanded polygon. The conservative
  * cell/probe correction prevents obstacles between probes from disappearing.
@@ -60,6 +60,8 @@ public:
 protected:
   bool excludedByStaticLayer(double world_x, double world_y) const;
 
+  void refreshProjectedExclusionCostmap();
+
   bool refreshPenalizedCellMask();
 
   bool refreshFootprintBoundarySamples();
@@ -76,6 +78,9 @@ protected:
 
   nav2_costmap_2d::Costmap2D * costmap_{nullptr};
   nav2_costmap_2d::Costmap2D * exclusion_costmap_{nullptr};
+  nav2_costmap_2d::CostmapLayer * exclusion_costmap_layer_{nullptr};
+  nav2_costmap_2d::Costmap2D projected_exclusion_costmap_;
+  bool project_exclusion_costmap_{false};
   nav_2d_msgs::msg::Path2D global_plan_;
   PreparedPlanGeometry prepared_plan_geometry_;
   std::string source_layer_;

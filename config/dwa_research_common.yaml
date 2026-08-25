@@ -57,12 +57,37 @@ controller_server:
       # the common local costmap and prevents a candidate from being scored
       # against an artificially clipped Path endpoint.
       forward_prune_distance: 4.0
+      # Keep enough path behind the closest point to recover from the largest
+      # measured real-machine deviation (2.24 m). This prevents DWB from
+      # pruning the transformed path to zero and publishing an abrupt stop
+      # while the endpoint-admissible controller is decelerating or returning.
+      prune_distance: 4.0
       discretize_by_time: true
       time_granularity: 0.05
       linear_granularity: 0.05
       angular_granularity: 0.025
       include_last_point: true
       enable_nominal_delay_preview: true
+      # Standard DWA starts each dynamic window from measured odometry. Keep
+      # dispatch/native ledgers for known future transport and A/J/F state, but
+      # do not assume that the physical WHILL has already reached the last
+      # robot-facing command.
+      use_observed_velocity_for_activation_state: true
+      # Both modes enable this common plant model in launch. The parameters
+      # were identified from post-Collision-Monitor command and odometry data
+      # in run_20260823_221202/run_20260823_221327 and independently validated
+      # by run_20260825_163606/run_20260825_163730. Simulation also applies the
+      # same response before Gazebo, so candidate activation and plant motion
+      # use one model rather than mode-specific dynamics.
+      enable_velocity_response_prediction: false
+      velocity_response_prediction_seconds: 0.12
+      velocity_response_integration_step_seconds: 0.01
+      linear_velocity_response_dead_time_seconds: 0.035
+      linear_velocity_response_time_constant_seconds: 0.02
+      linear_velocity_response_gain: 1.0
+      angular_velocity_response_dead_time_seconds: 0.015
+      angular_velocity_response_time_constant_seconds: 0.085
+      angular_velocity_response_gain: 0.95
       nominal_delay_preview_seconds: 0.07
       # This is a robot-observable software dispatch event. It does not claim
       # knowledge of the internal motor actuation instant.
@@ -78,26 +103,67 @@ controller_server:
       # Retain and revalidate a method-native deceleration suffix from the
       # previous legal command. If the next cycle has no legal nominal
       # trajectory, use this instead of falling straight through to Nav2's
-      # zero-velocity publication.
+      # zero-velocity publication. If a new obstacle invalidates the complete
+      # suffix, dispatch its next swept-footprint-safe 50 ms step and replan.
       enable_no_valid_control_deceleration_fallback: true
-      # Prefer the lowest footprint-clearance-risk legal candidate whenever
-      # obstacle risk is present. The hard ObstacleFootprint gate below still
-      # rejects physical collisions and unknown/off-grid footprint crossings.
+      # Standard Dynamic Window admissibility: a candidate may be selected
+      # only when issuing it now and then applying that method's native
+      # deceleration can stop the physical WHILL footprint without entering a
+      # lethal/unknown cell. This uses no extra certificate reserve and is
+      # common to V/A/J/F, so faster ranking cannot consume the last braking
+      # room before an obstacle.
+      enable_stop_admissibility: true
+      # When an unexplained live-sensor obstacle is present, constrain its
+      # dynamic clearance risk so acceleration-limited steering accumulates
+      # before the physical stop gate. Outside that context, static clearance
+      # remains only the bounded weighted preference below.
       enable_clearance_constraint: true
-      clearance_constraint_critic_name: "FootprintClearance"
-      clearance_constraint_trigger_critic_name: "FootprintClearance"
+      clearance_constraint_critic_name: "DynamicClearance"
+      # Start constrained ranking only for sensor observations that cannot be
+      # explained by the static map. This prevents a mapped doorway wall from
+      # activating constrained rank and forcing the Controller away from a
+      # collision-free reference turn.
+      clearance_constraint_trigger_critic_name: "DynamicClearance"
+      # During dynamic avoidance, reject only the high-risk part of the static
+      # map objective before comparing dynamic risk. This prevents a
+      # sensor-only detour from ending against a known wall without restoring
+      # the doorway bias caused by always minimizing static clearance.
+      clearance_constraint_guard_critic_name: "StaticClearance"
+      clearance_constraint_guard_admissible_risk: 0.80
+      clearance_constraint_guard_risk_resolution: 0.02
       # Epsilon-constraint boundary for normalized footprint-clearance risk.
-      # Inside this admissible set, the existing path/progress objective
-      # selects the command, avoiding the trivial minimum-risk stop solution.
-      clearance_constraint_admissible_risk: 0.05
-      # Activate the constraint as soon as any positive risk is observed, so
-      # avoidance ranking starts before the admissible-risk boundary is crossed.
-      clearance_constraint_trigger_risk: 0.0
-      # FootprintClearance is normalized to [0, 1]. Candidates in the same
-      # one-percent violation band above the epsilon boundary retain the
-      # existing weighted-score ordering; a lower violation band takes
-      # priority over path and goal following.
-      clearance_constraint_risk_resolution: 0.01
+      # Candidates at or below the measured dynamic background ceiling remain
+      # one feasible set and are ranked by the ordinary DWB objective. Above
+      # it, the Controller must accumulate the small risk improvement produced
+      # by each acceleration-limited V-DWA steering step. In the LB_C replay,
+      # keeping this boundary at 0.65 treated risks 0.563--0.573 as equal and
+      # delayed the bypass until no translating stop was admissible. The
+      # corrected replay exposed master clearance risks 0.544--0.551 while
+      # DynamicClearance was above the measured background ceiling. Resolving
+      # that band makes V-DWA accumulate the available steering early.
+      clearance_constraint_admissible_risk: 0.50
+      # Start avoidance before the physical footprint reaches the obstacle.
+      # In the fixed-obstacle replay, 0.75 activated only after clearance had
+      # fallen to 0.085 m, leaving no translating stop-admissible candidate.
+      # A 0.50 trigger clears the measured 0.485 dynamic background floor.
+      # Hard footprint and full-stop checks remain active at every risk level.
+      clearance_constraint_trigger_risk: 0.50
+      # Compare unavoidable dynamic-risk violations in half-percent bands.
+      # This separates the 0.563 and 0.568 candidates available in one V-DWA
+      # dynamic window while still grouping sub-resolution sensor noise.
+      clearance_constraint_risk_resolution: 0.005
+      # Outside the terminal region, first require a legal candidate to move
+      # toward the observable Path subgoal or turn toward its bearing. One
+      # half costmap cell and one angular discretization step are sufficient
+      # evidence of progress. The former 0.10 m / 0.15 rad thresholds rejected
+      # every smooth F-DWA turn candidate before its FIR response developed,
+      # forcing retained deceleration at the 2026-08-23 22:13:27 replay turn.
+      # If none meets these resolution-level bounds, retain the conventional
+      # weighted DWB ordering among hard-legal, stop-admissible candidates;
+      # minimum-risk-only ordering can otherwise steer away indefinitely.
+      clearance_constraint_minimum_subgoal_distance_progress: 0.025
+      clearance_constraint_minimum_subgoal_heading_progress: 0.025
+      clearance_constraint_motion_preference_goal_distance: 0.75
       # F-8's 46 effective taps retain 2.3 s of raw-input history at 20 Hz.
       # Twelve seconds lets the projected stop drain that state after braking;
       # this is only a search bound, and the generated sequence ends as soon
@@ -114,25 +180,27 @@ controller_server:
       terminal_stop_goal_distance_scale: 24.0
       terminal_stop_distance_target: path_progress
       terminal_stop_path_lookahead_distance: 1.5
-      # The normal V/A/J/F comparison must not generate or retain an additional
-      # terminal-stop sequence. A positive value is reserved for an explicitly
-      # reported terminal-stop-policy ablation.
-      terminal_stop_goal_capture_distance: 0.0
+      # Once a method-native predicted stop ends inside the GoalChecker's
+      # position window, retain and revalidate that deceleration suffix. This
+      # prevents a fast trajectory from crossing and pruning away the final
+      # Path point before the stopped GoalChecker can accept it.
+      terminal_stop_goal_capture_distance: 0.25
       # Ignore terminal yaw when retaining a certified stop. The periodic yaw
       # error is at most pi, matching the position-and-speed GoalChecker.
       terminal_stop_goal_capture_yaw_tolerance: 3.141592653589793
       stop_capture_velocity: 0.01
-      # Certification rounds this upward to complete 50 ms controller ticks
-      # (70 ms -> 2 ticks) for every DWB-derived method.
-      terminal_stop_command_delay_seconds: 0.07
-      # This is an optional certificate reserve outside the measured physical
-      # footprint. Recovery from reserve intrusion is off by
-      # default and will be implemented as a separate switchable policy.
-      minimum_certified_margin: 0.02
+      # Shared measured response horizon for simulation and the physical WHILL.
+      # Certification rounds 120 ms upward to three 50 ms controller ticks.
+      terminal_stop_command_delay_seconds: 0.12
+      # Reserve one local-costmap cell outside the measured physical footprint
+      # when certifying the complete stop. The 0.02 m reserve still allowed the
+      # delayed F-DWA response to consume all stopping room at the mapped
+      # doorway in the Real203039 and Real203249 regression simulations.
+      minimum_certified_margin: 0.05
       # Optional reserve-only recovery never relaxes the physical
       # planning footprint. It is an ablation and remains off for the primary
       # comparison; when enabled, the candidate must move toward and clear
-      # only the additional 0.02 m reserve.
+      # only the additional 0.05 m reserve.
       enable_reserve_recovery: false
       reserve_recovery_hysteresis: true
       # At 0.05 m costmap resolution, checking at half-cell swept distance
@@ -185,6 +253,8 @@ controller_server:
         # Soft footprint-aware clearance ranking. This never changes the
         # physical footprint or hard collision rejection; the GUI exposes
         # only its zero-cost margin for common V/A/J/F/DWB comparisons.
+        - DynamicClearance
+        - StaticClearance
         - FootprintClearance
         # The common certification layer performs exact swept-footprint safety
         # checks. Use the standard center-cell critic only for the continuous
@@ -220,10 +290,17 @@ controller_server:
       # 0.6 m/s x 1.6 s. Near the goal, the critic automatically uses the
       # shorter remaining Path length.
       TrajectoryProgress.lookahead_distance: 0.96
-      TrajectoryProgress.scale: 12.0
+      # Keep progress at the previously validated value. In
+      # run_20260823_204411 at the first bend, candidate 111 was in the same
+      # hard-legality and 0.01 clearance-risk bucket as selected candidate 22,
+      # but its 0.600 m/s mean speed lost by only 0.848 total cost to a
+      # 0.379 m/s candidate. Raising only the common speed term from 9 to 13
+      # reverses that pair by 0.036 without weakening obstacle legality or
+      # clearance ordering.
+      TrajectoryProgress.scale: 25.0
       MeanSpeed.class: "f_dwa_controller::MeanSpeedCritic"
       MeanSpeed.target_speed: 0.6
-      MeanSpeed.scale: 4.0
+      MeanSpeed.scale: 13.0
       ForwardObstacle.class: "f_dwa_controller::ForwardObstacleCritic"
       # Common total spatial observation distance. Unlike the former endpoint
       # +2 m ray, this does not grow when sim_time changes.
@@ -231,7 +308,10 @@ controller_server:
       # Build every soft risk path from the same native-model prefix. Longer
       # 1.6/1.8 s rollout suffixes remain available to the physical hard gate,
       # but cannot change this 2.5 m terminal-value prediction.
-      ForwardObstacle.risk_seed_time: 1.4
+      # Keep the complete default Controller prediction before extending the
+      # candidate along the Path. Launch overrides this with the GUI-selected
+      # prediction time so gradual V-DWA steering remains observable.
+      ForwardObstacle.risk_seed_time: 2.5
       # After the common 1.4 s native prefix, preserve the candidate's spatial
       # turn for a fixed 0.50 m maneuver phase, then merge its heading back to
       # the plan over this common physical distance. The complete 0.50 + 1.0 m
@@ -249,19 +329,69 @@ controller_server:
       # same score and cannot initiate an early detour.
       ForwardObstacle.peak_weight: 0.25
       ForwardObstacle.scale: 8.0
+      # Dynamic-only risk starts the epsilon-constraint mode but has zero
+      # weighted cost. StaticClearance supplies a separate known-wall guard,
+      # while the bounded FootprintClearance cost remains in the ordinary DWB
+      # objective.
+      DynamicClearance.class: "f_dwa_controller::FootprintClearanceCritic"
+      DynamicClearance.clearance_margin: 0.45
+      DynamicClearance.clearance_bands: 9
+      DynamicClearance.risk_distance: 2.5
+      DynamicClearance.risk_seed_time: 2.5
+      DynamicClearance.heading_relaxation_distance: 1.0
+      DynamicClearance.sample_resolution: 0.10
+      DynamicClearance.source_layer: ""
+      # In the 2026-08-25 real-fidelity replay, 703/704 live lethal cells in a
+      # no-obstacle frame were within 0.15 m of a mapped wall; the maximum
+      # registration/rasterization offset was 0.178 m. Round that measured
+      # bound to 0.18 m, rather than 0.20 m: the latter hid the 0.20 m
+      # simulation/world mismatch that caused two NoValidControl zeros in the
+      # Real202818 replay. Hard collision rejection and the master-costmap
+      # soft-clearance objective still retain every sensor return.
+      DynamicClearance.exclude_layer: "static_layer"
+      DynamicClearance.exclude_layer_tolerance: 0.18
+      DynamicClearance.apply_exclude_tolerance_on_aligned_grids: true
+      DynamicClearance.penalty_power: 3.0
+      DynamicClearance.peak_weight: 0.25
+      DynamicClearance.scale: 0.0
+      # Static-only risk is evaluated solely as the avoidance-context guard.
+      # It never contributes weighted cost and cannot activate the constraint
+      # at an ordinary mapped doorway.
+      StaticClearance.class: "f_dwa_controller::FootprintClearanceCritic"
+      StaticClearance.clearance_margin: 0.45
+      StaticClearance.clearance_bands: 9
+      StaticClearance.risk_distance: 2.5
+      StaticClearance.risk_seed_time: 2.5
+      StaticClearance.heading_relaxation_distance: 1.0
+      StaticClearance.sample_resolution: 0.10
+      StaticClearance.source_layer: "static_layer"
+      StaticClearance.exclude_layer: ""
+      StaticClearance.exclude_layer_tolerance: 0.0
+      StaticClearance.apply_exclude_tolerance_on_aligned_grids: false
+      StaticClearance.penalty_power: 3.0
+      StaticClearance.peak_weight: 0.25
+      StaticClearance.scale: 0.0
+      # This bounded soft term keeps useful clearance from mapped walls. It is
+      # deliberately weaker than path/goal alignment: on Real203039 and
+      # Real203249, scale 75 assigned roughly 52 cost to the correct doorway
+      # turn and selected the opposite steering direction for five seconds.
+      # Dynamic obstacles use the independent epsilon constraint above.
       FootprintClearance.class: "f_dwa_controller::FootprintClearanceCritic"
       FootprintClearance.clearance_margin: 0.45
       FootprintClearance.clearance_bands: 9
       FootprintClearance.risk_distance: 2.5
-      FootprintClearance.risk_seed_time: 1.4
+      FootprintClearance.risk_seed_time: 2.5
       FootprintClearance.heading_relaxation_distance: 1.0
       FootprintClearance.sample_resolution: 0.10
       FootprintClearance.source_layer: ""
       FootprintClearance.exclude_layer: ""
       FootprintClearance.exclude_layer_tolerance: 0.0
+      FootprintClearance.apply_exclude_tolerance_on_aligned_grids: false
       FootprintClearance.penalty_power: 3.0
       FootprintClearance.peak_weight: 0.25
-      FootprintClearance.scale: 75.0
+      # A full-scale static-clearance difference contributes at most 8 cost.
+      # Physical collision and complete-stop admissibility remain hard gates.
+      FootprintClearance.scale: 8.0
       ObstacleFootprint.class: "f_dwa_controller::HorizonObstacleFootprintCritic"
       # Deprecated compatibility input: this value is still validated but no
       # longer truncates the hard gate or contributes a soft score. The critic
@@ -281,14 +411,17 @@ controller_server:
       # Preserve the stopping behavior without ranking the configured goal
       # orientation. Angular motion is instead reduced around the current yaw.
       RotateToGoal.ignore_goal_orientation: true
-      # Do not latch outside the GoalChecker window.  A positive release
-      # margin would create another position band where translation is
-      # rejected although the non-stateful GoalChecker cannot yet succeed.
-      RotateToGoal.xy_goal_tolerance_release_margin: 0.0
+      # Once the robot enters the GoalChecker window, keep terminal braking
+      # latched until the critic is reset for a new Path. Releasing immediately
+      # after a high-speed crossing allowed the controller to accelerate away
+      # from the final Path point before the stopped GoalChecker could accept.
+      RotateToGoal.xy_goal_tolerance_release_margin: -1.0
       RotateToGoal.lookahead_time: 1.25
       TerminalApproach.class: "f_dwa_controller::TerminalApproachCritic"
-      # Keep obstacle/path ranking unchanged outside the terminal region. The
-      # smooth 1.5--0.65 m transition avoids a discontinuous command choice.
+      # Keep obstacle/path ranking unchanged outside the stopping envelope.
+      # The launch/runtime layer replaces 1.5 m with
+      # v_max^2/(2*0.15) + 0.07*v_max + 0.25; at 0.8 m/s this is 2.439 m.
+      # The smooth transition avoids a discontinuous command choice.
       # Every horizon evaluates the same 1.4 s rollout prefix and projects its
       # measured speed from that pose to a soft predicted stopping position.
       TerminalApproach.evaluation_time: 1.4
@@ -299,7 +432,10 @@ controller_server:
       # the physical 0.6 m/s^2 value underestimated the observed stopping
       # distance by four to six times and activated useful ranking too late.
       TerminalApproach.reference_deceleration: 0.15
-      TerminalApproach.scale: 24.0
+      # The progress and mean-speed terms were doubled after the recorded
+      # low-speed run. Preserve the prior terminal/forward objective ratio so
+      # that extra progress does not overpower a stop-capable candidate.
+      TerminalApproach.scale: 48.0
 
 velocity_smoother:
   ros__parameters:
@@ -335,6 +471,14 @@ local_costmap:
       resolution: 0.05
       width: 10
       height: 10
+      # Known walls must be present before they enter the live sensor field of
+      # view. Otherwise a static wall appears as a new voxel obstacle after a
+      # candidate has already consumed its braking room, which can force Nav2's
+      # NoValidControl zero despite an unchanged map and environment.
+      plugins: ["static_layer", "voxel_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
       # Rectangle is the measured physical research footprint. Clearance
       # outside it is represented by the inflation gradient below.
       footprint: "[[-0.2, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.2, 0.3]]"

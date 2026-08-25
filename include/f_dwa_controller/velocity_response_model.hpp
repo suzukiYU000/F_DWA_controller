@@ -18,55 +18,52 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#ifndef F_DWA_CONTROLLER__PLANNING_SNAPSHOT_HPP_
-#define F_DWA_CONTROLLER__PLANNING_SNAPSHOT_HPP_
+#ifndef F_DWA_CONTROLLER__VELOCITY_RESPONSE_MODEL_HPP_
+#define F_DWA_CONTROLLER__VELOCITY_RESPONSE_MODEL_HPP_
 
 #include <vector>
 
 #include "geometry_msgs/msg/pose2_d.hpp"
 #include "nav_2d_msgs/msg/twist2_d.hpp"
-#include "rclcpp/time.hpp"
 
 namespace f_dwa_controller
 {
 
-struct ScheduledCommand
+struct AxisVelocityResponseModel
 {
-  rclcpp::Time activation_time;
-  nav_2d_msgs::msg::Twist2D command;
-  bool is_controller_failure_stop{false};
+  double dead_time_seconds{0.0};
+  double time_constant_seconds{0.0};
+  double steady_state_gain{1.0};
 };
 
-struct ActivationState
+struct VelocityResponsePrediction
 {
   geometry_msgs::msg::Pose2D pose;
   nav_2d_msgs::msg::Twist2D velocity;
-  double linear_acceleration{0.0};
-  double angular_acceleration{0.0};
-  std::vector<double> linear_fir_history;
-  std::vector<double> angular_fir_history;
-  rclcpp::Time activation_time;
-  bool native_state_valid{true};
-};
-
-// A PlanningSnapshot is assembled once at the start of a control cycle and is
-// then shared as const. current_state is the measured physical state;
-// activation_state is its transport replay or identified-response prediction.
-// Native acceleration and FIR fields remain command-state memory correlated
-// with robot-facing dispatches. Simulator ground truth and future jitter samples
-// are deliberately excluded.
-struct PlanningSnapshot
-{
-  rclcpp::Time measurement_time;
-  rclcpp::Time activation_time;
-  ActivationState current_state;
-  ActivationState activation_state;
-  std::vector<ScheduledCommand> committed_commands;
-  std::vector<geometry_msgs::msg::Pose2D> delay_trajectory;
-  bool dispatch_state_observed{false};
+  std::vector<geometry_msgs::msg::Pose2D> trajectory;
   bool valid{false};
 };
 
+bool valid_velocity_response_model(
+  const AxisVelocityResponseModel & model);
+
+double predict_axis_velocity(
+  double observed_velocity,
+  double dispatched_command,
+  double dispatch_age_seconds,
+  double prediction_seconds,
+  const AxisVelocityResponseModel & model);
+
+VelocityResponsePrediction predict_velocity_response(
+  const geometry_msgs::msg::Pose2D & observed_pose,
+  const nav_2d_msgs::msg::Twist2D & observed_velocity,
+  const nav_2d_msgs::msg::Twist2D & dispatched_command,
+  double dispatch_age_seconds,
+  double prediction_seconds,
+  double maximum_integration_step_seconds,
+  const AxisVelocityResponseModel & linear_model,
+  const AxisVelocityResponseModel & angular_model);
+
 }  // namespace f_dwa_controller
 
-#endif  // F_DWA_CONTROLLER__PLANNING_SNAPSHOT_HPP_
+#endif  // F_DWA_CONTROLLER__VELOCITY_RESPONSE_MODEL_HPP_

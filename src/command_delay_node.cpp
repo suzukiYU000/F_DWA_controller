@@ -20,6 +20,7 @@
 
 #include "f_dwa_controller/command_delay_node.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -115,13 +116,31 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
     declare_parameter<double>("stopped_velocity_threshold", 0.01);
   const double minimum_input_interval_ms =
     declare_parameter<double>("minimum_input_interval_ms", 0.0);
+  velocity_response_model_enabled_ =
+    declare_parameter<bool>("enable_velocity_response_model", false);
+  linear_velocity_response_model_.dead_time_seconds =
+    declare_parameter<double>(
+    "linear_velocity_response_dead_time_seconds", 0.035);
+  linear_velocity_response_model_.time_constant_seconds =
+    declare_parameter<double>(
+    "linear_velocity_response_time_constant_seconds", 0.02);
+  linear_velocity_response_model_.steady_state_gain =
+    declare_parameter<double>("linear_velocity_response_gain", 1.0);
+  angular_velocity_response_model_.dead_time_seconds =
+    declare_parameter<double>(
+    "angular_velocity_response_dead_time_seconds", 0.015);
+  angular_velocity_response_model_.time_constant_seconds =
+    declare_parameter<double>(
+    "angular_velocity_response_time_constant_seconds", 0.085);
+  angular_velocity_response_model_.steady_state_gain =
+    declare_parameter<double>("angular_velocity_response_gain", 0.95);
 
   CommandDelayParameters delay_parameters;
-  delay_parameters.min_delay_ms = declare_parameter<double>("min_delay_ms", 60.0);
-  delay_parameters.max_delay_ms = declare_parameter<double>("max_delay_ms", 80.0);
-  delay_parameters.mean_delay_ms = declare_parameter<double>("mean_delay_ms", 70.0);
+  delay_parameters.min_delay_ms = declare_parameter<double>("min_delay_ms", 5.0);
+  delay_parameters.max_delay_ms = declare_parameter<double>("max_delay_ms", 35.0);
+  delay_parameters.mean_delay_ms = declare_parameter<double>("mean_delay_ms", 20.0);
   delay_parameters.delay_stddev_ms =
-    declare_parameter<double>("delay_stddev_ms", 3.333333333333333);
+    declare_parameter<double>("delay_stddev_ms", 5.0);
   const double command_zero_threshold =
     declare_parameter<double>("command_zero_threshold", 0.0);
   const double legacy_zero_threshold =
@@ -157,6 +176,12 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
   {
     throw std::invalid_argument(
             "minimum_input_interval_ms must be finite and non-negative");
+  }
+  if (!valid_velocity_response_model(linear_velocity_response_model_) ||
+    !valid_velocity_response_model(angular_velocity_response_model_))
+  {
+    throw std::invalid_argument(
+            "velocity response model parameters are invalid");
   }
   minimum_input_interval_seconds_ = minimum_input_interval_ms * 1.0e-3;
   if (random_seed < 0) {
@@ -219,6 +244,7 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
   const rclcpp::Time initial_time = now();
   last_observed_time_ = initial_time;
   has_observed_time_ = true;
+  reset_velocity_response_locked(initial_time);
   command_publisher_->publish(zero_command);
   applied_command_publisher_->publish(zero_command);
   f_dwa_controller::msg::CommandDispatch initial_dispatch;
@@ -233,7 +259,9 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
     get_logger(),
     "Command delay transport: %.6f Hz, delay=[%.3f, %.3f] ms, mean=%.3f ms, "
     "stddev=%.3f ms, input_interval>=%.3f ms, queue_depth=%" PRId64
-    ", seed=%" PRId64,
+    ", seed=%" PRId64 ", velocity_response=%s, "
+    "linear_response=(L=%.3f s,T=%.3f s,K=%.3f), "
+    "angular_response=(L=%.3f s,T=%.3f s,K=%.3f)",
     publish_frequency_hz,
     delay_parameters.min_delay_ms,
     delay_parameters.max_delay_ms,
@@ -241,7 +269,14 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
     delay_parameters.delay_stddev_ms,
     minimum_input_interval_ms,
     max_queue_depth,
-    random_seed);
+    random_seed,
+    velocity_response_model_enabled_ ? "enabled" : "disabled",
+    linear_velocity_response_model_.dead_time_seconds,
+    linear_velocity_response_model_.time_constant_seconds,
+    linear_velocity_response_model_.steady_state_gain,
+    angular_velocity_response_model_.dead_time_seconds,
+    angular_velocity_response_model_.time_constant_seconds,
+    angular_velocity_response_model_.steady_state_gain);
 }
 
 void CommandDelayNode::command_callback(
@@ -295,6 +330,8 @@ void CommandDelayNode::command_callback(
 void CommandDelayNode::timer_callback()
 {
   geometry_msgs::msg::Twist command_to_publish;
+  geometry_msgs::msg::Twist target_to_publish;
+  geometry_msgs::msg::Twist dispatched_command;
   const auto callback_started_at = std::chrono::steady_clock::now();
   const rclcpp::Time callback_time = now();
   rclcpp::Time dispatch_time(0, 0, callback_time.get_clock_type());
@@ -334,7 +371,7 @@ void CommandDelayNode::timer_callback()
       // robot-facing boundary. The service response means "scheduled", not
       // that output state has already changed.
       delay_queue_->reset(pending_reset_seed_);
-      last_applied_command_ = geometry_msgs::msg::Twist();
+      reset_velocity_response_locked(callback_time);
       last_applied_sequence_ = 0;
       has_applied_sequence_ = false;
       transport_valid_ = true;
@@ -347,20 +384,33 @@ void CommandDelayNode::timer_callback()
       reset_publication_pending_ = false;
       reset_applied = true;
     } else if (transport_valid_) {
+      advance_velocity_response_locked(callback_time);
       const auto due_command = delay_queue_->pop_due(callback_time);
       if (due_command.has_value()) {
-        last_applied_command_ = due_command->command;
+        last_dispatched_command_ = due_command->command;
+        if (velocity_response_model_enabled_) {
+          schedule_velocity_response_target_locked(
+            last_dispatched_command_, callback_time);
+          // Activate zero-dead-time events at this dispatch boundary without
+          // adding an unintended extra Timer period.
+          advance_velocity_response_locked(callback_time);
+        } else {
+          last_applied_command_ = last_dispatched_command_;
+        }
         last_applied_sequence_ = due_command->sequence;
         has_applied_sequence_ = true;
         command_received_at = due_command->received_at;
         command_received_steady_time_ns =
           due_command->received_steady_time_ns;
+        dispatched_command = due_command->command;
         command_changed = true;
       }
     } else {
+      last_dispatched_command_ = geometry_msgs::msg::Twist();
       last_applied_command_ = geometry_msgs::msg::Twist();
     }
     command_to_publish = last_applied_command_;
+    target_to_publish = last_dispatched_command_;
     transport_stopped = is_transport_stopped_locked();
     applied_sequence = last_applied_sequence_;
     has_applied_sequence = has_applied_sequence_;
@@ -389,13 +439,17 @@ void CommandDelayNode::timer_callback()
     std::lock_guard<std::mutex> lock(mutex_);
     if (emergency_stop_active_) {
       command_to_publish = geometry_msgs::msg::Twist();
+      target_to_publish = geometry_msgs::msg::Twist();
       command_changed = false;
       reset_applied = false;
       transport_stopped = true;
     }
   }
   command_publisher_->publish(command_to_publish);
-  applied_command_publisher_->publish(command_to_publish);
+  // This topic keeps the same semantics as real mode: the command handed to
+  // the actuator. Gazebo receives the modeled plant response above, while
+  // odometry remains the measured response used by Controller Server.
+  applied_command_publisher_->publish(target_to_publish);
   if (reset_applied) {
     f_dwa_controller::msg::CommandDispatch reset_dispatch;
     reset_dispatch.header.stamp = dispatch_time;
@@ -409,7 +463,7 @@ void CommandDelayNode::timer_callback()
     dispatch.header.stamp = dispatch_time;
     dispatch.received_at = command_received_at;
     dispatch.received_steady_time_ns = command_received_steady_time_ns;
-    dispatch.command = command_to_publish;
+    dispatch.command = dispatched_command;
     dispatch.sequence_id = applied_sequence;
     dispatch.has_sequence = has_applied_sequence;
     command_dispatch_publisher_->publish(dispatch);
@@ -489,7 +543,7 @@ void CommandDelayNode::emergency_stop_callback(
     reset_publication_pending_ = false;
     emergency_stop_active_ = true;
     transport_valid_ = false;
-    last_applied_command_ = zero_command;
+    reset_velocity_response_locked(stopped_at);
     last_applied_sequence_ = 0;
     has_applied_sequence_ = false;
     last_observed_time_ = stopped_at;
@@ -543,6 +597,104 @@ bool CommandDelayNode::observe_time_locked(const rclcpp::Time & observed_at)
   return true;
 }
 
+void CommandDelayNode::reset_velocity_response_locked(
+  const rclcpp::Time & reset_at)
+{
+  last_dispatched_command_ = geometry_msgs::msg::Twist();
+  last_applied_command_ = geometry_msgs::msg::Twist();
+  response_state_time_ = reset_at;
+  has_response_state_time_ = true;
+  active_linear_response_target_ = 0.0;
+  active_angular_response_target_ = 0.0;
+  pending_linear_response_targets_.clear();
+  pending_angular_response_targets_.clear();
+}
+
+void CommandDelayNode::schedule_velocity_response_target_locked(
+  const geometry_msgs::msg::Twist & target,
+  const rclcpp::Time & dispatched_at)
+{
+  pending_linear_response_targets_.push_back(
+    AxisResponseTarget{
+      dispatched_at + rclcpp::Duration::from_seconds(
+        linear_velocity_response_model_.dead_time_seconds),
+      target.linear.x});
+  pending_angular_response_targets_.push_back(
+    AxisResponseTarget{
+      dispatched_at + rclcpp::Duration::from_seconds(
+        angular_velocity_response_model_.dead_time_seconds),
+      target.angular.z});
+}
+
+void CommandDelayNode::advance_velocity_response_locked(
+  const rclcpp::Time & update_at)
+{
+  if (!velocity_response_model_enabled_) {
+    last_applied_command_ = last_dispatched_command_;
+    response_state_time_ = update_at;
+    has_response_state_time_ = true;
+    return;
+  }
+  if (!has_response_state_time_) {
+    response_state_time_ = update_at;
+    has_response_state_time_ = true;
+    return;
+  }
+  if (update_at < response_state_time_) {
+    return;
+  }
+
+  const auto advance_axis =
+    [&update_at, this](
+    double & response,
+    double & active_target,
+    std::deque<AxisResponseTarget> & pending_targets,
+    const AxisVelocityResponseModel & model)
+    {
+      rclcpp::Time cursor = response_state_time_;
+      const auto integrate =
+        [&response, &active_target, &model](const double duration_seconds)
+        {
+          if (duration_seconds <= 0.0) {
+            return;
+          }
+          const double target = model.steady_state_gain * active_target;
+          const double retained_fraction = std::exp(
+            -duration_seconds / model.time_constant_seconds);
+          response = target + (response - target) * retained_fraction;
+        };
+      while (!pending_targets.empty() &&
+        pending_targets.front().activation_time <= update_at)
+      {
+        const AxisResponseTarget event = pending_targets.front();
+        pending_targets.pop_front();
+        if (event.activation_time > cursor) {
+          integrate((event.activation_time - cursor).seconds());
+          cursor = event.activation_time;
+        }
+        active_target = event.command;
+      }
+      if (update_at > cursor) {
+        integrate((update_at - cursor).seconds());
+      }
+    };
+  advance_axis(
+    last_applied_command_.linear.x,
+    active_linear_response_target_,
+    pending_linear_response_targets_,
+    linear_velocity_response_model_);
+  advance_axis(
+    last_applied_command_.angular.z,
+    active_angular_response_target_,
+    pending_angular_response_targets_,
+    angular_velocity_response_model_);
+  last_applied_command_.linear.y = 0.0;
+  last_applied_command_.linear.z = 0.0;
+  last_applied_command_.angular.x = 0.0;
+  last_applied_command_.angular.y = 0.0;
+  response_state_time_ = update_at;
+}
+
 void CommandDelayNode::invalidate_transport(
   const rclcpp::Time & detected_at,
   const std::string & reason)
@@ -586,7 +738,7 @@ void CommandDelayNode::invalidate_transport(
     queue_depth,
     next_sequence,
     queued_commands);
-  last_applied_command_ = geometry_msgs::msg::Twist();
+  reset_velocity_response_locked(detected_at);
 }
 
 void CommandDelayNode::publish_transport_valid(const bool is_valid)
@@ -631,6 +783,10 @@ bool CommandDelayNode::is_transport_stopped_locked() const
   return emergency_stop_active_ ||
          (transport_valid_ && delay_queue_->empty() &&
          CommandDelayQueue::is_zero(
+    last_dispatched_command_, stopped_velocity_threshold_) &&
+         pending_linear_response_targets_.empty() &&
+         pending_angular_response_targets_.empty() &&
+         CommandDelayQueue::is_zero(
     last_applied_command_, stopped_velocity_threshold_));
 }
 
@@ -652,6 +808,9 @@ void CommandDelayNode::publish_diagnostic(
   status.message = message;
   status.values.push_back(make_key_value("queue_depth", std::to_string(queue_depth)));
   status.values.push_back(make_key_value("next_sequence", std::to_string(next_sequence)));
+  status.values.push_back(
+    make_key_value(
+      "last_dispatched_command", command_to_string(last_dispatched_command_)));
   status.values.push_back(
     make_key_value("last_applied_command", command_to_string(last_applied_command_)));
   status.values.push_back(

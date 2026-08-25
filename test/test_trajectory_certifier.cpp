@@ -61,6 +61,16 @@ void expect_same_certification(
   EXPECT_EQ(
     broadphase.failure_interpolation_index,
     reference.failure_interpolation_index);
+  EXPECT_EQ(broadphase.has_failure_cell, reference.has_failure_cell);
+  if (reference.has_failure_cell) {
+    EXPECT_EQ(broadphase.failure_cell_x, reference.failure_cell_x);
+    EXPECT_EQ(broadphase.failure_cell_y, reference.failure_cell_y);
+    EXPECT_EQ(broadphase.failure_cell_cost, reference.failure_cell_cost);
+    EXPECT_DOUBLE_EQ(
+      broadphase.failure_cell_world_x, reference.failure_cell_world_x);
+    EXPECT_DOUBLE_EQ(
+      broadphase.failure_cell_world_y, reference.failure_cell_world_y);
+  }
   if (reference.has_failure_pose) {
     EXPECT_DOUBLE_EQ(
       broadphase.failure_pose.x, reference.failure_pose.x);
@@ -112,6 +122,11 @@ TEST(TrajectoryCertifier, RejectsObstacleInsideFootprintInterior)
   EXPECT_EQ(
     broadphase.failure, CertificationFailure::kLethalObstacle);
   EXPECT_TRUE(broadphase.has_failure_pose);
+  EXPECT_TRUE(broadphase.has_failure_cell);
+  EXPECT_EQ(broadphase.failure_cell_x, obstacle_x);
+  EXPECT_EQ(broadphase.failure_cell_y, obstacle_y);
+  EXPECT_EQ(
+    broadphase.failure_cell_cost, nav2_costmap_2d::LETHAL_OBSTACLE);
   EXPECT_EQ(broadphase.failure_source_pose_index, 0u);
 }
 
@@ -140,6 +155,9 @@ TEST(TrajectoryCertifier, RejectsObstacleCrossingSweptBoundary)
   EXPECT_EQ(
     broadphase.failure, CertificationFailure::kLethalObstacle);
   EXPECT_TRUE(broadphase.has_failure_pose);
+  EXPECT_TRUE(broadphase.has_failure_cell);
+  EXPECT_EQ(broadphase.failure_cell_x, obstacle_x);
+  EXPECT_EQ(broadphase.failure_cell_y, obstacle_y);
   EXPECT_EQ(broadphase.failure_source_pose_index, 1u);
 }
 
@@ -158,6 +176,10 @@ TEST(TrajectoryCertifier, RejectsUnknownAndOffCostmap)
     costmap, rectangle_footprint(), poses, 0.025);
   EXPECT_FALSE(result.safe);
   EXPECT_EQ(result.failure, CertificationFailure::kUnknownSpace);
+  EXPECT_TRUE(result.has_failure_cell);
+  EXPECT_EQ(result.failure_cell_x, unknown_x);
+  EXPECT_EQ(result.failure_cell_y, unknown_y);
+  EXPECT_EQ(result.failure_cell_cost, nav2_costmap_2d::NO_INFORMATION);
 
   poses.front().x = 0.9;
   result = certify_pose_sequence(

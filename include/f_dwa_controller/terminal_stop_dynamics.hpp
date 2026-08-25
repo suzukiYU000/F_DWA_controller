@@ -73,7 +73,8 @@ StopSequence generate_fir_stop_sequence(
   int maximum_steps,
   double stop_velocity_threshold,
   bool record_fir_histories = true,
-  const FirStopCoefficientResponse * coefficient_response = nullptr);
+  const FirStopCoefficientResponse * coefficient_response = nullptr,
+  bool allow_velocity_direction_reversal = false);
 
 }  // namespace f_dwa_controller
 

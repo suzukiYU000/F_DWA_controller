@@ -65,6 +65,7 @@ add_library(${library_name} SHARED
   src/terminal_stop_dynamics.cpp
   src/trajectory_progress_critic.cpp
   src/trajectory_certifier.cpp
+  src/velocity_response_model.cpp
   src/v_dwb_trajectory_generators.cpp
 )
 
@@ -79,6 +80,7 @@ add_library(${transport_library_name} SHARED
   src/command_envelope_node.cpp
   src/command_delay_node.cpp
   src/command_delay_queue.cpp
+  src/velocity_response_model.cpp
 )
 
 rosidl_get_typesupport_target(
@@ -132,6 +134,7 @@ ament_target_dependencies(${library_name}
 ament_target_dependencies(${transport_library_name}
   diagnostic_msgs
   geometry_msgs
+  nav_2d_msgs
   rclcpp
   std_msgs
   std_srvs
@@ -370,6 +373,17 @@ if(BUILD_TESTING)
     )
   endif()
 
+  ament_add_gtest(test_velocity_response_model
+    test/test_velocity_response_model.cpp
+  )
+  if(TARGET test_velocity_response_model)
+    target_link_libraries(test_velocity_response_model ${library_name})
+    ament_target_dependencies(test_velocity_response_model
+      geometry_msgs
+      nav_2d_msgs
+    )
+  endif()
+
   ament_add_gtest(test_trajectory_certifier
     test/test_trajectory_certifier.cpp
     src/trajectory_certifier.cpp
@@ -395,6 +409,7 @@ if(BUILD_TESTING)
         include
     )
     ament_target_dependencies(test_path_subgoal
+      dwb_msgs
       geometry_msgs
       nav_2d_msgs
     )

@@ -150,6 +150,7 @@ protected:
   {
     int maximum_stop_steps{0};
     double stop_velocity_threshold{0.0};
+    bool allow_velocity_direction_reversal{false};
     std::vector<AxisState> delayed_states;
     StopSequence stop_sequence;
     bool computed{false};
@@ -235,7 +236,8 @@ private:
     int rollout_step_count,
     int command_delay_steps,
     int maximum_stop_steps,
-    double stop_velocity_threshold);
+    double stop_velocity_threshold,
+    bool allow_velocity_direction_reversal);
   bool generate_candidate_stop_trajectory(
     const Candidate & candidate,
     const geometry_msgs::msg::Pose2D & start_pose,

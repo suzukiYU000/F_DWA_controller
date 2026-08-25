@@ -9,9 +9,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 
 #include "dwb_core/exceptions.hpp"
+#include "f_dwa_controller/trajectory_certifier.hpp"
+#include "nav2_costmap_2d/cost_values.hpp"
+#include "nav2_costmap_2d/costmap_layer.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 
@@ -73,6 +79,78 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
     throw dwb_core::IllegalTrajectoryException(
             name_, "Trajectory has no poses.");
   }
+  const auto score_pose_with_diagnostics =
+    [this](
+    const geometry_msgs::msg::Pose2D & checked_pose,
+    const std::size_t pose_index,
+    const std::size_t subdivision_index)
+    {
+      try {
+        static_cast<void>(scorePose(checked_pose));
+      } catch (const dwb_core::IllegalTrajectoryException & exception) {
+        std::ostringstream detail;
+        detail << std::setprecision(17) << exception.what() <<
+          ";pose_index=" << pose_index <<
+          ";subdivision=" << subdivision_index <<
+          ";pose_x=" << checked_pose.x <<
+          ";pose_y=" << checked_pose.y <<
+          ";pose_yaw=" << checked_pose.theta;
+
+        CertificationResult result;
+        if (costmap_ && footprint_spec_.size() >= 3u) {
+          const std::vector<geometry_msgs::msg::Pose2D> single_pose{
+            checked_pose};
+          result = certify_pose_sequence(
+            *costmap_, footprint_spec_, single_pose,
+            maximum_swept_distance_);
+        }
+        if (result.has_failure_cell) {
+          detail <<
+            ";failure=" << certification_failure_name(result.failure) <<
+            ";cell_x=" << result.failure_cell_x <<
+            ";cell_y=" << result.failure_cell_y <<
+            ";cell_world_x=" << result.failure_cell_world_x <<
+            ";cell_world_y=" << result.failure_cell_world_y <<
+            ";cell_cost=" <<
+            static_cast<unsigned int>(result.failure_cell_cost);
+
+          if (costmap_ros_ && costmap_ros_->getLayeredCostmap()) {
+            const auto plugins =
+              costmap_ros_->getLayeredCostmap()->getPlugins();
+            bool first_layer = true;
+            for (const auto & plugin : *plugins) {
+              const auto layer =
+                std::dynamic_pointer_cast<nav2_costmap_2d::CostmapLayer>(
+                plugin);
+              if (!layer) {
+                continue;
+              }
+              unsigned int layer_x = 0u;
+              unsigned int layer_y = 0u;
+              if (!layer->worldToMap(
+                  result.failure_cell_world_x,
+                  result.failure_cell_world_y, layer_x, layer_y))
+              {
+                continue;
+              }
+              const unsigned char layer_cost =
+                layer->getCost(layer_x, layer_y);
+              if (layer_cost != nav2_costmap_2d::NO_INFORMATION &&
+                layer_cost < nav2_costmap_2d::LETHAL_OBSTACLE)
+              {
+                continue;
+              }
+              detail << (first_layer ? ";layers=" : ",") <<
+                plugin->getName() << ':' <<
+                static_cast<unsigned int>(layer_cost);
+              first_layer = false;
+            }
+          }
+        }
+        throw dwb_core::IllegalTrajectoryException(name_, detail.str());
+      }
+    };
+
   for (std::size_t index = 0u; index < trajectory.poses.size(); ++index) {
     const auto & pose = trajectory.poses[index];
     if (!std::isfinite(pose.x) || !std::isfinite(pose.y) ||
@@ -84,7 +162,7 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
 
     // Numeric legal-cell cost is intentionally ignored. This critic defines
     // only the physical hard gate; the common soft critics rank legal poses.
-    static_cast<void>(scorePose(pose));
+    score_pose_with_diagnostics(pose, index, 0u);
 
     if (index == 0u) {
       continue;
@@ -121,7 +199,7 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
       // Ignore the legal-cell numeric cost: this sample exists solely to
       // prevent a physical footprint from crossing a lethal/unknown cell
       // between two 50 ms rollout poses.
-      static_cast<void>(scorePose(intermediate));
+      score_pose_with_diagnostics(intermediate, index, subdivision);
     }
   }
   return 0.0;

@@ -332,6 +332,20 @@ public:
     return refreshPenalizedCellMask();
   }
 
+  bool configureProjected(
+    nav2_costmap_2d::Costmap2D * source,
+    nav2_costmap_2d::CostmapLayer * exclusion,
+    const double exclusion_tolerance)
+  {
+    costmap_ = source;
+    exclusion_costmap_layer_ = exclusion;
+    project_exclusion_costmap_ = true;
+    exclude_layer_tolerance_ = exclusion_tolerance;
+    apply_exclude_tolerance_on_aligned_grids_ = true;
+    refreshProjectedExclusionCostmap();
+    return refreshPenalizedCellMask();
+  }
+
   bool refreshDistanceField()
   {
     return refreshPenalizedCellMask();
@@ -431,6 +445,25 @@ public:
   std::size_t rowDistanceCapacity() const
   {
     return row_distance_scratch_.capacity();
+  }
+};
+
+class ProjectedStaticTestLayer : public nav2_costmap_2d::CostmapLayer
+{
+public:
+  void reset() override {}
+
+  bool isClearable() override {return false;}
+
+  void updateBounds(
+    double, double, double, double *, double *, double *, double *) override
+  {}
+
+  void updateCosts(
+    nav2_costmap_2d::Costmap2D & master_grid,
+    int, int, int, int) override
+  {
+    master_grid.setCost(4u, 5u, nav2_costmap_2d::LETHAL_OBSTACLE);
   }
 };
 
@@ -1044,6 +1077,21 @@ TEST(FootprintClearanceCritic, InvalidatesDistanceFieldForExclusionChanges)
   exclusion.setCost(5u, 5u, nav2_costmap_2d::FREE_SPACE);
   EXPECT_TRUE(critic.refreshDistanceField());
   EXPECT_TRUE(critic.isPenalized(5u, 5u));
+}
+
+TEST(FootprintClearanceCritic, ProjectsRollingStaticExclusionBeforeTolerance)
+{
+  nav2_costmap_2d::Costmap2D source(12, 12, 0.1, 3.0, -2.0, 0u);
+  source.setCost(4u, 5u, nav2_costmap_2d::LETHAL_OBSTACLE);
+  source.setCost(5u, 5u, nav2_costmap_2d::LETHAL_OBSTACLE);
+  source.setCost(7u, 5u, nav2_costmap_2d::LETHAL_OBSTACLE);
+  ProjectedStaticTestLayer static_layer;
+  CostmapFootprintClearanceCritic critic;
+
+  ASSERT_TRUE(critic.configureProjected(&source, &static_layer, 0.1));
+  EXPECT_FALSE(critic.isPenalized(4u, 5u));
+  EXPECT_FALSE(critic.isPenalized(5u, 5u));
+  EXPECT_TRUE(critic.isPenalized(7u, 5u));
 }
 
 TEST(FootprintClearanceCritic, EmptyDynamicLayerHasNoSoftObstacle)

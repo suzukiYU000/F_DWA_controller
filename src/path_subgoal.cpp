@@ -28,6 +28,149 @@
 namespace f_dwa_controller
 {
 
+bool project_pose_onto_path(
+  const nav_2d_msgs::msg::Path2D & path,
+  const geometry_msgs::msg::Pose2D & pose,
+  PathProjection & projection)
+{
+  if (path.poses.empty() || !std::isfinite(pose.x) ||
+    !std::isfinite(pose.y))
+  {
+    return false;
+  }
+  if (path.poses.size() == 1u) {
+    const auto & point = path.poses.front();
+    if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
+      return false;
+    }
+    projection = PathProjection();
+    projection.tangent_heading =
+      std::isfinite(point.theta) ? point.theta : 0.0;
+    projection.distance = std::hypot(pose.x - point.x, pose.y - point.y);
+    return true;
+  }
+
+  double cumulative_arclength = 0.0;
+  double nearest_squared_distance = std::numeric_limits<double>::infinity();
+  bool found_segment = false;
+  for (std::size_t index = 1u; index < path.poses.size(); ++index) {
+    const auto & start = path.poses[index - 1u];
+    const auto & end = path.poses[index];
+    if (!std::isfinite(start.x) || !std::isfinite(start.y) ||
+      !std::isfinite(end.x) || !std::isfinite(end.y))
+    {
+      return false;
+    }
+    const double segment_x = end.x - start.x;
+    const double segment_y = end.y - start.y;
+    const double squared_length =
+      segment_x * segment_x + segment_y * segment_y;
+    const double segment_length = std::sqrt(squared_length);
+    if (squared_length <= 1.0e-12) {
+      continue;
+    }
+    const double along = std::clamp(
+      ((pose.x - start.x) * segment_x +
+      (pose.y - start.y) * segment_y) / squared_length,
+      0.0, 1.0);
+    const double projected_x = start.x + along * segment_x;
+    const double projected_y = start.y + along * segment_y;
+    const double offset_x = pose.x - projected_x;
+    const double offset_y = pose.y - projected_y;
+    const double squared_distance =
+      offset_x * offset_x + offset_y * offset_y;
+    if (squared_distance < nearest_squared_distance) {
+      nearest_squared_distance = squared_distance;
+      projection.arclength =
+        cumulative_arclength + along * segment_length;
+      projection.lateral_error =
+        (-segment_y * offset_x + segment_x * offset_y) /
+        segment_length;
+      projection.tangent_heading = std::atan2(segment_y, segment_x);
+      projection.distance = std::sqrt(squared_distance);
+      found_segment = true;
+    }
+    cumulative_arclength += segment_length;
+  }
+  if (found_segment) {
+    return true;
+  }
+
+  const auto & point = path.poses.back();
+  projection = PathProjection();
+  projection.tangent_heading =
+    std::isfinite(point.theta) ? point.theta : 0.0;
+  projection.distance = std::hypot(pose.x - point.x, pose.y - point.y);
+  return true;
+}
+
+bool trajectory_has_meaningful_path_progress(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  const nav_2d_msgs::msg::Path2D & path,
+  const geometry_msgs::msg::Pose2D & heading_target,
+  const double minimum_arclength_progress,
+  const double minimum_heading_progress)
+{
+  if (trajectory.poses.empty() ||
+    (minimum_arclength_progress <= 0.0 &&
+    minimum_heading_progress <= 0.0))
+  {
+    return false;
+  }
+  PathProjection initial_projection;
+  if (!project_pose_onto_path(
+      path, trajectory.poses.front(), initial_projection))
+  {
+    return false;
+  }
+  const double target_heading = std::isfinite(heading_target.theta) ?
+    heading_target.theta : initial_projection.tangent_heading;
+  const auto heading_error = [target_heading](const auto & pose) {
+      return std::abs(std::remainder(
+        target_heading - pose.theta, 2.0 * M_PI));
+    };
+  const double initial_heading_error =
+    heading_error(trajectory.poses.front());
+  // Nearest-path arclength can increase even while a trajectory diverges
+  // laterally from the path. Treat that projection artifact as progress only
+  // when path-distance and subgoal-heading errors do not grow beyond the
+  // corresponding progress resolutions.
+  const double maximum_path_distance_growth =
+    std::max(0.0, minimum_arclength_progress);
+  const double maximum_heading_error_growth =
+    minimum_heading_progress > 0.0 ?
+    minimum_heading_progress : std::numeric_limits<double>::infinity();
+  for (const auto & pose : trajectory.poses) {
+    PathProjection candidate_projection;
+    if (!project_pose_onto_path(path, pose, candidate_projection)) {
+      return false;
+    }
+    if (minimum_arclength_progress > 0.0 &&
+      candidate_projection.arclength - initial_projection.arclength >=
+      minimum_arclength_progress - 1.0e-12 &&
+      candidate_projection.distance <= initial_projection.distance +
+      maximum_path_distance_growth + 1.0e-12 &&
+      heading_error(pose) <= initial_heading_error +
+      maximum_heading_error_growth + 1.0e-12)
+    {
+      return true;
+    }
+    // Heading-only motion is useful when rotation is the requested fallback,
+    // but it must not compete with translational progress when both criteria
+    // are configured. Otherwise a near-zero command can satisfy the progress
+    // class by rotating a few hundredths of a radian and then win solely on
+    // clearance risk.
+    if (minimum_arclength_progress <= 0.0 &&
+      minimum_heading_progress > 0.0 &&
+      initial_heading_error - heading_error(pose) >=
+      minimum_heading_progress - 1.0e-12)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool compute_path_subgoal(
   const nav_2d_msgs::msg::Path2D & path,
   const geometry_msgs::msg::Pose2D & current_pose,

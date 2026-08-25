@@ -1189,12 +1189,15 @@ NativeInputTrajectoryGenerator::get_axis_stop_cache(
   const int rollout_step_count,
   const int command_delay_steps,
   const int maximum_stop_steps,
-  const double stop_velocity_threshold)
+  const double stop_velocity_threshold,
+  const bool allow_velocity_direction_reversal)
 {
   AxisStopCache & cache = rollout.stop_cache;
   if (cache.computed &&
     cache.maximum_stop_steps == maximum_stop_steps &&
-    cache.stop_velocity_threshold == stop_velocity_threshold)
+    cache.stop_velocity_threshold == stop_velocity_threshold &&
+    cache.allow_velocity_direction_reversal ==
+    allow_velocity_direction_reversal)
   {
     return cache;
   }
@@ -1205,6 +1208,8 @@ NativeInputTrajectoryGenerator::get_axis_stop_cache(
   cache.computed = true;
   cache.maximum_stop_steps = maximum_stop_steps;
   cache.stop_velocity_threshold = stop_velocity_threshold;
+  cache.allow_velocity_direction_reversal =
+    allow_velocity_direction_reversal;
   cache.delayed_states.reserve(
     static_cast<std::size_t>(command_delay_steps));
 
@@ -1244,7 +1249,20 @@ NativeInputTrajectoryGenerator::get_axis_stop_cache(
     cache.stop_sequence = generate_fir_stop_sequence(
       state, limits, fir_coefficients_, fir_history, control_period_,
       maximum_stop_steps, stop_velocity_threshold, false,
-      &fir_stop_coefficient_response_);
+      &fir_stop_coefficient_response_, false);
+    if (allow_velocity_direction_reversal &&
+      (!cache.stop_sequence.feasible ||
+      !cache.stop_sequence.terminal_state_cleared))
+    {
+      // Preserve the shortest no-reversal stop when one exists. Angular FIR
+      // inertia may make that class empty after a steering sign change; only
+      // then allow a bounded zero crossing, whose complete swept footprint is
+      // still checked by StopAdmissibility.
+      cache.stop_sequence = generate_fir_stop_sequence(
+        state, limits, fir_coefficients_, fir_history, control_period_,
+        maximum_stop_steps, stop_velocity_threshold, false,
+        &fir_stop_coefficient_response_, true);
+    }
   }
   cache.valid =
     cache.stop_sequence.feasible &&
@@ -1293,12 +1311,12 @@ bool NativeInputTrajectoryGenerator::generate_candidate_stop_trajectory(
     get_axis_stop_cache(
     *candidate.linear_rollout, initial_linear_state, linear_axis_limits,
     iteration_initial_linear_fir_history_, rollout_step_count,
-    command_delay_steps, maximum_stop_steps, stop_velocity_threshold);
+    command_delay_steps, maximum_stop_steps, stop_velocity_threshold, false);
   const AxisStopCache & angular_cache =
     get_axis_stop_cache(
     *candidate.angular_rollout, initial_angular_state, angular_axis_limits,
     iteration_initial_angular_fir_history_, rollout_step_count,
-    command_delay_steps, maximum_stop_steps, stop_velocity_threshold);
+    command_delay_steps, maximum_stop_steps, stop_velocity_threshold, true);
   if (!linear_cache.valid || !angular_cache.valid ||
     linear_cache.delayed_states.size() !=
     static_cast<std::size_t>(command_delay_steps) ||

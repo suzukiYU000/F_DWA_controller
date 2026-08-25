@@ -49,6 +49,12 @@ struct CertificationResult
   std::size_t failure_source_pose_index{0};
   std::size_t failure_interpolation_index{0};
   geometry_msgs::msg::Pose2D failure_pose;
+  bool has_failure_cell{false};
+  unsigned int failure_cell_x{0};
+  unsigned int failure_cell_y{0};
+  unsigned char failure_cell_cost{0};
+  double failure_cell_world_x{0.0};
+  double failure_cell_world_y{0.0};
 };
 
 struct CertificationWorkspace

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <string>
 
 #include "builtin_interfaces/msg/duration.hpp"
 #include "dwb_core/exceptions.hpp"
@@ -152,7 +153,13 @@ TEST(HorizonObstacleFootprintCritic, RejectsNonFinitePose)
 TEST(HorizonObstacleFootprintCritic, RejectsCollisionAtGeneratedPose)
 {
   StubHorizonObstacleFootprintCritic critic;
-  EXPECT_THROW(
-    critic.scoreTrajectory(make_trajectory({2.0, -1.0, 100.0})),
-    dwb_core::IllegalTrajectoryException);
+  try {
+    static_cast<void>(
+      critic.scoreTrajectory(make_trajectory({2.0, -1.0, 100.0})));
+    FAIL() << "Expected a collision rejection";
+  } catch (const dwb_core::IllegalTrajectoryException & exception) {
+    const std::string detail = exception.what();
+    EXPECT_NE(detail.find("pose_index=1"), std::string::npos);
+    EXPECT_NE(detail.find("pose_x=-1"), std::string::npos);
+  }
 }

@@ -452,6 +452,38 @@ TEST(TerminalStopDynamics, FirDrainsHistoryInsideVelocityCaptureTube)
   }
 }
 
+TEST(TerminalStopDynamics, FirAngularStopMayCrossZeroBeforeSettling)
+{
+  const AxisLimits limits{-0.8, 0.8, -1.6, 1.6, -1.57, 1.57};
+  const std::vector<double> coefficients = f8_coefficients();
+  std::vector<double> history(coefficients.size() - 1u, -0.4);
+  history.front() = -1.57;
+  const AxisState state{
+    0.005, fir_acceleration(coefficients, history, -1.57)};
+
+  const StopSequence directional = generate_fir_stop_sequence(
+    state, limits, coefficients, history, 0.03, 400, 0.01,
+    false, nullptr, false);
+  const StopSequence angular = generate_fir_stop_sequence(
+    state, limits, coefficients, history, 0.03, 400, 0.01,
+    false, nullptr, true);
+
+  EXPECT_FALSE(directional.feasible);
+  ASSERT_TRUE(angular.feasible);
+  ASSERT_TRUE(angular.terminal_state_cleared);
+  EXPECT_TRUE(std::any_of(
+      angular.states.begin(), angular.states.end(),
+      [](const AxisState & value) {return value.velocity < 0.0;}));
+  for (const AxisState & value : angular.states) {
+    EXPECT_GE(value.velocity, limits.velocity_min);
+    EXPECT_LE(value.velocity, limits.velocity_max);
+    EXPECT_GE(value.acceleration, limits.acceleration_min);
+    EXPECT_LE(value.acceleration, limits.acceleration_max);
+  }
+  EXPECT_LE(std::abs(angular.states.back().velocity), 0.01);
+  EXPECT_LE(std::abs(angular.states.back().acceleration), 0.01);
+}
+
 TEST(TerminalStopDynamics, FirHistoryRecordingDoesNotChangeDynamics)
 {
   const AxisLimits limits{-1.2, 1.2, -1.2, 1.2, -1.2, 1.2};

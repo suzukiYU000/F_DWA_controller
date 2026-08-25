@@ -6,12 +6,12 @@ Method files should contain only the plugin and native-dynamics differences.
 
 `enable_certification` is `false` in every normal controller configuration.
 Setting it to `true` is reserved for an explicit terminal-stop-certificate
-ablation; normal experiments do not add or reject candidates with that
-certificate. `terminal_stop_goal_capture_distance` is also `0.0` in the common
-comparison Config. This disables generation and retention of the separate
-goal-capture stop sequence even when certification is off; a positive value is
-an independently reported terminal-stop-policy ablation. The common nominal
-command-history rollout remains enabled.
+ablation; normal experiments do not reject candidates with that certificate.
+The common Config retains a method-native stop suffix once its predicted end
+is within the GoalChecker's 0.25 m position window. This prevents the stopped
+GoalChecker from losing the final Path point while a fast candidate is still
+crossing the goal. The
+common nominal command-history rollout remains enabled.
 DWB-derived native-input generators keep the selected candidate's
 internal acceleration, jerk, or FIR state correlated with the observable
 dispatch ledger in either mode; disabling certification changes neither the
@@ -35,6 +35,25 @@ The common dispatch-state parameters are:
   same-sequence FIFO-head command that a downstream safety monitor only reduced
   or zeroed; simulation keeps this `false` and requires exact command equality
 - `nominal_delay_preview_seconds`: future nominal delay; no future jitter sample
+- `use_observed_velocity_for_activation_state`: starts each dynamic window from
+  Controller Server odometry while retaining dispatch/native ledgers for known
+  future transport and A/J/F internal state; this avoids treating a dispatched
+  command as measured wheel speed
+- `enable_velocity_response_prediction`: common activation-state predictor;
+  starts from measured odometry and approaches the latest robot-facing command
+  with the identified dead-time plus first-order WHILL response instead of
+  reanchoring every cycle to delayed odometry or treating command as velocity
+- `velocity_response_prediction_seconds`: prediction horizon from the current
+  measurement; the real experiment uses 0.12 s
+- `*_velocity_response_dead_time_seconds`,
+  `*_velocity_response_time_constant_seconds`, and
+  `*_velocity_response_gain`: independently identified linear/angular plant
+  parameters, common to V/A/J/F; simulation applies the same response before
+  Gazebo and uses it for candidate activation
+- `enable_stop_admissibility`: standard Dynamic Window physical stopping
+  condition; a candidate is legal only when its method-native deceleration can
+  stop the physical footprint on the current costmap, without the optional
+  certificate reserve
 - `terminal_stop_command_delay_seconds`: delay included before terminal stop
 - `terminal_stop_velocity_threshold`: common numerical capture threshold for
   velocity, controller-internal acceleration, and F-DWA raw-input history;
@@ -42,8 +61,8 @@ The common dispatch-state parameters are:
 - `terminal_stop_maximum_time`: upper bound for constructing a certified stop,
   not a commanded stop duration; the common 12 s bound accommodates the F-8
   filter-history drain and each sequence ends as soon as capture is reached
-- `terminal_stop_goal_capture_distance`: `0.0` for normal V/A/J/F comparisons,
-  so no separate terminal-stop suffix is generated or retained
+- `terminal_stop_goal_capture_distance`: 0.25 m common method-native terminal
+  capture set; each cycle revalidates the retained deceleration suffix
 - `stop_capture_velocity`: planned-stop completion threshold
 - `planning_deadline_seconds`: 0.05 s deadline at the common 20 Hz control rate
 
@@ -62,12 +81,12 @@ measured odometry. If delayed commands moved the robot outside the goal
 condition, the runner resends the same saved Path within the original run
 deadline. A new setPlan resets stateful DWB components before control resumes.
 The research-common stopping critic and GoalChecker both use the same 0.25 m
-position window.  Its
-`RotateToGoal.xy_goal_tolerance_release_margin` is 0.0 m, so the rotate-only
-latch is released immediately outside the GoalChecker acceptance boundary.
-This avoids a band where translation is rejected although the non-stateful
-GoalChecker cannot yet succeed.  The upstream-compatible release-margin
-default is -1.0 (no automatic release). This behavior is exported by
+position window. Its
+`RotateToGoal.xy_goal_tolerance_release_margin` is -1.0, so terminal braking
+remains latched after the robot first enters the acceptance boundary and is
+cleared only when a new Path resets the critic. This prevents delayed motion
+from releasing the brake phase and accelerating away from the final Path
+point. This behavior is exported by
 `f_dwa_controller::HysteresisRotateToGoalCritic`; Navigation2 source remains
 unchanged.
 The dispatch publisher is Reliable during a run and retains only its latest

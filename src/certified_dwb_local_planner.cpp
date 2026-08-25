@@ -43,6 +43,7 @@
 #include "f_dwa_controller/path_subgoal.hpp"
 #include "f_dwa_controller/terminal_stop_dynamics.hpp"
 #include "f_dwa_controller/trajectory_certifier.hpp"
+#include "f_dwa_controller/velocity_response_model.hpp"
 #include "nav_2d_utils/conversions.hpp"
 #include "nav_2d_utils/tf_help.hpp"
 #include "nav2_core/controller_exceptions.hpp"
@@ -83,6 +84,39 @@ geometry_msgs::msg::Pose2D integrate_pose(
 bool is_positive_finite(const double value)
 {
   return std::isfinite(value) && value > 0.0;
+}
+
+double clearance_constraint_score_limit(
+  const bool constraint_active,
+  const bool candidate_has_progress,
+  const bool best_has_progress,
+  const uint64_t candidate_guard_risk_bucket,
+  const uint64_t best_guard_risk_bucket,
+  const uint64_t candidate_risk_bucket,
+  const uint64_t best_risk_bucket,
+  const bool best_uses_reserve_recovery,
+  const double best_total)
+{
+  const double normal_limit = best_uses_reserve_recovery ? -1.0 : best_total;
+  if (!constraint_active) {
+    return normal_limit;
+  }
+  if (candidate_has_progress != best_has_progress) {
+    return candidate_has_progress ?
+           -1.0 : std::numeric_limits<double>::min();
+  }
+  if (!candidate_has_progress ||
+    (candidate_guard_risk_bucket == best_guard_risk_bucket &&
+    candidate_risk_bucket == best_risk_bucket))
+  {
+    return normal_limit;
+  }
+  if (candidate_guard_risk_bucket != best_guard_risk_bucket) {
+    return candidate_guard_risk_bucket < best_guard_risk_bucket ?
+           -1.0 : std::numeric_limits<double>::min();
+  }
+  return candidate_risk_bucket < best_risk_bucket ?
+         -1.0 : std::numeric_limits<double>::min();
 }
 
 std::string candidate_diagnostic_metadata(
@@ -213,6 +247,9 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".clearance_constraint_trigger_critic_name",
     rclcpp::ParameterValue(std::string{"FootprintClearance"}));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_guard_critic_name",
+    rclcpp::ParameterValue(std::string{"FootprintClearance"}));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".clearance_constraint_admissible_risk",
     rclcpp::ParameterValue(0.05));
   nav2_util::declare_parameter_if_not_declared(
@@ -222,11 +259,56 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".clearance_constraint_risk_resolution",
     rclcpp::ParameterValue(0.01));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_guard_admissible_risk",
+    rclcpp::ParameterValue(1.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_guard_risk_resolution",
+    rclcpp::ParameterValue(0.01));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_minimum_subgoal_distance_progress",
+    rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_minimum_subgoal_heading_progress",
+    rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_motion_preference_goal_distance",
+    rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".enable_nominal_delay_preview",
     rclcpp::ParameterValue(true));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".use_observed_velocity_for_activation_state",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".enable_velocity_response_prediction",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".nominal_delay_preview_seconds",
     rclcpp::ParameterValue(0.07));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".velocity_response_prediction_seconds",
+    rclcpp::ParameterValue(0.12));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".velocity_response_integration_step_seconds",
+    rclcpp::ParameterValue(0.01));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".linear_velocity_response_dead_time_seconds",
+    rclcpp::ParameterValue(0.035));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".linear_velocity_response_time_constant_seconds",
+    rclcpp::ParameterValue(0.02));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".linear_velocity_response_gain",
+    rclcpp::ParameterValue(1.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".angular_velocity_response_dead_time_seconds",
+    rclcpp::ParameterValue(0.015));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".angular_velocity_response_time_constant_seconds",
+    rclcpp::ParameterValue(0.085));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".angular_velocity_response_gain",
+    rclcpp::ParameterValue(0.95));
   nav2_util::declare_parameter_if_not_declared(
     node, name + ".command_dispatch_topic",
     rclcpp::ParameterValue("/controller/command_dispatch"));
@@ -247,6 +329,9 @@ void CertifiedDWBLocalPlanner::configure(
     rclcpp::ParameterValue(0.03));
   nav2_util::declare_parameter_if_not_declared(
     node, name + ".enable_no_valid_control_deceleration_fallback",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".enable_stop_admissibility",
     rclcpp::ParameterValue(false));
   nav2_util::declare_parameter_if_not_declared(
     node, name + ".terminal_stop_maximum_time",
@@ -316,6 +401,9 @@ void CertifiedDWBLocalPlanner::configure(
     name + ".clearance_constraint_trigger_critic_name",
     clearance_constraint_trigger_critic_name_);
   node->get_parameter(
+    name + ".clearance_constraint_guard_critic_name",
+    clearance_constraint_guard_critic_name_);
+  node->get_parameter(
     name + ".clearance_constraint_admissible_risk",
     clearance_constraint_admissible_risk_);
   node->get_parameter(
@@ -325,14 +413,62 @@ void CertifiedDWBLocalPlanner::configure(
     name + ".clearance_constraint_risk_resolution",
     clearance_constraint_risk_resolution_);
   node->get_parameter(
+    name + ".clearance_constraint_guard_admissible_risk",
+    clearance_constraint_guard_admissible_risk_);
+  node->get_parameter(
+    name + ".clearance_constraint_guard_risk_resolution",
+    clearance_constraint_guard_risk_resolution_);
+  node->get_parameter(
+    name + ".clearance_constraint_minimum_subgoal_distance_progress",
+    clearance_constraint_minimum_subgoal_distance_progress_);
+  node->get_parameter(
+    name + ".clearance_constraint_minimum_subgoal_heading_progress",
+    clearance_constraint_minimum_subgoal_heading_progress_);
+  node->get_parameter(
+    name + ".clearance_constraint_motion_preference_goal_distance",
+    clearance_constraint_motion_preference_goal_distance_);
+  node->get_parameter(
     name + ".enable_no_valid_control_deceleration_fallback",
     no_valid_control_deceleration_fallback_enabled_);
+  node->get_parameter(
+    name + ".enable_stop_admissibility",
+    stop_admissibility_enabled_);
   node->get_parameter(
     name + ".enable_nominal_delay_preview",
     nominal_delay_preview_enabled_);
   node->get_parameter(
+    name + ".use_observed_velocity_for_activation_state",
+    use_observed_velocity_for_activation_state_);
+  node->get_parameter(
+    name + ".enable_velocity_response_prediction",
+    velocity_response_prediction_enabled_);
+  node->get_parameter(
     name + ".nominal_delay_preview_seconds",
     nominal_delay_preview_seconds_);
+  node->get_parameter(
+    name + ".velocity_response_prediction_seconds",
+    velocity_response_prediction_seconds_);
+  node->get_parameter(
+    name + ".velocity_response_integration_step_seconds",
+    velocity_response_integration_step_seconds_);
+  node->get_parameter(
+    name + ".linear_velocity_response_dead_time_seconds",
+    linear_velocity_response_model_.dead_time_seconds);
+  node->get_parameter(
+    name + ".linear_velocity_response_time_constant_seconds",
+    linear_velocity_response_model_.time_constant_seconds);
+  node->get_parameter(
+    name + ".linear_velocity_response_gain",
+    linear_velocity_response_model_.steady_state_gain);
+  node->get_parameter(
+    name + ".angular_velocity_response_dead_time_seconds",
+    angular_velocity_response_model_.dead_time_seconds);
+  node->get_parameter(
+    name + ".angular_velocity_response_time_constant_seconds",
+    angular_velocity_response_model_.time_constant_seconds);
+  node->get_parameter(
+    name + ".angular_velocity_response_gain",
+    angular_velocity_response_model_.steady_state_gain);
   node->get_parameter(
     name + ".require_command_dispatch_state",
     require_command_dispatch_state_);
@@ -422,6 +558,11 @@ void CertifiedDWBLocalPlanner::configure(
 
   if (!std::isfinite(nominal_delay_preview_seconds_) ||
     nominal_delay_preview_seconds_ < 0.0 ||
+    !std::isfinite(velocity_response_prediction_seconds_) ||
+    velocity_response_prediction_seconds_ < 0.0 ||
+    !is_positive_finite(velocity_response_integration_step_seconds_) ||
+    !valid_velocity_response_model(linear_velocity_response_model_) ||
+    !valid_velocity_response_model(angular_velocity_response_model_) ||
     !is_positive_finite(certification_control_period_) ||
     !is_positive_finite(terminal_stop_maximum_time_) ||
     !is_positive_finite(terminal_stop_velocity_threshold_) ||
@@ -444,6 +585,19 @@ void CertifiedDWBLocalPlanner::configure(
     clearance_constraint_trigger_risk_ > 1.0 ||
     !is_positive_finite(clearance_constraint_risk_resolution_) ||
     clearance_constraint_risk_resolution_ > 1.0 ||
+    !std::isfinite(clearance_constraint_guard_admissible_risk_) ||
+    clearance_constraint_guard_admissible_risk_ < 0.0 ||
+    clearance_constraint_guard_admissible_risk_ > 1.0 ||
+    !is_positive_finite(clearance_constraint_guard_risk_resolution_) ||
+    clearance_constraint_guard_risk_resolution_ > 1.0 ||
+    !std::isfinite(
+      clearance_constraint_minimum_subgoal_distance_progress_) ||
+    clearance_constraint_minimum_subgoal_distance_progress_ < 0.0 ||
+    !std::isfinite(
+      clearance_constraint_minimum_subgoal_heading_progress_) ||
+    clearance_constraint_minimum_subgoal_heading_progress_ < 0.0 ||
+    !std::isfinite(clearance_constraint_motion_preference_goal_distance_) ||
+    clearance_constraint_motion_preference_goal_distance_ < 0.0 ||
     !is_positive_finite(maximum_swept_distance_) ||
     planning_metrics_report_interval_ <= 0 ||
     !is_positive_finite(planning_deadline_seconds_) ||
@@ -453,6 +607,12 @@ void CertifiedDWBLocalPlanner::configure(
     throw nav2_core::ControllerException(
             "Invalid delay-preview or trajectory-certification parameter");
   }
+  if (velocity_response_prediction_enabled_ &&
+    !use_observed_velocity_for_activation_state_)
+  {
+    throw nav2_core::ControllerException(
+            "Velocity response prediction requires observed odometry state");
+  }
 
   const std::string plugin_name = name;
   dwb_core::DWBLocalPlanner::configure(
@@ -460,6 +620,7 @@ void CertifiedDWBLocalPlanner::configure(
 
   clearance_constraint_critic_.reset();
   clearance_constraint_trigger_critic_.reset();
+  clearance_constraint_guard_critic_.reset();
   for (const auto & critic : critics_) {
     const auto clearance_critic =
       std::dynamic_pointer_cast<FootprintClearanceCritic>(critic);
@@ -484,6 +645,16 @@ void CertifiedDWBLocalPlanner::configure(
       }
       clearance_constraint_trigger_critic_ = clearance_critic;
     }
+    if (clearance_critic->getName() ==
+      clearance_constraint_guard_critic_name_)
+    {
+      if (clearance_constraint_guard_critic_) {
+        throw nav2_core::ControllerException(
+                "clearance_constraint_guard_critic_name is not unique: " +
+                clearance_constraint_guard_critic_name_);
+      }
+      clearance_constraint_guard_critic_ = clearance_critic;
+    }
   }
   if (clearance_constraint_enabled_ && !clearance_constraint_critic_) {
     throw nav2_core::ControllerException(
@@ -496,6 +667,11 @@ void CertifiedDWBLocalPlanner::configure(
     throw nav2_core::ControllerException(
             "clearance constraint trigger critic was not found: " +
             clearance_constraint_trigger_critic_name_);
+  }
+  if (clearance_constraint_enabled_ && !clearance_constraint_guard_critic_) {
+    throw nav2_core::ControllerException(
+            "clearance constraint guard critic was not found: " +
+            clearance_constraint_guard_critic_name_);
   }
 
   node->get_parameter(
@@ -546,6 +722,20 @@ void CertifiedDWBLocalPlanner::configure(
     std::bind(
       &CertifiedDWBLocalPlanner::reset_trial_callback,
       this, std::placeholders::_1, std::placeholders::_2));
+  if (velocity_response_prediction_enabled_) {
+    RCLCPP_INFO(
+      logger_,
+      "real velocity response prediction enabled: horizon=%.3f s, "
+      "linear=(L=%.3f,T=%.3f,K=%.3f), "
+      "angular=(L=%.3f,T=%.3f,K=%.3f)",
+      velocity_response_prediction_seconds_,
+      linear_velocity_response_model_.dead_time_seconds,
+      linear_velocity_response_model_.time_constant_seconds,
+      linear_velocity_response_model_.steady_state_gain,
+      angular_velocity_response_model_.dead_time_seconds,
+      angular_velocity_response_model_.time_constant_seconds,
+      angular_velocity_response_model_.steady_state_gain);
+  }
 }
 
 void CertifiedDWBLocalPlanner::activate()
@@ -586,6 +776,9 @@ void CertifiedDWBLocalPlanner::cleanup()
     command_ledger_valid_ = false;
     expected_dispatch_sequence_ready_ = false;
     expected_dispatch_sequence_ = 0;
+    dispatched_command_ = nav_2d_msgs::msg::Twist2D();
+    dispatched_command_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    dispatched_command_time_valid_ = false;
   }
   dwb_core::DWBLocalPlanner::cleanup();
 }
@@ -617,14 +810,18 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
       costmap_ros_->getCostmap();
     std::unique_lock<nav2_costmap_2d::Costmap2D::mutex_t>
     certification_costmap_lock(*(costmap->getMutex()), std::defer_lock);
-    if (certification_enabled_) {
+    const bool require_physical_delay_check =
+      velocity_response_prediction_enabled_ && stop_admissibility_enabled_;
+    if (certification_enabled_ || require_physical_delay_check) {
       // The mutex is recursive; base DWB takes it again while scoring. Keeping
       // this outer lock makes the committed-delay check, broadphase prefix,
       // critic preparation, and candidate certification use one snapshot.
       certification_costmap_lock.lock();
+    }
+    if (certification_enabled_) {
       prepare_certified_footprint();
     }
-    planning_snapshot_ = build_planning_snapshot(pose);
+    planning_snapshot_ = build_planning_snapshot(pose, velocity);
     if (!planning_snapshot_->valid) {
       throw nav2_core::NoValidControl(
               "No valid robot-observable command-dispatch state");
@@ -710,6 +907,18 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
           throw nav2_core::NoValidControl(
                   diagnostic);
         }
+      }
+    }
+    if (require_physical_delay_check && !certification_enabled_ &&
+      !planning_snapshot_->delay_trajectory.empty())
+    {
+      const CertificationResult physical_delay_result = certify_pose_sequence(
+        *costmap, costmap_ros_->getRobotFootprint(),
+        planning_snapshot_->delay_trajectory, maximum_swept_distance_);
+      if (!physical_delay_result.safe) {
+        throw nav2_core::NoValidControl(
+                std::string("Predicted real response prefix is unsafe: ") +
+                certification_failure_name(physical_delay_result.failure));
       }
     }
 
@@ -890,6 +1099,8 @@ void CertifiedDWBLocalPlanner::command_dispatch_callback(
     }
     if (dispatch_is_valid) {
       dispatched_command_ = dispatched;
+      dispatched_command_time_ = transport_dispatched_at;
+      dispatched_command_time_valid_ = true;
       command_dispatch_observed_ = true;
     }
   }
@@ -988,6 +1199,7 @@ void CertifiedDWBLocalPlanner::transport_valid_callback(
   command_transport_valid_ = message->data;
   if (!message->data) {
     command_dispatch_observed_ = false;
+    dispatched_command_time_valid_ = false;
     command_ledger_valid_ = false;
     expected_dispatch_sequence_ready_ = false;
     pending_issued_commands_.clear();
@@ -1013,20 +1225,32 @@ void CertifiedDWBLocalPlanner::request_transport_invalidation(
 
 std::shared_ptr<const PlanningSnapshot>
 CertifiedDWBLocalPlanner::build_planning_snapshot(
-  const geometry_msgs::msg::PoseStamped & pose)
+  const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::Twist & observed_velocity)
 {
   PlanningSnapshot snapshot;
   snapshot.measurement_time = clock_->now();
+  const double activation_preview_seconds =
+    velocity_response_prediction_enabled_ ?
+    velocity_response_prediction_seconds_ :
+    (nominal_delay_preview_enabled_ ? nominal_delay_preview_seconds_ : 0.0);
   snapshot.activation_time =
     snapshot.measurement_time +
-    rclcpp::Duration::from_seconds(
-    nominal_delay_preview_enabled_ ?
-    nominal_delay_preview_seconds_ : 0.0);
+    rclcpp::Duration::from_seconds(activation_preview_seconds);
   snapshot.current_state.pose =
     nav_2d_utils::poseStampedToPose2D(pose).pose;
   snapshot.current_state.activation_time = snapshot.measurement_time;
 
   std::deque<IssuedCommand> issued_commands;
+  nav_2d_msgs::msg::Twist2D dispatched_command;
+  rclcpp::Time dispatched_command_time(0, 0, RCL_ROS_TIME);
+  bool dispatched_command_time_valid = false;
+  const nav_2d_msgs::msg::Twist2D observed_velocity_2d =
+    nav_2d_utils::twist3Dto2D(observed_velocity);
+  const bool observed_velocity_is_finite =
+    std::isfinite(observed_velocity_2d.x) &&
+    std::isfinite(observed_velocity_2d.y) &&
+    std::isfinite(observed_velocity_2d.theta);
   {
     std::lock_guard<std::mutex> command_lock(command_state_mutex_);
     snapshot.dispatch_state_observed = command_dispatch_observed_;
@@ -1034,8 +1258,18 @@ CertifiedDWBLocalPlanner::build_planning_snapshot(
       command_transport_valid_ &&
       command_ledger_valid_ &&
       (command_dispatch_observed_ || !require_command_dispatch_state_);
-    snapshot.current_state.velocity = dispatched_command_;
+    snapshot.current_state.velocity =
+      use_observed_velocity_for_activation_state_ ?
+      observed_velocity_2d : dispatched_command_;
+    if (use_observed_velocity_for_activation_state_ &&
+      !observed_velocity_is_finite)
+    {
+      snapshot.valid = false;
+    }
     issued_commands = pending_issued_commands_;
+    dispatched_command = dispatched_command_;
+    dispatched_command_time = dispatched_command_time_;
+    dispatched_command_time_valid = dispatched_command_time_valid_;
   }
 
   geometry_msgs::msg::Pose2D rollout_pose = snapshot.current_state.pose;
@@ -1044,8 +1278,43 @@ CertifiedDWBLocalPlanner::build_planning_snapshot(
   rclcpp::Time rollout_time = snapshot.measurement_time;
   snapshot.delay_trajectory.push_back(rollout_pose);
 
+  if (velocity_response_prediction_enabled_) {
+    if (!dispatched_command_time_valid ||
+      dispatched_command_time > snapshot.measurement_time)
+    {
+      snapshot.valid = false;
+    } else {
+      const double dispatch_age_seconds =
+        (snapshot.measurement_time - dispatched_command_time).seconds();
+      const VelocityResponsePrediction prediction =
+        predict_velocity_response(
+        rollout_pose, rollout_velocity, dispatched_command,
+        dispatch_age_seconds, velocity_response_prediction_seconds_,
+        velocity_response_integration_step_seconds_,
+        linear_velocity_response_model_, angular_velocity_response_model_);
+      if (!prediction.valid) {
+        snapshot.valid = false;
+      } else {
+        rollout_pose = prediction.pose;
+        rollout_velocity = prediction.velocity;
+        snapshot.delay_trajectory = prediction.trajectory;
+      }
+    }
+    snapshot.activation_state = snapshot.current_state;
+    snapshot.activation_state.pose = rollout_pose;
+    snapshot.activation_state.velocity = rollout_velocity;
+    snapshot.activation_state.activation_time = snapshot.activation_time;
+    return std::make_shared<const PlanningSnapshot>(std::move(snapshot));
+  }
+
   rclcpp::Time previous_activation = snapshot.measurement_time;
+  const bool replay_pending_commands =
+    !use_observed_velocity_for_activation_state_ ||
+    snapshot.activation_time > snapshot.measurement_time;
   for (const IssuedCommand & issued : issued_commands) {
+    if (!replay_pending_commands) {
+      break;
+    }
     rclcpp::Time activation_time =
       issued.issued_at +
       rclcpp::Duration::from_seconds(nominal_delay_preview_seconds_);
@@ -1295,7 +1564,61 @@ uint64_t CertifiedDWBLocalPlanner::clearance_constraint_bucket(
   return static_cast<uint64_t>(std::max(1.0, violation_bands));
 }
 
+double CertifiedDWBLocalPlanner::zero_scale_clearance_diagnostic_score(
+  const bool is_clearance_constraint_critic,
+  const bool is_clearance_constraint_trigger_critic,
+  const bool is_clearance_constraint_guard_critic,
+  const std::optional<double> precomputed_clearance_risk,
+  const std::optional<double> precomputed_clearance_trigger_risk,
+  const std::optional<double> precomputed_clearance_guard_risk)
+{
+  if (is_clearance_constraint_critic && precomputed_clearance_risk) {
+    return *precomputed_clearance_risk;
+  }
+  if (is_clearance_constraint_trigger_critic &&
+    precomputed_clearance_trigger_risk)
+  {
+    return *precomputed_clearance_trigger_risk;
+  }
+  if (is_clearance_constraint_guard_critic &&
+    precomputed_clearance_guard_risk)
+  {
+    return *precomputed_clearance_guard_risk;
+  }
+  return 0.0;
+}
+
+bool CertifiedDWBLocalPlanner::trajectory_has_meaningful_subgoal_progress(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  const nav_2d_msgs::msg::Path2D & path,
+  const geometry_msgs::msg::Pose2D & subgoal,
+  const double minimum_distance_progress,
+  const double minimum_heading_progress)
+{
+  return trajectory_has_meaningful_path_progress(
+    trajectory, path, subgoal, minimum_distance_progress,
+    minimum_heading_progress);
+}
+
+bool CertifiedDWBLocalPlanner::terminal_plan_fallback_is_applicable(
+  const geometry_msgs::msg::Pose2D & pose,
+  const geometry_msgs::msg::Pose2D & terminal_pose,
+  const double capture_distance)
+{
+  return std::isfinite(pose.x) && std::isfinite(pose.y) &&
+         std::isfinite(terminal_pose.x) &&
+         std::isfinite(terminal_pose.y) &&
+         std::isfinite(capture_distance) && capture_distance > 0.0 &&
+         std::hypot(
+    pose.x - terminal_pose.x,
+    pose.y - terminal_pose.y) <= capture_distance + 1.0e-12;
+}
+
 bool CertifiedDWBLocalPlanner::clearance_constraint_prefers_candidate(
+  const bool candidate_has_meaningful_progress,
+  const bool best_has_meaningful_progress,
+  const uint64_t candidate_guard_risk_bucket,
+  const uint64_t best_guard_risk_bucket,
   const uint64_t candidate_risk_bucket,
   const uint64_t best_risk_bucket,
   const double candidate_total,
@@ -1303,8 +1626,106 @@ bool CertifiedDWBLocalPlanner::clearance_constraint_prefers_candidate(
   const std::size_t candidate_canonical_index,
   const std::size_t best_canonical_index)
 {
+  if (candidate_has_meaningful_progress != best_has_meaningful_progress) {
+    return candidate_has_meaningful_progress;
+  }
+  // When no legal candidate can make immediate subgoal progress, preserve the
+  // conventional weighted DWB objective. Ranking that recovery set by minimum
+  // clearance risk alone can keep steering away from the Path indefinitely.
+  // Every candidate reaching this comparator has already passed the hard
+  // footprint and full-stop admissibility checks.
+  if (!candidate_has_meaningful_progress) {
+    if (candidate_total != best_total) {
+      return candidate_total < best_total;
+    }
+    return candidate_canonical_index < best_canonical_index;
+  }
+  if (candidate_guard_risk_bucket != best_guard_risk_bucket) {
+    return candidate_guard_risk_bucket < best_guard_risk_bucket;
+  }
   if (candidate_risk_bucket != best_risk_bucket) {
     return candidate_risk_bucket < best_risk_bucket;
+  }
+  if (candidate_total != best_total) {
+    return candidate_total < best_total;
+  }
+  return candidate_canonical_index < best_canonical_index;
+}
+
+bool CertifiedDWBLocalPlanner::clearance_constraint_is_active_for_pair(
+  const bool clearance_constraint_enabled,
+  const double best_total,
+  const uint64_t candidate_trigger_risk_bucket,
+  const uint64_t best_trigger_risk_bucket)
+{
+  return clearance_constraint_enabled && best_total >= 0.0 &&
+         (candidate_trigger_risk_bucket > 0u ||
+         best_trigger_risk_bucket > 0u);
+}
+
+CertifiedDWBLocalPlanner::TerminalStopAssessment
+CertifiedDWBLocalPlanner::assess_terminal_stop(
+  const std::vector<geometry_msgs::msg::Pose2D> & stop_poses,
+  const geometry_msgs::msg::Pose2D & goal_pose,
+  const double terminal_path_heading,
+  const double capture_distance,
+  const double capture_yaw_tolerance,
+  const double maximum_overshoot)
+{
+  TerminalStopAssessment assessment;
+  if (stop_poses.empty() || !std::isfinite(goal_pose.x) ||
+    !std::isfinite(goal_pose.y) || !std::isfinite(goal_pose.theta) ||
+    !std::isfinite(terminal_path_heading) ||
+    !std::isfinite(capture_distance) || capture_distance < 0.0 ||
+    !std::isfinite(capture_yaw_tolerance) ||
+    capture_yaw_tolerance < 0.0 || !std::isfinite(maximum_overshoot) ||
+    maximum_overshoot < 0.0)
+  {
+    return assessment;
+  }
+
+  assessment.terminal_pose = stop_poses.back();
+  if (!std::isfinite(assessment.terminal_pose.x) ||
+    !std::isfinite(assessment.terminal_pose.y) ||
+    !std::isfinite(assessment.terminal_pose.theta))
+  {
+    return assessment;
+  }
+  const double delta_x = assessment.terminal_pose.x - goal_pose.x;
+  const double delta_y = assessment.terminal_pose.y - goal_pose.y;
+  const double tangent_x = std::cos(terminal_path_heading);
+  const double tangent_y = std::sin(terminal_path_heading);
+  assessment.available = true;
+  assessment.position_error = std::hypot(delta_x, delta_y);
+  assessment.yaw_error = std::abs(std::remainder(
+      assessment.terminal_pose.theta - goal_pose.theta, 2.0 * M_PI));
+  assessment.longitudinal_error =
+    delta_x * tangent_x + delta_y * tangent_y;
+  assessment.lateral_error =
+    -delta_x * tangent_y + delta_y * tangent_x;
+  assessment.captures_goal =
+    assessment.position_error <= capture_distance &&
+    assessment.yaw_error <= capture_yaw_tolerance;
+  // The terminal tangent defines the endpoint ordering only inside the Goal
+  // capture corridor. Applying its infinite half-plane to the entire plan can
+  // reject an earlier leg of a curved or returning path as already beyond the
+  // endpoint, even when that leg is metres away laterally.
+  assessment.crosses_terminal_limit =
+    std::abs(assessment.lateral_error) <= capture_distance + 1.0e-12 &&
+    assessment.longitudinal_error > maximum_overshoot + 1.0e-12;
+  return assessment;
+}
+
+bool CertifiedDWBLocalPlanner::terminal_stop_prefers_candidate(
+  const bool candidate_captures_goal,
+  const bool best_captures_goal,
+  const double candidate_total,
+  const double best_total,
+  const std::size_t candidate_canonical_index,
+  const std::size_t best_canonical_index)
+{
+  if (candidate_captures_goal != best_captures_goal) {
+    return candidate_captures_goal;
   }
   if (candidate_total != best_total) {
     return candidate_total < best_total;
@@ -1645,8 +2066,64 @@ void CertifiedDWBLocalPlanner::setPlan(const nav_msgs::msg::Path & path)
   terminal_stop_goal_capture_active_ = false;
   has_evaluation_publish_time_ = false;
   current_goal_pose_valid_ = false;
+  current_terminal_path_heading_valid_ = false;
   current_terminal_distance_target_pose_valid_ = false;
+  current_progress_reference_plan_.poses.clear();
   dwb_core::DWBLocalPlanner::setPlan(path);
+  // DWB prunes global_plan_ in place. Preserve the submitted reference so the
+  // braking endpoint remains observable after the robot passes or departs from
+  // the transformed local segment.
+  terminal_reference_plan_ = global_plan_;
+}
+
+nav_2d_msgs::msg::Path2D CertifiedDWBLocalPlanner::transformGlobalPlan(
+  const nav_2d_msgs::msg::Pose2DStamped & pose)
+{
+  try {
+    nav_2d_msgs::msg::Path2D transformed_plan =
+      dwb_core::DWBLocalPlanner::transformGlobalPlan(pose);
+    current_progress_reference_plan_ = transformed_plan;
+    return transformed_plan;
+  } catch (const nav2_core::InvalidPath &) {
+    if (terminal_reference_plan_.poses.empty()) {
+      throw;
+    }
+
+    nav_2d_msgs::msg::Pose2DStamped plan_frame_pose;
+    if (!nav_2d_utils::transformPose(
+        tf_, terminal_reference_plan_.header.frame_id, pose,
+        plan_frame_pose, transform_tolerance_))
+    {
+      throw;
+    }
+    const geometry_msgs::msg::Pose2D & terminal_pose =
+      terminal_reference_plan_.poses.back();
+    if (!terminal_plan_fallback_is_applicable(
+        plan_frame_pose.pose, terminal_pose,
+        terminal_stop_goal_capture_distance_))
+    {
+      throw;
+    }
+
+    // Goal position is already admissible, but StoppedGoalChecker may need
+    // another cycle for measured velocity to settle. Restore only the saved
+    // endpoint so normal DWB scoring can complete that deceleration instead
+    // of aborting after the regular lookahead-limited prune removes all poses.
+    global_plan_.header = terminal_reference_plan_.header;
+    global_plan_.poses.assign(1u, terminal_pose);
+    nav_2d_msgs::msg::Path2D transformed_plan =
+      dwb_core::DWBLocalPlanner::transformGlobalPlan(pose);
+    current_progress_reference_plan_ = transformed_plan;
+    RCLCPP_INFO_THROTTLE(
+      logger_, *clock_, 1000,
+      "Restored the terminal Path pose while StoppedGoalChecker settles; "
+      "position_error=%.3f m, capture_distance=%.3f m",
+      std::hypot(
+        plan_frame_pose.pose.x - terminal_pose.x,
+        plan_frame_pose.pose.y - terminal_pose.y),
+      terminal_stop_goal_capture_distance_);
+    return transformed_plan;
+  }
 }
 
 void CertifiedDWBLocalPlanner::reset()
@@ -1658,6 +2135,8 @@ void CertifiedDWBLocalPlanner::reset()
   planning_snapshot_.reset();
   has_evaluation_publish_time_ = false;
   current_goal_pose_valid_ = false;
+  terminal_reference_plan_.poses.clear();
+  current_terminal_path_heading_valid_ = false;
   current_terminal_distance_target_pose_valid_ = false;
   for (dwb_core::TrajectoryCritic::Ptr & critic : critics_) {
     critic->reset();
@@ -1669,15 +2148,16 @@ void CertifiedDWBLocalPlanner::prepare_terminal_targets(
   const geometry_msgs::msg::Pose2D & pose)
 {
   current_goal_pose_valid_ = false;
+  current_terminal_path_heading_valid_ = false;
   current_terminal_distance_target_pose_valid_ = false;
-  if (global_plan_.poses.empty()) {
+  if (terminal_reference_plan_.poses.empty()) {
     return;
   }
 
   nav_2d_msgs::msg::Pose2DStamped goal_pose;
-  goal_pose.header.frame_id = global_plan_.header.frame_id;
-  goal_pose.header.stamp = global_plan_.header.stamp;
-  goal_pose.pose = global_plan_.poses.back();
+  goal_pose.header.frame_id = terminal_reference_plan_.header.frame_id;
+  goal_pose.header.stamp = terminal_reference_plan_.header.stamp;
+  goal_pose.pose = terminal_reference_plan_.poses.back();
   nav_2d_msgs::msg::Pose2DStamped transformed_goal;
   if (nav_2d_utils::transformPose(
       tf_, costmap_ros_->getGlobalFrameID(), goal_pose,
@@ -1685,6 +2165,41 @@ void CertifiedDWBLocalPlanner::prepare_terminal_targets(
   {
     current_goal_pose_ = transformed_goal.pose;
     current_goal_pose_valid_ = true;
+  }
+
+  if (current_goal_pose_valid_) {
+    for (std::size_t reverse_index = terminal_reference_plan_.poses.size();
+      reverse_index > 1u; --reverse_index)
+    {
+      const auto & previous =
+        terminal_reference_plan_.poses[reverse_index - 2u];
+      const auto & terminal = terminal_reference_plan_.poses.back();
+      if (std::hypot(
+          terminal.x - previous.x, terminal.y - previous.y) <= 1.0e-6)
+      {
+        continue;
+      }
+      nav_2d_msgs::msg::Pose2DStamped previous_pose;
+      previous_pose.header = terminal_reference_plan_.header;
+      previous_pose.pose = previous;
+      nav_2d_msgs::msg::Pose2DStamped transformed_previous;
+      if (nav_2d_utils::transformPose(
+          tf_, costmap_ros_->getGlobalFrameID(), previous_pose,
+          transformed_previous, transform_tolerance_))
+      {
+        current_terminal_path_heading_ = std::atan2(
+          current_goal_pose_.y - transformed_previous.pose.y,
+          current_goal_pose_.x - transformed_previous.pose.x);
+        current_terminal_path_heading_valid_ = true;
+      }
+      break;
+    }
+    if (!current_terminal_path_heading_valid_ &&
+      std::isfinite(current_goal_pose_.theta))
+    {
+      current_terminal_path_heading_ = current_goal_pose_.theta;
+      current_terminal_path_heading_valid_ = true;
+    }
   }
 
   if (terminal_stop_score_mode_ ==
@@ -1699,11 +2214,11 @@ void CertifiedDWBLocalPlanner::prepare_terminal_targets(
 
   nav_2d_msgs::msg::Pose2DStamped costmap_pose;
   costmap_pose.header.frame_id = costmap_ros_->getGlobalFrameID();
-  costmap_pose.header.stamp = global_plan_.header.stamp;
+  costmap_pose.header.stamp = terminal_reference_plan_.header.stamp;
   costmap_pose.pose = pose;
   nav_2d_msgs::msg::Pose2DStamped plan_frame_pose;
   if (!nav_2d_utils::transformPose(
-      tf_, global_plan_.header.frame_id, costmap_pose,
+      tf_, terminal_reference_plan_.header.frame_id, costmap_pose,
       plan_frame_pose, transform_tolerance_))
   {
     return;
@@ -1711,13 +2226,13 @@ void CertifiedDWBLocalPlanner::prepare_terminal_targets(
 
   geometry_msgs::msg::Pose2D path_subgoal;
   if (!compute_path_subgoal(
-      global_plan_, plan_frame_pose.pose,
+      terminal_reference_plan_, plan_frame_pose.pose,
       terminal_stop_path_lookahead_distance_, path_subgoal))
   {
     return;
   }
   nav_2d_msgs::msg::Pose2DStamped stamped_subgoal;
-  stamped_subgoal.header = global_plan_.header;
+  stamped_subgoal.header = terminal_reference_plan_.header;
   stamped_subgoal.pose = path_subgoal;
   nav_2d_msgs::msg::Pose2DStamped transformed_subgoal;
   if (nav_2d_utils::transformPose(
@@ -1735,7 +2250,7 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   const nav_2d_msgs::msg::Twist2D velocity,
   std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & results)
 {
-  if (certification_enabled_) {
+  if (certification_enabled_ || stop_admissibility_enabled_) {
     prepare_certification_broadphase(
       *costmap_ros_->getCostmap(), certification_workspace_);
   }
@@ -1746,6 +2261,9 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   const bool terminal_stop_policy_enabled =
     native_generator && terminal_stop_goal_capture_distance_ > 0.0 &&
     terminal_stop_goal_capture_yaw_tolerance_ > 0.0;
+  const bool terminal_endpoint_policy_enabled =
+    terminal_stop_policy_enabled && current_goal_pose_valid_ &&
+    current_terminal_path_heading_valid_;
   if (certification_enabled_ &&
     terminal_stop_goal_distance_scale_ > 0.0 &&
     !current_terminal_distance_target_pose_valid_)
@@ -1789,6 +2307,8 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
   best_command_state;
   bool best_uses_reserve_recovery = false;
+  bool best_has_meaningful_progress = false;
+  bool best_captures_goal = false;
   std::vector<nav_2d_msgs::msg::Twist2D> best_stop_velocities;
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
   best_stop_states;
@@ -1796,9 +2316,21 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   std::size_t evaluation_index = 0u;
   dwb_msgs::msg::Trajectory2D trajectory_scratch;
   dwb_msgs::msg::TrajectoryScore score_scratch;
+  std::vector<geometry_msgs::msg::Pose2D> candidate_stop_poses;
   uint64_t best_clearance_risk_bucket =
     std::numeric_limits<uint64_t>::max();
-  bool clearance_constraint_triggered = false;
+  uint64_t best_clearance_trigger_bucket = 0u;
+  uint64_t best_clearance_guard_bucket =
+    std::numeric_limits<uint64_t>::max();
+  const bool clearance_progress_preference_enabled =
+    clearance_constraint_enabled_ && current_goal_pose_valid_ &&
+    current_terminal_distance_target_pose_valid_ &&
+    (clearance_constraint_minimum_subgoal_distance_progress_ > 0.0 ||
+    clearance_constraint_minimum_subgoal_heading_progress_ > 0.0) &&
+    std::hypot(
+      pose.x - current_goal_pose_.x,
+      pose.y - current_goal_pose_.y) >
+    clearance_constraint_motion_preference_goal_distance_;
 
   traj_generator_->startNewIteration(velocity);
   while (traj_generator_->hasMoreTwists()) {
@@ -1818,9 +2350,35 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       evaluation_index;
     ++evaluation_index;
     try {
+      TerminalStopAssessment terminal_stop_assessment;
+      candidate_stop_poses.clear();
+      if (terminal_endpoint_policy_enabled) {
+        if (!build_stop_trajectory(
+            trajectory_scratch, candidate_stop_poses, nullptr, nullptr,
+            canonical_index))
+        {
+          throw dwb_core::IllegalTrajectoryException(
+                  "TerminalGoalAdmissibility",
+                  "No dynamically feasible terminal stop sequence");
+        }
+        terminal_stop_assessment = assess_terminal_stop(
+          candidate_stop_poses, current_goal_pose_,
+          current_terminal_path_heading_,
+          terminal_stop_goal_capture_distance_,
+          terminal_stop_goal_capture_yaw_tolerance_,
+          terminal_stop_goal_capture_distance_);
+        if (!terminal_stop_assessment.available) {
+          throw dwb_core::IllegalTrajectoryException(
+                  "TerminalGoalAdmissibility",
+                  "Terminal stop endpoint is not finite");
+        }
+      }
       std::optional<double> precomputed_clearance_risk;
+      std::optional<double> precomputed_clearance_trigger_risk;
+      std::optional<double> precomputed_clearance_guard_risk;
       uint64_t candidate_clearance_risk_bucket = 0u;
       uint64_t candidate_clearance_trigger_bucket = 0u;
+      uint64_t candidate_clearance_guard_bucket = 0u;
       if (clearance_constraint_enabled_) {
         const double clearance_risk =
           clearance_constraint_critic_->scoreTrajectory(trajectory_scratch);
@@ -1850,6 +2408,8 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
                   "ClearanceConstraint",
                   "Clearance trigger risk is outside [0, 1]");
         }
+        precomputed_clearance_trigger_risk =
+          std::clamp(clearance_trigger_risk, 0.0, 1.0);
         const double trigger_risk =
           clearance_constraint_trigger_risk_ >= 0.0 ?
           clearance_constraint_trigger_risk_ :
@@ -1858,28 +2418,63 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           std::clamp(clearance_trigger_risk, 0.0, 1.0),
           trigger_risk,
           clearance_constraint_risk_resolution_);
-        clearance_constraint_triggered = clearance_constraint_triggered ||
-          candidate_clearance_trigger_bucket > 0u;
+        const double clearance_guard_risk =
+          clearance_constraint_guard_critic_.get() ==
+          clearance_constraint_critic_.get() ?
+          *precomputed_clearance_risk :
+          (clearance_constraint_guard_critic_.get() ==
+          clearance_constraint_trigger_critic_.get() ?
+          *precomputed_clearance_trigger_risk :
+          clearance_constraint_guard_critic_->scoreTrajectory(
+          trajectory_scratch));
+        if (!std::isfinite(clearance_guard_risk) ||
+          clearance_guard_risk < 0.0 ||
+          clearance_guard_risk > 1.0 + 1.0e-9)
+        {
+          throw dwb_core::IllegalTrajectoryException(
+                  "ClearanceConstraint",
+                  "Clearance guard risk is outside [0, 1]");
+        }
+        precomputed_clearance_guard_risk =
+          std::clamp(clearance_guard_risk, 0.0, 1.0);
+        candidate_clearance_guard_bucket = clearance_constraint_bucket(
+          *precomputed_clearance_guard_risk,
+          clearance_constraint_guard_admissible_risk_,
+          clearance_constraint_guard_risk_resolution_);
       }
       const bool avoidance_constraint_context =
-        clearance_constraint_enabled_ && best.total >= 0.0 &&
-        clearance_constraint_triggered;
-      double candidate_best_score =
-        best_uses_reserve_recovery ? -1.0 : best.total;
-      if (avoidance_constraint_context) {
-        if (candidate_clearance_risk_bucket < best_clearance_risk_bucket)
-        {
-          // A lower-risk bucket can win even with a larger path-following
-          // score, so it must complete every hard check and soft score.
-          candidate_best_score = -1.0;
-        } else if (
-          candidate_clearance_risk_bucket > best_clearance_risk_bucket)
-        {
-          // Preserve the physical-footprint critic at the head of the list,
-          // then permit normal short-circuiting for a candidate which cannot
-          // enter the current epsilon-feasible clearance set.
-          candidate_best_score = std::numeric_limits<double>::min();
-        }
+        clearance_constraint_is_active_for_pair(
+        clearance_constraint_enabled_, best.total,
+        candidate_clearance_trigger_bucket,
+        best_clearance_trigger_bucket);
+      const bool candidate_has_meaningful_progress =
+        clearance_progress_preference_enabled &&
+        trajectory_has_meaningful_subgoal_progress(
+        trajectory_scratch,
+        current_progress_reference_plan_,
+        current_terminal_distance_target_pose_,
+        clearance_constraint_minimum_subgoal_distance_progress_,
+        clearance_constraint_minimum_subgoal_heading_progress_);
+      double candidate_best_score = clearance_constraint_score_limit(
+        avoidance_constraint_context, candidate_has_meaningful_progress,
+        best_has_meaningful_progress, candidate_clearance_guard_bucket,
+        best_clearance_guard_bucket, candidate_clearance_risk_bucket,
+        best_clearance_risk_bucket, best_uses_reserve_recovery, best.total);
+      if (terminal_endpoint_policy_enabled && best.total >= 0.0 &&
+        terminal_stop_assessment.captures_goal != best_captures_goal)
+      {
+        // Goal capture is an admissibility class, not another critic weight.
+        // Fully evaluate a capturing candidate and short-circuit one that
+        // cannot displace an already capturing candidate.
+        candidate_best_score = terminal_stop_assessment.captures_goal ?
+          -1.0 : std::numeric_limits<double>::min();
+      }
+      if (terminal_endpoint_policy_enabled &&
+        terminal_stop_assessment.crosses_terminal_limit)
+      {
+        // Complete the normal hard checks before reporting an endpoint
+        // rejection, preserving the physical-footprint gate's precedence.
+        candidate_best_score = -1.0;
       }
       bool candidate_uses_reserve_recovery = false;
       double candidate_clearance_risk = 0.0;
@@ -1888,26 +2483,78 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         candidate_best_score,
         score_scratch, record_full_evaluation_details_,
         &candidate_uses_reserve_recovery, precomputed_clearance_risk,
-        &candidate_clearance_risk);
+        precomputed_clearance_trigger_risk,
+        precomputed_clearance_guard_risk,
+        &candidate_clearance_risk,
+        terminal_endpoint_policy_enabled ? &candidate_stop_poses : nullptr);
       (void)candidate_clearance_risk;
+      if (terminal_endpoint_policy_enabled &&
+        terminal_stop_assessment.crosses_terminal_limit)
+      {
+        std::ostringstream detail;
+        detail << std::setprecision(17) <<
+          "predicted_stop_beyond_path_end" <<
+          ";goal_x=" << current_goal_pose_.x <<
+          ";goal_y=" << current_goal_pose_.y <<
+          ";terminal_x=" << terminal_stop_assessment.terminal_pose.x <<
+          ";terminal_y=" << terminal_stop_assessment.terminal_pose.y <<
+          ";longitudinal_error=" <<
+          terminal_stop_assessment.longitudinal_error <<
+          ";lateral_error=" << terminal_stop_assessment.lateral_error <<
+          ";maximum_overshoot=" << terminal_stop_goal_capture_distance_;
+        throw dwb_core::IllegalTrajectoryException(
+                "TerminalGoalAdmissibility", detail.str());
+      }
+      if (record_full_evaluation_details_ &&
+        terminal_stop_assessment.available)
+      {
+        std::ostringstream detail;
+        detail << std::setprecision(17) <<
+          "__terminal_stop__:capture=" <<
+          (terminal_stop_assessment.captures_goal ? "true" : "false") <<
+          ";position_error=" << terminal_stop_assessment.position_error <<
+          ";yaw_error=" << terminal_stop_assessment.yaw_error <<
+          ";longitudinal_error=" <<
+          terminal_stop_assessment.longitudinal_error <<
+          ";lateral_error=" << terminal_stop_assessment.lateral_error <<
+          ";terminal_x=" << terminal_stop_assessment.terminal_pose.x <<
+          ";terminal_y=" << terminal_stop_assessment.terminal_pose.y;
+        dwb_msgs::msg::CriticScore terminal_detail;
+        terminal_detail.name = detail.str();
+        terminal_detail.scale = 0.0;
+        terminal_detail.raw_score = 0.0;
+        score_scratch.scores.push_back(std::move(terminal_detail));
+      }
       const bool recovery_mode_matches =
         candidate_uses_reserve_recovery == best_uses_reserve_recovery;
+      const bool terminal_capture_rank_is_better =
+        terminal_endpoint_policy_enabled && recovery_mode_matches &&
+        terminal_stop_assessment.captures_goal != best_captures_goal &&
+        terminal_stop_assessment.captures_goal;
+      const bool terminal_capture_class_matches =
+        !terminal_endpoint_policy_enabled ||
+        terminal_stop_assessment.captures_goal == best_captures_goal;
       const bool avoidance_rank_is_better =
         avoidance_constraint_context && recovery_mode_matches &&
+        terminal_capture_class_matches &&
         clearance_constraint_prefers_candidate(
+        candidate_has_meaningful_progress, best_has_meaningful_progress,
+        candidate_clearance_guard_bucket, best_clearance_guard_bucket,
         candidate_clearance_risk_bucket, best_clearance_risk_bucket,
         score_scratch.total, best.total,
         canonical_index, best_canonical_index);
       const bool normal_rank_is_better =
         !avoidance_constraint_context && recovery_mode_matches &&
-        (score_scratch.total < best.total ||
-        (score_scratch.total == best.total &&
-        canonical_index < best_canonical_index));
+        terminal_stop_prefers_candidate(
+        terminal_stop_assessment.captures_goal, best_captures_goal,
+        score_scratch.total, best.total,
+        canonical_index, best_canonical_index);
       const bool is_best =
         best.total < 0.0 ||
         (!candidate_uses_reserve_recovery &&
         best_uses_reserve_recovery) ||
-        avoidance_rank_is_better || normal_rank_is_better;
+        terminal_capture_rank_is_better || avoidance_rank_is_better ||
+        normal_rank_is_better;
       bool is_worst = worst_total < 0.0;
       if (!is_worst) {
         is_worst = score_scratch.total > worst_total;
@@ -1933,6 +2580,10 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         }
         best_canonical_index = canonical_index;
         best_clearance_risk_bucket = candidate_clearance_risk_bucket;
+        best_clearance_trigger_bucket = candidate_clearance_trigger_bucket;
+        best_clearance_guard_bucket = candidate_clearance_guard_bucket;
+        best_has_meaningful_progress = candidate_has_meaningful_progress;
+        best_captures_goal = terminal_stop_assessment.captures_goal;
         best_uses_reserve_recovery =
           candidate_uses_reserve_recovery;
         if (results) {
@@ -1977,6 +2628,17 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       }
       tracker.addIllegalTrajectory(exception);
     }
+  }
+
+  const bool avoidance_progress_unavailable =
+    best.total >= 0.0 && best_clearance_trigger_bucket > 0u &&
+    clearance_progress_preference_enabled &&
+    !best_has_meaningful_progress;
+  if (avoidance_progress_unavailable) {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "No legal avoidance candidate advances toward the Path subgoal; "
+      "using the stop-admissible candidate with the best weighted DWB score");
   }
 
   if (best.total >= 0.0) {
@@ -2062,29 +2724,34 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         std::make_move_iterator(best_stop_states.end()));
     }
     terminal_stop_goal_capture_active_ = false;
-    if (
-      terminal_stop_goal_capture_distance_ > 0.0 &&
-      terminal_stop_goal_capture_yaw_tolerance_ > 0.0 &&
-      current_goal_pose_valid_ &&
-      !best_stop_poses.empty())
-    {
-      const geometry_msgs::msg::Pose2D & terminal_pose =
-        best_stop_poses.back();
-      const double yaw_error = std::abs(std::atan2(
-          std::sin(terminal_pose.theta - current_goal_pose_.theta),
-          std::cos(terminal_pose.theta - current_goal_pose_.theta)));
-      const double position_error = std::hypot(
-        terminal_pose.x - current_goal_pose_.x,
-        terminal_pose.y - current_goal_pose_.y);
+    if (terminal_endpoint_policy_enabled) {
+      terminal_stop_goal_capture_active_ = best_captures_goal;
+    } else {
       if (
-        position_error <= terminal_stop_goal_capture_distance_ &&
-        yaw_error <= terminal_stop_goal_capture_yaw_tolerance_)
+        terminal_stop_goal_capture_distance_ > 0.0 &&
+        terminal_stop_goal_capture_yaw_tolerance_ > 0.0 &&
+        current_goal_pose_valid_ &&
+        !best_stop_poses.empty())
       {
-        terminal_stop_goal_capture_active_ = true;
+        const geometry_msgs::msg::Pose2D & terminal_pose =
+          best_stop_poses.back();
+        const double yaw_error = std::abs(std::atan2(
+            std::sin(terminal_pose.theta - current_goal_pose_.theta),
+            std::cos(terminal_pose.theta - current_goal_pose_.theta)));
+        const double position_error = std::hypot(
+          terminal_pose.x - current_goal_pose_.x,
+          terminal_pose.y - current_goal_pose_.y);
+        if (
+          position_error <= terminal_stop_goal_capture_distance_ &&
+          yaw_error <= terminal_stop_goal_capture_yaw_tolerance_)
+        {
+          terminal_stop_goal_capture_active_ = true;
+        }
       }
     }
     if (!certification_enabled_ &&
-      !terminal_stop_goal_capture_active_)
+      !terminal_stop_goal_capture_active_ &&
+      !no_valid_control_deceleration_fallback_enabled_)
     {
       retained_backup_commands_.clear();
       retained_backup_states_.clear();
@@ -2132,7 +2799,7 @@ CertifiedDWBLocalPlanner::scoreTrajectory(
   dwb_msgs::msg::TrajectoryScore score;
   score.traj = trajectory;
   score_trajectory_components(
-    trajectory, best_score, score, true, nullptr, std::nullopt, nullptr);
+    trajectory, best_score, score, true, nullptr);
   return score;
 }
 
@@ -2143,7 +2810,10 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
   const bool record_score_details,
   bool * used_reserve_recovery,
   const std::optional<double> precomputed_clearance_risk,
-  double * clearance_risk)
+  const std::optional<double> precomputed_clearance_trigger_risk,
+  const std::optional<double> precomputed_clearance_guard_risk,
+  double * clearance_risk,
+  const std::vector<geometry_msgs::msg::Pose2D> * precomputed_stop_poses)
 {
   if (used_reserve_recovery) {
     *used_reserve_recovery = false;
@@ -2160,6 +2830,7 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
   if (record_score_details) {
     score.scores.reserve(
       critics_.size() + (score_terminal_stop ? 1u : 0u) +
+      (stop_admissibility_enabled_ ? 1u : 0u) +
       (certification_enabled_ ? 2u : 0u));
   }
   for (dwb_core::TrajectoryCritic::Ptr & critic : critics_) {
@@ -2167,10 +2838,20 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     const bool is_clearance_constraint_critic =
       clearance_constraint_critic_ &&
       critic.get() == clearance_constraint_critic_.get();
+    const bool is_clearance_constraint_trigger_critic =
+      clearance_constraint_trigger_critic_ &&
+      critic.get() == clearance_constraint_trigger_critic_.get();
+    const bool is_clearance_constraint_guard_critic =
+      clearance_constraint_guard_critic_ &&
+      critic.get() == clearance_constraint_guard_critic_.get();
     if (critic_scale == 0.0) {
-      const double raw_score =
-        is_clearance_constraint_critic && precomputed_clearance_risk ?
-        *precomputed_clearance_risk : 0.0;
+      const double raw_score = zero_scale_clearance_diagnostic_score(
+        is_clearance_constraint_critic,
+        is_clearance_constraint_trigger_critic,
+        is_clearance_constraint_guard_critic,
+        precomputed_clearance_risk,
+        precomputed_clearance_trigger_risk,
+        precomputed_clearance_guard_risk);
       if (is_clearance_constraint_critic && clearance_risk) {
         *clearance_risk = raw_score;
       }
@@ -2186,7 +2867,14 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
 
     const double raw_score =
       is_clearance_constraint_critic && precomputed_clearance_risk ?
-      *precomputed_clearance_risk : critic->scoreTrajectory(trajectory);
+      *precomputed_clearance_risk :
+      (is_clearance_constraint_trigger_critic &&
+      precomputed_clearance_trigger_risk ?
+      *precomputed_clearance_trigger_risk :
+      (is_clearance_constraint_guard_critic &&
+      precomputed_clearance_guard_risk ?
+      *precomputed_clearance_guard_risk :
+      critic->scoreTrajectory(trajectory)));
     if (is_clearance_constraint_critic && clearance_risk) {
       *clearance_risk = raw_score;
     }
@@ -2205,26 +2893,36 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     }
   }
 
-  if (certification_enabled_ || score_terminal_stop) {
+  if (certification_enabled_ || stop_admissibility_enabled_ ||
+    score_terminal_stop)
+  {
     if (best_score >= 0.0 && score.total > best_score) {
       return;
     }
-    stop_pose_scratch_.clear();
-    if (!build_stop_trajectory(
-        trajectory, stop_pose_scratch_, nullptr, nullptr))
-    {
-      if (certification_enabled_) {
-        ++certification_rejections_.terminal_stop_infeasible;
+    if (!precomputed_stop_poses) {
+      stop_pose_scratch_.clear();
+      if (!build_stop_trajectory(
+          trajectory, stop_pose_scratch_, nullptr, nullptr))
+      {
+        if (certification_enabled_) {
+          ++certification_rejections_.terminal_stop_infeasible;
+        }
+        throw dwb_core::IllegalTrajectoryException(
+                certification_enabled_ ? "SafetyCertificate" :
+                (stop_admissibility_enabled_ ?
+                "StopAdmissibility" : "TerminalStopDynamics"),
+                "No dynamically feasible terminal stop sequence");
       }
+      precomputed_stop_poses = &stop_pose_scratch_;
+    }
+    if (precomputed_stop_poses->empty()) {
       throw dwb_core::IllegalTrajectoryException(
-              certification_enabled_ ?
-              "SafetyCertificate" : "TerminalStopDynamics",
-              "No dynamically feasible terminal stop sequence");
+              "TerminalStopDynamics", "Terminal stop sequence is empty");
     }
 
     if (score_terminal_stop) {
       const geometry_msgs::msg::Pose2D & terminal_pose =
-        stop_pose_scratch_.back();
+        precomputed_stop_poses->back();
       const char * stop_goal_score_name = nullptr;
       double stop_goal_raw_score = 0.0;
       switch (terminal_stop_score_mode_) {
@@ -2266,11 +2964,32 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     }
   }
 
+  if (stop_admissibility_enabled_) {
+    const CertificationResult stop_admissibility_result =
+      certify_pose_sequence(
+      *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
+      *precomputed_stop_poses, maximum_swept_distance_,
+      &certification_workspace_);
+    if (!stop_admissibility_result.safe) {
+      throw dwb_core::IllegalTrajectoryException(
+              "StopAdmissibility",
+              certification_failure_name(
+                stop_admissibility_result.failure));
+    }
+    if (record_score_details) {
+      dwb_msgs::msg::CriticScore admissibility_score;
+      admissibility_score.name = "StopAdmissibility";
+      admissibility_score.scale = 0.0;
+      admissibility_score.raw_score = 0.0;
+      score.scores.push_back(std::move(admissibility_score));
+    }
+  }
+
   if (certification_enabled_) {
     CertificationFailure failure = CertificationFailure::kInvalidInput;
     bool certificate_used_reserve_recovery = false;
     if (!certify_stop_poses(
-        stop_pose_scratch_, failure, nullptr,
+        *precomputed_stop_poses, failure, nullptr,
         &certificate_used_reserve_recovery))
     {
       record_certification_rejection(failure);
@@ -2433,6 +3152,7 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
   }
 
   bool used_reserve_recovery = false;
+  bool used_receding_horizon_deceleration = false;
   CertificationFailure failure = CertificationFailure::kInvalidInput;
   bool backup_is_valid = false;
   if (certification_enabled_) {
@@ -2451,15 +3171,41 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
       certify_pose_sequence(
       *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
       poses, maximum_swept_distance_);
-    RCLCPP_WARN(
-      logger_,
-      "Retained stop backup rejected during revalidation: %s; "
-      "planning_footprint_safe=%s; planning_footprint_failure=%s",
-      certification_failure_name(failure),
-      planning_footprint_result.safe ? "true" : "false",
-      certification_failure_name(planning_footprint_result.failure));
-    retained_backup_commands_.clear();
-    return false;
+    if (!certification_enabled_ &&
+      no_valid_control_deceleration_fallback_enabled_ && poses.size() >= 2u)
+    {
+      std::vector<geometry_msgs::msg::Pose2D> immediate_poses{
+        poses.begin(), poses.begin() + 2};
+      const CertificationResult immediate_result = certify_pose_sequence(
+        *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
+        immediate_poses, maximum_swept_distance_);
+      if (immediate_result.safe) {
+        // A newly observed obstacle can invalidate the complete stop suffix
+        // even though its next native deceleration step remains collision
+        // free. Return only that verified step and replan on the next cycle;
+        // throwing here would make controller_server publish an abrupt zero.
+        poses = std::move(immediate_poses);
+        backup_is_valid = true;
+        used_receding_horizon_deceleration = true;
+        RCLCPP_WARN_THROTTLE(
+          logger_, *clock_, 1000,
+          "Complete retained stop intersects the latest costmap; "
+          "dispatching one physical-footprint-safe native deceleration step "
+          "and replanning");
+      }
+    }
+    if (!backup_is_valid) {
+      RCLCPP_WARN(
+        logger_,
+        "Retained stop backup rejected during revalidation: %s; "
+        "planning_footprint_safe=%s; planning_footprint_failure=%s",
+        certification_failure_name(failure),
+        planning_footprint_result.safe ? "true" : "false",
+        certification_failure_name(planning_footprint_result.failure));
+      retained_backup_commands_.clear();
+      retained_backup_states_.clear();
+      return false;
+    }
   }
 
   backup_score = dwb_msgs::msg::TrajectoryScore();
@@ -2467,10 +3213,11 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
   backup_score.traj.velocity = retained_backup_commands_.front();
   backup_score.traj.poses = std::move(poses);
   dwb_msgs::msg::CriticScore certificate_score;
-  certificate_score.name = certification_enabled_ ?
-    "RetainedSafetyBackup" :
+  certificate_score.name = used_receding_horizon_deceleration ?
+    "RecedingNoValidControlDeceleration" :
+    (certification_enabled_ ? "RetainedSafetyBackup" :
     (no_valid_control_deceleration_fallback_enabled_ ?
-    "RetainedNoValidControlDeceleration" : "RetainedTerminalStop");
+    "RetainedNoValidControlDeceleration" : "RetainedTerminalStop"));
   certificate_score.scale = 1.0;
   certificate_score.raw_score = 0.0;
   backup_score.scores.push_back(certificate_score);
@@ -2581,6 +3328,11 @@ void CertifiedDWBLocalPlanner::reset_trial_callback(
   retained_backup_states_.clear();
   terminal_stop_goal_capture_active_ = false;
   global_plan_.poses.clear();
+  terminal_reference_plan_.poses.clear();
+  current_progress_reference_plan_.poses.clear();
+  current_goal_pose_valid_ = false;
+  current_terminal_path_heading_valid_ = false;
+  current_terminal_distance_target_pose_valid_ = false;
   for (dwb_core::TrajectoryCritic::Ptr & critic : critics_) {
     critic->reset();
   }
@@ -2597,6 +3349,8 @@ void CertifiedDWBLocalPlanner::reset_trial_callback(
     std::lock_guard<std::mutex> command_lock(command_state_mutex_);
     pending_issued_commands_.clear();
     dispatched_command_ = nav_2d_msgs::msg::Twist2D();
+    dispatched_command_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    dispatched_command_time_valid_ = false;
     // The transport reset service is called after this controller reset. Do
     // not certify a new epoch until its observable reset dispatch and valid
     // state have both arrived.

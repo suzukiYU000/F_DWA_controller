@@ -21,11 +21,32 @@
 #ifndef F_DWA_CONTROLLER__PATH_SUBGOAL_HPP_
 #define F_DWA_CONTROLLER__PATH_SUBGOAL_HPP_
 
+#include "dwb_msgs/msg/trajectory2_d.hpp"
 #include "geometry_msgs/msg/pose2_d.hpp"
 #include "nav_2d_msgs/msg/path2_d.hpp"
 
 namespace f_dwa_controller
 {
+
+struct PathProjection
+{
+  double arclength{0.0};
+  double lateral_error{0.0};
+  double tangent_heading{0.0};
+  double distance{0.0};
+};
+
+bool project_pose_onto_path(
+  const nav_2d_msgs::msg::Path2D & path,
+  const geometry_msgs::msg::Pose2D & pose,
+  PathProjection & projection);
+
+bool trajectory_has_meaningful_path_progress(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  const nav_2d_msgs::msg::Path2D & path,
+  const geometry_msgs::msg::Pose2D & heading_target,
+  double minimum_arclength_progress,
+  double minimum_heading_progress);
 
 bool compute_path_subgoal(
   const nav_2d_msgs::msg::Path2D & path,

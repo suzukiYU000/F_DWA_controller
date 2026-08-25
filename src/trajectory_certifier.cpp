@@ -140,10 +140,24 @@ CertificationResult check_pose(
     const unsigned char cost = costmap.getCost(cell.x, cell.y);
     if (cost == nav2_costmap_2d::NO_INFORMATION) {
       result.failure = CertificationFailure::kUnknownSpace;
+      result.has_failure_cell = true;
+      result.failure_cell_x = cell.x;
+      result.failure_cell_y = cell.y;
+      result.failure_cell_cost = cost;
+      costmap.mapToWorld(
+        cell.x, cell.y, result.failure_cell_world_x,
+        result.failure_cell_world_y);
       return result;
     }
     if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
       result.failure = CertificationFailure::kLethalObstacle;
+      result.has_failure_cell = true;
+      result.failure_cell_x = cell.x;
+      result.failure_cell_y = cell.y;
+      result.failure_cell_cost = cost;
+      costmap.mapToWorld(
+        cell.x, cell.y, result.failure_cell_world_x,
+        result.failure_cell_world_y);
       return result;
     }
   }
@@ -355,6 +369,12 @@ CertificationResult certify_pose_sequence(
     result.failure = pose_result.failure;
     result.has_failure_pose = true;
     result.failure_pose = poses.front();
+    result.has_failure_cell = pose_result.has_failure_cell;
+    result.failure_cell_x = pose_result.failure_cell_x;
+    result.failure_cell_y = pose_result.failure_cell_y;
+    result.failure_cell_cost = pose_result.failure_cell_cost;
+    result.failure_cell_world_x = pose_result.failure_cell_world_x;
+    result.failure_cell_world_y = pose_result.failure_cell_world_y;
     return result;
   }
 
@@ -401,6 +421,12 @@ CertificationResult certify_pose_sequence(
         result.failure_interpolation_index =
           static_cast<std::size_t>(interpolation_index);
         result.failure_pose = interpolated;
+        result.has_failure_cell = pose_result.has_failure_cell;
+        result.failure_cell_x = pose_result.failure_cell_x;
+        result.failure_cell_y = pose_result.failure_cell_y;
+        result.failure_cell_cost = pose_result.failure_cell_cost;
+        result.failure_cell_world_x = pose_result.failure_cell_world_x;
+        result.failure_cell_world_y = pose_result.failure_cell_world_y;
         return result;
       }
     }

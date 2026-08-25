@@ -86,6 +86,114 @@ TEST(PathSubgoal, UsesPathEndWhenRemainingDistanceIsShort)
   EXPECT_NEAR(subgoal.y, 0.0, 1.0e-12);
 }
 
+TEST(PathSubgoal, ProjectsCandidateProgressAroundCornerByArclength)
+{
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(3u);
+  path.poses[1u].x = 1.0;
+  path.poses[2u].x = 1.0;
+  path.poses[2u].y = 1.0;
+  geometry_msgs::msg::Pose2D pose;
+  pose.x = 1.0;
+  pose.y = 0.4;
+  f_dwa_controller::PathProjection projection;
+
+  ASSERT_TRUE(f_dwa_controller::project_pose_onto_path(
+      path, pose, projection));
+  EXPECT_NEAR(projection.arclength, 1.4, 1.0e-12);
+  EXPECT_NEAR(projection.lateral_error, 0.0, 1.0e-12);
+  EXPECT_NEAR(projection.tangent_heading, M_PI_2, 1.0e-12);
+}
+
+TEST(PathSubgoal, MeaningfulProgressUsesPathArclengthAndLookaheadHeading)
+{
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(3u);
+  path.poses[1u].x = 1.0;
+  path.poses[2u].x = 1.0;
+  path.poses[2u].y = 1.0;
+  geometry_msgs::msg::Pose2D heading_target;
+  heading_target.theta = M_PI_2;
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(3u);
+  trajectory.poses[0u].x = 0.9;
+  trajectory.poses[1u].x = 1.0;
+  trajectory.poses[1u].y = 0.1;
+  trajectory.poses[2u].x = 1.0;
+  trajectory.poses[2u].y = 0.3;
+
+  EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.20, 0.20));
+
+  trajectory.poses[1u].x = 1.1;
+  trajectory.poses[1u].y = 0.0;
+  trajectory.poses[2u].x = 1.3;
+  trajectory.poses[2u].y = 0.0;
+  EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.20, 0.20));
+
+  trajectory.poses[2u].theta = 0.25;
+  EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.20, 0.20));
+  EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.0, 0.20));
+}
+
+TEST(PathSubgoal, ArclengthProgressRejectsGrowingPathDistance)
+{
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(2u);
+  path.poses[1u].x = 2.0;
+  geometry_msgs::msg::Pose2D heading_target;
+  heading_target.x = 2.0;
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(3u);
+  trajectory.poses[0u].x = 0.5;
+  trajectory.poses[0u].y = 0.7;
+  trajectory.poses[1u].x = 0.55;
+  trajectory.poses[1u].y = 0.775;
+  trajectory.poses[2u].x = 1.0;
+  trajectory.poses[2u].y = 2.2;
+
+  EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.025, 0.025));
+}
+
+TEST(PathSubgoal, ArclengthProgressAllowsBoundedPathDistanceGrowth)
+{
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(2u);
+  path.poses[1u].x = 2.0;
+  geometry_msgs::msg::Pose2D heading_target;
+  heading_target.x = 2.0;
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(2u);
+  trajectory.poses[0u].x = 0.5;
+  trajectory.poses[0u].y = 0.7;
+  trajectory.poses[1u].x = 0.525;
+  trajectory.poses[1u].y = 0.72;
+
+  EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.025, 0.025));
+}
+
+TEST(PathSubgoal, ArclengthProgressRejectsGrowingSubgoalHeadingError)
+{
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(2u);
+  path.poses[1u].x = 2.0;
+  geometry_msgs::msg::Pose2D heading_target;
+  heading_target.x = 2.0;
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(2u);
+  trajectory.poses[0u].x = 0.5;
+  trajectory.poses[1u].x = 0.55;
+  trajectory.poses[1u].theta = 0.1;
+
+  EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.025, 0.025));
+}
+
 TEST(PathSubgoal, RejectsInvalidInput)
 {
   nav_2d_msgs::msg::Path2D empty_path;

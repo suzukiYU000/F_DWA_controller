@@ -46,10 +46,10 @@ struct DelayedCommand
 
 struct CommandDelayParameters
 {
-  double min_delay_ms{60.0};
-  double max_delay_ms{80.0};
-  double mean_delay_ms{70.0};
-  double delay_stddev_ms{3.333333333333333};
+  double min_delay_ms{5.0};
+  double max_delay_ms{35.0};
+  double mean_delay_ms{20.0};
+  double delay_stddev_ms{5.0};
   double zero_threshold{0.0};
   // Three bounded-delay entries, one normal callback-order entry, and one
   // delayed-timer scheduling slot. A further backlog is transport_invalid.

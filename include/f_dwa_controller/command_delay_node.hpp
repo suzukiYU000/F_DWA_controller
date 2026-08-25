@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -32,6 +33,7 @@
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
 #include "f_dwa_controller/command_delay_queue.hpp"
 #include "f_dwa_controller/msg/command_dispatch.hpp"
+#include "f_dwa_controller/velocity_response_model.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -46,6 +48,12 @@ public:
   explicit CommandDelayNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
 
 private:
+  struct AxisResponseTarget
+  {
+    rclcpp::Time activation_time;
+    double command{0.0};
+  };
+
   void command_callback(const geometry_msgs::msg::Twist::SharedPtr message);
   void timer_callback();
   void reset_trial_callback(
@@ -58,6 +66,11 @@ private:
     const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   [[nodiscard]] bool observe_time_locked(const rclcpp::Time & observed_at);
+  void reset_velocity_response_locked(const rclcpp::Time & reset_at);
+  void schedule_velocity_response_target_locked(
+    const geometry_msgs::msg::Twist & target,
+    const rclcpp::Time & dispatched_at);
+  void advance_velocity_response_locked(const rclcpp::Time & update_at);
   void invalidate_transport(
     const rclcpp::Time & detected_at,
     const std::string & reason);
@@ -78,6 +91,7 @@ private:
   // inversion with the Timer's final state recheck.
   std::mutex publish_mutex_;
   std::unique_ptr<CommandDelayQueue> delay_queue_;
+  geometry_msgs::msg::Twist last_dispatched_command_;
   geometry_msgs::msg::Twist last_applied_command_;
   uint64_t last_applied_sequence_{0};
   bool has_applied_sequence_{false};
@@ -88,6 +102,15 @@ private:
   std::chrono::steady_clock::time_point pending_reset_requested_at_;
   double stopped_velocity_threshold_{0.01};
   double minimum_input_interval_seconds_{0.0};
+  bool velocity_response_model_enabled_{false};
+  AxisVelocityResponseModel linear_velocity_response_model_{0.035, 0.02, 1.0};
+  AxisVelocityResponseModel angular_velocity_response_model_{0.015, 0.085, 0.95};
+  rclcpp::Time response_state_time_{0, 0, RCL_ROS_TIME};
+  bool has_response_state_time_{false};
+  double active_linear_response_target_{0.0};
+  double active_angular_response_target_{0.0};
+  std::deque<AxisResponseTarget> pending_linear_response_targets_;
+  std::deque<AxisResponseTarget> pending_angular_response_targets_;
   int64_t publish_period_nanoseconds_{30000000};
   rclcpp::Time last_robot_publish_time_{0, 0, RCL_ROS_TIME};
   bool has_robot_publish_time_{false};

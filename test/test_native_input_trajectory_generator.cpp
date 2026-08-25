@@ -401,6 +401,7 @@ class ScorePlannerAdapter final : public CertifiedDWBLocalPlanner
 {
 public:
   using TestDiagnosticPublication = DiagnosticPublication;
+  using TestTerminalStopAssessment = TerminalStopAssessment;
 
   void set_test_critics(
     std::vector<dwb_core::TrajectoryCritic::Ptr> critics,
@@ -480,7 +481,20 @@ public:
       risk, admissible_risk, resolution);
   }
 
+  static double zero_scale_clearance_diagnostic(
+    const bool is_primary,
+    const bool is_trigger,
+    const std::optional<double> primary_risk,
+    const std::optional<double> trigger_risk)
+  {
+    return zero_scale_clearance_diagnostic_score(
+      is_primary, is_trigger, false, primary_risk, trigger_risk,
+      std::nullopt);
+  }
+
   static bool clearance_prefers_candidate(
+    const bool candidate_has_meaningful_progress,
+    const bool best_has_meaningful_progress,
     const uint64_t candidate_risk_bucket,
     const uint64_t best_risk_bucket,
     const double candidate_total,
@@ -489,7 +503,80 @@ public:
     const std::size_t best_index)
   {
     return clearance_constraint_prefers_candidate(
+      candidate_has_meaningful_progress, best_has_meaningful_progress,
+      0u, 0u,
       candidate_risk_bucket, best_risk_bucket,
+      candidate_total, best_total, candidate_index, best_index);
+  }
+
+  static bool clearance_guard_prefers_candidate(
+    const uint64_t candidate_guard_bucket,
+    const uint64_t best_guard_bucket,
+    const uint64_t candidate_risk_bucket,
+    const uint64_t best_risk_bucket,
+    const double candidate_total,
+    const double best_total)
+  {
+    return clearance_constraint_prefers_candidate(
+      true, true, candidate_guard_bucket, best_guard_bucket,
+      candidate_risk_bucket, best_risk_bucket,
+      candidate_total, best_total, 0u, 1u);
+  }
+
+  static bool clearance_is_active_for_pair(
+    const bool enabled,
+    const double best_total,
+    const uint64_t candidate_trigger_bucket,
+    const uint64_t best_trigger_bucket)
+  {
+    return clearance_constraint_is_active_for_pair(
+      enabled, best_total, candidate_trigger_bucket, best_trigger_bucket);
+  }
+
+  static bool has_meaningful_subgoal_progress(
+    const dwb_msgs::msg::Trajectory2D & trajectory,
+    const nav_2d_msgs::msg::Path2D & path,
+    const geometry_msgs::msg::Pose2D & subgoal,
+    const double minimum_distance_progress,
+    const double minimum_heading_progress)
+  {
+    return trajectory_has_meaningful_subgoal_progress(
+      trajectory, path, subgoal, minimum_distance_progress,
+      minimum_heading_progress);
+  }
+
+  static bool terminal_plan_fallback(
+    const geometry_msgs::msg::Pose2D & pose,
+    const geometry_msgs::msg::Pose2D & terminal_pose,
+    const double capture_distance)
+  {
+    return terminal_plan_fallback_is_applicable(
+      pose, terminal_pose, capture_distance);
+  }
+
+  static TestTerminalStopAssessment terminal_stop_assessment(
+    const std::vector<geometry_msgs::msg::Pose2D> & stop_poses,
+    const geometry_msgs::msg::Pose2D & goal_pose,
+    const double terminal_path_heading,
+    const double capture_distance,
+    const double capture_yaw_tolerance,
+    const double maximum_overshoot)
+  {
+    return assess_terminal_stop(
+      stop_poses, goal_pose, terminal_path_heading, capture_distance,
+      capture_yaw_tolerance, maximum_overshoot);
+  }
+
+  static bool terminal_prefers_candidate(
+    const bool candidate_captures_goal,
+    const bool best_captures_goal,
+    const double candidate_total,
+    const double best_total,
+    const std::size_t candidate_index,
+    const std::size_t best_index)
+  {
+    return terminal_stop_prefers_candidate(
+      candidate_captures_goal, best_captures_goal,
       candidate_total, best_total, candidate_index, best_index);
   }
 };
@@ -967,6 +1054,67 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
+  ClearanceConstraintKeepsStrictBoundaryWithoutRankingMapQuantization)
+{
+  constexpr double admissible_risk = 0.0001;
+  constexpr double violation_resolution = 0.01;
+
+  // Preserve the earlier obstacle-avoidance distinction at the admissible
+  // boundary while treating the latest run's tiny map-induced differences as
+  // members of the same weighted-score set.
+  EXPECT_EQ(
+    ScorePlannerAdapter::clearance_bucket(
+      0.000034, admissible_risk, violation_resolution),
+    0u);
+  EXPECT_EQ(
+    ScorePlannerAdapter::clearance_bucket(
+      0.000359, admissible_risk, violation_resolution),
+    1u);
+  EXPECT_EQ(
+    ScorePlannerAdapter::clearance_bucket(
+      0.31086189, admissible_risk, violation_resolution),
+    ScorePlannerAdapter::clearance_bucket(
+      0.31091166, admissible_risk, violation_resolution));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ClearanceConstraintSeparatesLatestSensorObstacleCandidates)
+{
+  constexpr double admissible_risk = 0.0001;
+  constexpr double violation_resolution = 0.01;
+  const uint64_t safer_bucket = ScorePlannerAdapter::clearance_bucket(
+    0.7972353101, admissible_risk, violation_resolution);
+  const uint64_t selected_bucket = ScorePlannerAdapter::clearance_bucket(
+    0.8039881587, admissible_risk, violation_resolution);
+
+  EXPECT_EQ(safer_bucket, 80u);
+  EXPECT_EQ(selected_bucket, 81u);
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
+      true, true, safer_bucket, selected_bucket,
+      208.6572113, 208.1932526, 60u, 90u));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ZeroScaleClearanceTriggerRetainsItsPrecomputedDiagnosticRisk)
+{
+  EXPECT_DOUBLE_EQ(
+    ScorePlannerAdapter::zero_scale_clearance_diagnostic(
+      false, true, 0.80, 0.60),
+    0.60);
+  EXPECT_DOUBLE_EQ(
+    ScorePlannerAdapter::zero_scale_clearance_diagnostic(
+      true, true, 0.80, 0.60),
+    0.80);
+  EXPECT_DOUBLE_EQ(
+    ScorePlannerAdapter::zero_scale_clearance_diagnostic(
+      false, false, 0.80, 0.60),
+    0.0);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
   ClearanceConstraintRejectsInvalidNormalization)
 {
   EXPECT_THROW(
@@ -982,16 +1130,179 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
-  ClearanceConstraintRanksRiskBeforePathCostAndProgress)
+  ClearanceConstraintUsesWeightedScoreWhenNoCandidateMakesProgress)
+{
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
+      false, false, 3u, 4u, 120.0, 100.0, 8u, 9u));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
+      false, false, 5u, 4u, 10.0, 100.0, 8u, 9u));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
+      false, false, 4u, 4u, 99.0, 100.0, 10u, 9u));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
+      false, false, 4u, 4u, 100.0, 100.0, 8u, 9u));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ClearanceConstraintPrefersSafeProgressOverAStationaryMinimumRiskCandidate)
 {
   EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
-      3u, 4u, 120.0, 100.0, 8u, 9u));
+      true, false, 8u, 3u, 140.0, 100.0, 8u, 9u));
   EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
-      5u, 4u, 10.0, 100.0, 8u, 9u));
+      false, true, 2u, 8u, 80.0, 140.0, 8u, 9u));
   EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
-      4u, 4u, 99.0, 100.0, 10u, 9u));
-  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
-      4u, 4u, 100.0, 100.0, 8u, 9u));
+      true, true, 7u, 8u, 150.0, 140.0, 8u, 9u));
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
+      true, true, 9u, 8u, 100.0, 140.0, 8u, 9u));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ClearanceConstraintAppliesMappedWallGuardBeforeDynamicRisk)
+{
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_guard_prefers_candidate(
+      0u, 2u, 8u, 3u, 150.0, 100.0));
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_guard_prefers_candidate(
+      3u, 1u, 2u, 8u, 80.0, 140.0));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_guard_prefers_candidate(
+      0u, 0u, 7u, 8u, 150.0, 140.0));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ClearanceConstraintTriggerIsPairLocalInsteadOfSticky)
+{
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_is_active_for_pair(
+      false, 100.0, 2u, 0u));
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_is_active_for_pair(
+      true, -1.0, 2u, 0u));
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_is_active_for_pair(
+      true, 100.0, 0u, 0u));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_is_active_for_pair(
+      true, 100.0, 2u, 0u));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_is_active_for_pair(
+      true, 100.0, 0u, 2u));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ClearanceConstraintRequiresProgressTowardThePathSubgoal)
+{
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(3u);
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(2u);
+  path.poses[1u].x = 1.0;
+  geometry_msgs::msg::Pose2D subgoal;
+  subgoal.x = 1.0;
+  trajectory.poses[0u].theta = 0.4;
+  trajectory.poses[1u].theta = 0.4;
+  trajectory.poses[2u].theta = 0.4;
+  trajectory.poses[1u].x = 0.09;
+  EXPECT_FALSE(ScorePlannerAdapter::has_meaningful_subgoal_progress(
+      trajectory, path, subgoal, 0.10, 0.15));
+
+  trajectory.poses[1u].x = 0.10;
+  EXPECT_TRUE(ScorePlannerAdapter::has_meaningful_subgoal_progress(
+      trajectory, path, subgoal, 0.10, 0.15));
+
+  trajectory.poses[1u].x = -0.10;
+  EXPECT_FALSE(ScorePlannerAdapter::has_meaningful_subgoal_progress(
+      trajectory, path, subgoal, 0.10, 0.15));
+
+  trajectory.poses[1u].x = 0.0;
+  trajectory.poses[2u].theta = 0.20;
+  EXPECT_FALSE(ScorePlannerAdapter::has_meaningful_subgoal_progress(
+      trajectory, path, subgoal, 0.10, 0.15));
+  EXPECT_TRUE(ScorePlannerAdapter::has_meaningful_subgoal_progress(
+      trajectory, path, subgoal, 0.0, 0.15));
+
+  trajectory.poses[2u].theta = 0.60;
+  EXPECT_FALSE(ScorePlannerAdapter::has_meaningful_subgoal_progress(
+      trajectory, path, subgoal, 0.10, 0.15));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  TerminalStopAssessmentUsesReferencePathTangentForOvershoot)
+{
+  geometry_msgs::msg::Pose2D goal;
+  goal.x = 5.0;
+  goal.y = 2.0;
+  goal.theta = 1.2;
+  std::vector<geometry_msgs::msg::Pose2D> stop_poses(1u);
+  stop_poses.back().x = 5.10;
+  stop_poses.back().y = 2.05;
+  stop_poses.back().theta = 1.2;
+
+  auto assessment = ScorePlannerAdapter::terminal_stop_assessment(
+    stop_poses, goal, 0.0, 0.25, M_PI, 0.25);
+  ASSERT_TRUE(assessment.available);
+  EXPECT_TRUE(assessment.captures_goal);
+  EXPECT_FALSE(assessment.crosses_terminal_limit);
+  EXPECT_NEAR(assessment.longitudinal_error, 0.10, 1.0e-12);
+  EXPECT_NEAR(assessment.lateral_error, 0.05, 1.0e-12);
+
+  stop_poses.back().x = 5.26;
+  assessment = ScorePlannerAdapter::terminal_stop_assessment(
+    stop_poses, goal, 0.0, 0.25, M_PI, 0.25);
+  EXPECT_FALSE(assessment.captures_goal);
+  EXPECT_TRUE(assessment.crosses_terminal_limit);
+
+  stop_poses.back().x = 5.0;
+  stop_poses.back().y = 2.30;
+  assessment = ScorePlannerAdapter::terminal_stop_assessment(
+    stop_poses, goal, 0.0, 0.25, M_PI, 0.25);
+  EXPECT_FALSE(assessment.captures_goal);
+  EXPECT_FALSE(assessment.crosses_terminal_limit);
+  EXPECT_NEAR(assessment.longitudinal_error, 0.0, 1.0e-12);
+  EXPECT_NEAR(assessment.lateral_error, 0.30, 1.0e-12);
+
+  // A curved path can put an earlier leg on the positive side of the
+  // endpoint's tangent plane. It is not an endpoint overshoot while it remains
+  // outside the Goal capture corridor.
+  stop_poses.back().x = 5.30;
+  assessment = ScorePlannerAdapter::terminal_stop_assessment(
+    stop_poses, goal, 0.0, 0.25, M_PI, 0.25);
+  EXPECT_FALSE(assessment.captures_goal);
+  EXPECT_FALSE(assessment.crosses_terminal_limit);
+  EXPECT_NEAR(assessment.longitudinal_error, 0.30, 1.0e-12);
+  EXPECT_NEAR(assessment.lateral_error, 0.30, 1.0e-12);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  TerminalPlanFallbackAppliesOnlyInsideGoalPositionTolerance)
+{
+  geometry_msgs::msg::Pose2D terminal_pose;
+  terminal_pose.x = 0.7041669926966279;
+  terminal_pose.y = -3.5416669017026834;
+  geometry_msgs::msg::Pose2D stopped_pose;
+  stopped_pose.x = 0.879495380832244;
+  stopped_pose.y = -3.57449105893422;
+
+  EXPECT_TRUE(ScorePlannerAdapter::terminal_plan_fallback(
+      stopped_pose, terminal_pose, 0.25));
+  stopped_pose.x = terminal_pose.x + 0.250001;
+  stopped_pose.y = terminal_pose.y;
+  EXPECT_FALSE(ScorePlannerAdapter::terminal_plan_fallback(
+      stopped_pose, terminal_pose, 0.25));
+  EXPECT_FALSE(ScorePlannerAdapter::terminal_plan_fallback(
+      stopped_pose, terminal_pose, 0.0));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  TerminalGoalCaptureOutranksWeightedScoreWithoutChangingWeights)
+{
+  EXPECT_TRUE(ScorePlannerAdapter::terminal_prefers_candidate(
+      true, false, 200.0, 10.0, 8u, 9u));
+  EXPECT_FALSE(ScorePlannerAdapter::terminal_prefers_candidate(
+      false, true, 1.0, 200.0, 8u, 9u));
+  EXPECT_TRUE(ScorePlannerAdapter::terminal_prefers_candidate(
+      true, true, 99.0, 100.0, 10u, 9u));
+  EXPECT_TRUE(ScorePlannerAdapter::terminal_prefers_candidate(
+      false, false, 100.0, 100.0, 8u, 9u));
 }
 
 TEST_F(

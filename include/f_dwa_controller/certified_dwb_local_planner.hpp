@@ -40,6 +40,7 @@
 #include "f_dwa_controller/native_input_trajectory_generator.hpp"
 #include "f_dwa_controller/planning_snapshot.hpp"
 #include "f_dwa_controller/trajectory_certifier.hpp"
+#include "f_dwa_controller/velocity_response_model.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "std_srvs/srv/trigger.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -73,6 +74,18 @@ public:
     double best_score = -1) override;
 
 protected:
+  struct TerminalStopAssessment
+  {
+    bool available{false};
+    bool captures_goal{false};
+    bool crosses_terminal_limit{false};
+    double position_error{0.0};
+    double yaw_error{0.0};
+    double longitudinal_error{0.0};
+    double lateral_error{0.0};
+    geometry_msgs::msg::Pose2D terminal_pose;
+  };
+
   struct DiagnosticPublication
   {
     std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> evaluation;
@@ -94,7 +107,11 @@ protected:
     bool record_score_details,
     bool * used_reserve_recovery = nullptr,
     std::optional<double> precomputed_clearance_risk = std::nullopt,
-    double * clearance_risk = nullptr);
+    std::optional<double> precomputed_clearance_trigger_risk = std::nullopt,
+    std::optional<double> precomputed_clearance_guard_risk = std::nullopt,
+    double * clearance_risk = nullptr,
+    const std::vector<geometry_msgs::msg::Pose2D> *
+    precomputed_stop_poses = nullptr);
   visualization_msgs::msg::MarkerArray build_candidate_markers(
     const dwb_msgs::msg::LocalPlanEvaluation & evaluation) const;
   static bool coalesce_stale_marker_publication(
@@ -104,9 +121,51 @@ protected:
     double clearance_risk,
     double admissible_risk,
     double risk_resolution);
+  static double zero_scale_clearance_diagnostic_score(
+    bool is_clearance_constraint_critic,
+    bool is_clearance_constraint_trigger_critic,
+    bool is_clearance_constraint_guard_critic,
+    std::optional<double> precomputed_clearance_risk,
+    std::optional<double> precomputed_clearance_trigger_risk,
+    std::optional<double> precomputed_clearance_guard_risk);
+  static bool trajectory_has_meaningful_subgoal_progress(
+    const dwb_msgs::msg::Trajectory2D & trajectory,
+    const nav_2d_msgs::msg::Path2D & path,
+    const geometry_msgs::msg::Pose2D & subgoal,
+    double minimum_distance_progress,
+    double minimum_heading_progress);
+  nav_2d_msgs::msg::Path2D transformGlobalPlan(
+    const nav_2d_msgs::msg::Pose2DStamped & pose) override;
+  static bool terminal_plan_fallback_is_applicable(
+    const geometry_msgs::msg::Pose2D & pose,
+    const geometry_msgs::msg::Pose2D & terminal_pose,
+    double capture_distance);
   static bool clearance_constraint_prefers_candidate(
+    bool candidate_has_meaningful_progress,
+    bool best_has_meaningful_progress,
+    uint64_t candidate_guard_risk_bucket,
+    uint64_t best_guard_risk_bucket,
     uint64_t candidate_risk_bucket,
     uint64_t best_risk_bucket,
+    double candidate_total,
+    double best_total,
+    std::size_t candidate_canonical_index,
+    std::size_t best_canonical_index);
+  static bool clearance_constraint_is_active_for_pair(
+    bool clearance_constraint_enabled,
+    double best_total,
+    uint64_t candidate_trigger_risk_bucket,
+    uint64_t best_trigger_risk_bucket);
+  static TerminalStopAssessment assess_terminal_stop(
+    const std::vector<geometry_msgs::msg::Pose2D> & stop_poses,
+    const geometry_msgs::msg::Pose2D & goal_pose,
+    double terminal_path_heading,
+    double capture_distance,
+    double capture_yaw_tolerance,
+    double maximum_overshoot);
+  static bool terminal_stop_prefers_candidate(
+    bool candidate_captures_goal,
+    bool best_captures_goal,
     double candidate_total,
     double best_total,
     std::size_t candidate_canonical_index,
@@ -140,7 +199,8 @@ private:
     const std_msgs::msg::Bool::SharedPtr message);
   void request_transport_invalidation(const char * reason);
   std::shared_ptr<const PlanningSnapshot> build_planning_snapshot(
-    const geometry_msgs::msg::PoseStamped & pose);
+    const geometry_msgs::msg::PoseStamped & pose,
+    const geometry_msgs::msg::Twist & observed_velocity);
   void record_issued_command(
     const geometry_msgs::msg::TwistStamped & command,
     const rclcpp::Time & issued_at,
@@ -216,14 +276,24 @@ private:
   std::string clearance_constraint_critic_name_{"FootprintClearance"};
   std::string clearance_constraint_trigger_critic_name_{
     "FootprintClearance"};
+  std::string clearance_constraint_guard_critic_name_{"FootprintClearance"};
   double clearance_constraint_admissible_risk_{0.05};
   double clearance_constraint_trigger_risk_{-1.0};
   double clearance_constraint_risk_resolution_{0.01};
+  double clearance_constraint_guard_admissible_risk_{1.0};
+  double clearance_constraint_guard_risk_resolution_{0.01};
+  double clearance_constraint_minimum_subgoal_distance_progress_{0.0};
+  double clearance_constraint_minimum_subgoal_heading_progress_{0.0};
+  double clearance_constraint_motion_preference_goal_distance_{0.0};
   std::shared_ptr<FootprintClearanceCritic> clearance_constraint_critic_;
   std::shared_ptr<FootprintClearanceCritic>
   clearance_constraint_trigger_critic_;
+  std::shared_ptr<FootprintClearanceCritic> clearance_constraint_guard_critic_;
   bool no_valid_control_deceleration_fallback_enabled_{false};
+  bool stop_admissibility_enabled_{false};
   bool nominal_delay_preview_enabled_{true};
+  bool use_observed_velocity_for_activation_state_{false};
+  bool velocity_response_prediction_enabled_{false};
   bool require_command_dispatch_state_{true};
   bool allow_safety_command_reduction_{false};
   bool command_dispatch_observed_{false};
@@ -232,6 +302,10 @@ private:
   bool expected_dispatch_sequence_ready_{false};
   uint64_t expected_dispatch_sequence_{0};
   double nominal_delay_preview_seconds_{0.07};
+  double velocity_response_prediction_seconds_{0.12};
+  double velocity_response_integration_step_seconds_{0.01};
+  AxisVelocityResponseModel linear_velocity_response_model_{0.035, 0.02, 1.0};
+  AxisVelocityResponseModel angular_velocity_response_model_{0.015, 0.085, 0.95};
   double certification_control_period_{0.03};
   double terminal_stop_maximum_time_{8.0};
   double terminal_stop_velocity_threshold_{0.01};
@@ -254,6 +328,8 @@ private:
   double maximum_angular_acceleration_{1.57};
   double maximum_angular_deceleration_{-1.57};
   nav_2d_msgs::msg::Twist2D dispatched_command_;
+  rclcpp::Time dispatched_command_time_{0, 0, RCL_ROS_TIME};
+  bool dispatched_command_time_valid_{false};
   std::deque<IssuedCommand> pending_issued_commands_;
   std::shared_ptr<const PlanningSnapshot> planning_snapshot_;
   bool planning_metrics_enabled_{true};
@@ -279,6 +355,10 @@ private:
   std::vector<geometry_msgs::msg::Pose2D> stop_pose_scratch_;
   geometry_msgs::msg::Pose2D current_goal_pose_;
   bool current_goal_pose_valid_{false};
+  nav_2d_msgs::msg::Path2D terminal_reference_plan_;
+  nav_2d_msgs::msg::Path2D current_progress_reference_plan_;
+  double current_terminal_path_heading_{0.0};
+  bool current_terminal_path_heading_valid_{false};
   geometry_msgs::msg::Pose2D current_terminal_distance_target_pose_;
   bool current_terminal_distance_target_pose_valid_{false};
 };

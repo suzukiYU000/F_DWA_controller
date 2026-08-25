@@ -32,6 +32,8 @@ namespace f_dwa_controller
 TEST(CommandDelayQueue, AppliesFixedDelayInFifoOrder)
 {
   CommandDelayParameters parameters;
+  parameters.min_delay_ms = 70.0;
+  parameters.max_delay_ms = 70.0;
   parameters.mean_delay_ms = 70.0;
   parameters.delay_stddev_ms = 0.0;
   parameters.max_queue_depth = 4;

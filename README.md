@@ -51,12 +51,16 @@ F-DWA defaults to a numeric 1.2 Hz low-pass cutoff, which preserves the ROS 1
 F-8 design. Its coefficients are generated deterministically by Python before
 Nav2 starts, so no source YAML contains a coefficient vector. The GUI accepts
 the cutoff in Hz; the established tap count and 20 Hz design rate stay fixed.
-The nominal F-DWA rollout uses the ROS 1 finite-pulse action primitive: the
-sampled raw input is active for 0.15 s and is then zero for the remainder of
-the 2.4 s scoring horizon. Every horizon state is still checked against the
-velocity and acceleration limits. Nav2 executes only the first control step
-and replans, while the independent stop certificate continues through delayed
-activation and complete stopping. Setting
+The nominal F-DWA rollout uses a two-control-cycle finite-pulse action
+primitive: the sampled raw input is active for 0.10 s and is then zero for the
+remainder of the scoring horizon. This is the shortest 20 Hz pulse that
+completed the fixed room-entrance replay; a one-cycle 0.05 s pulse did not
+produce enough predicted progress. The historical ROS 1 0.15 s pulse remains an
+explicit ablation; using it while dispatching only the first step can
+repeatedly overpredict a future filtered turn. Every horizon state is still
+checked against the velocity and acceleration limits, while the independent
+stop certificate continues through delayed activation and complete stopping.
+Setting
 `fir_prediction_pulse_duration: 0.0` restores the former full-horizon held
 input as an explicit ablation.
 
@@ -108,12 +112,15 @@ sequence for fair method or parameter comparisons.
 The package also provides `command_delay_transport`, a simulation-only command
 transport. It receives Nav2 commands, samples an independent truncated-normal
 delay for every command, preserves FIFO order, and applies at most one queued
-command per 33.333 Hz ROS-clock timer tick. The default distribution is bounded
-to 60--80 ms with mean 70 ms and standard deviation 3.333 ms.
+command per 33.333 Hz ROS-clock timer tick. The default sampled distribution is
+bounded to 5--35 ms with mean 20 ms and standard deviation 5 ms. Together with
+the Timer phase this reproduces the measured 11--71 ms real dispatch range.
 
-The transport publishes the command actually sent to the simulator on
-`/controller/applied_cmd_vel` and publishes a stamped change event on
-`/controller/command_dispatch`. A queue overflow publishes
+When `enable_velocity_response_model` is enabled, the transport then applies
+the identified axis-specific dead-time plus first-order WHILL response before
+sending velocity to Gazebo. `/controller/applied_cmd_vel` and the stamped
+`/controller/command_dispatch` event retain the actuator target, matching real
+mode; simulator odometry reports the resulting motion. A queue overflow publishes
 `/dwa_experiment/transport_valid = false`, records queue and last-command data
 on `/diagnostics`, clears the queue, and publishes zero thereafter. Such a run
 is a transport-invalid run, not an algorithm failure, and must be excluded and
