@@ -69,4 +69,12 @@
       Mean transformed-Path distance over every predicted trajectory pose.
     </description>
   </class>
+  <class
+    type="f_dwa_controller::PathDeviationCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Fixed soft cost when any predicted trajectory pose leaves a configurable
+      Euclidean-distance corridor around the transformed Path.
+    </description>
+  </class>
 </library>

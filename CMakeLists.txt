@@ -59,6 +59,7 @@ add_library(${library_name} SHARED
   src/mean_speed_critic.cpp
   src/native_input_dynamics.cpp
   src/native_input_trajectory_generator.cpp
+  src/path_deviation_critic.cpp
   src/path_subgoal.cpp
   src/path_subgoal_dist_critic.cpp
   src/terminal_approach_critic.cpp

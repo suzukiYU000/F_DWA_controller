@@ -18,6 +18,7 @@
 #include "f_dwa_controller/forward_obstacle_critic.hpp"
 #include "f_dwa_controller/mean_path_dist_critic.hpp"
 #include "f_dwa_controller/mean_speed_critic.hpp"
+#include "f_dwa_controller/path_deviation_critic.hpp"
 #include "f_dwa_controller/path_subgoal_dist_critic.hpp"
 #include "f_dwa_controller/terminal_approach_critic.hpp"
 #include "f_dwa_controller/trajectory_progress_critic.hpp"
@@ -650,6 +651,39 @@ TEST(MeanPathDistCritic, AveragesEveryPredictedPose)
   trajectory.poses[0].y = 1.0;
   trajectory.poses[1].y = 3.0;
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(trajectory), 2.0);
+}
+
+TEST(PathDeviationCritic, IsNeutralAtOrInsideMaximumDistance)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  geometry_msgs::msg::Pose2D current_pose;
+  geometry_msgs::msg::Pose2D goal;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(
+      current_pose, velocity, goal, straight_path(10.0)));
+
+  auto trajectory = trajectory_to(1.0, 1.0);
+  trajectory.poses.front().y = 1.5;
+  trajectory.poses.back().y = -1.5;
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(trajectory), 0.0);
+}
+
+TEST(PathDeviationCritic, AppliesOneFixedPenaltyForAnyOutsidePose)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  geometry_msgs::msg::Pose2D current_pose;
+  geometry_msgs::msg::Pose2D goal;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(
+      current_pose, velocity, goal, straight_path(10.0)));
+
+  auto slightly_outside = trajectory_to(1.0, 1.0);
+  slightly_outside.poses.front().y = 1.500001;
+  auto far_outside = trajectory_to(1.0, 1.0);
+  far_outside.poses.back().y = -3.0;
+
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(slightly_outside), 1000.0);
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(far_outside), 1000.0);
 }
 
 TEST(ForwardObstacleCritic, PenalizesBlockedNominalPath)

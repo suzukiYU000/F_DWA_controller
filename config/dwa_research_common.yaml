@@ -235,6 +235,7 @@ controller_server:
         # Evaluate the physical hard constraint before soft short-circuiting,
         # so every trajectory reported as valid has passed the footprint gate.
         - ObstacleFootprint
+        - PathDeviation
         - RotateToGoal
         - TerminalApproach
         - GoalAlign
@@ -269,6 +270,14 @@ controller_server:
       BaseObstacle.scale: 0.003125
       # BaseObstacle.scale: 0.15  # stronger-clearance ablation; recording invalid
       BaseObstacle.sum_scores: true
+      # ENGINEERING SAFEGUARD: keep the ordinary continuous path-ranking
+      # critics unchanged, but add one finite cost when any predicted pose
+      # leaves the 1.5 m Euclidean corridor around the transformed Path. The
+      # boundary itself is neutral, and this never rejects a trajectory.
+      PathDeviation.class: "f_dwa_controller::PathDeviationCritic"
+      PathDeviation.maximum_path_distance: 1.5
+      PathDeviation.deviation_penalty: 1000.0
+      PathDeviation.scale: 1.0
       # Keep the heading/path observation terms identical to the passing Nav2
       # DWB baseline.  R1 evidence showed that the former research-only values
       # (PathAlign 2.0, GoalAlign 1.5, 0.325 m) underweighted the north-room
