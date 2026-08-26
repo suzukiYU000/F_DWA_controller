@@ -131,42 +131,39 @@ bool trajectory_has_meaningful_path_progress(
     };
   const double initial_heading_error =
     heading_error(trajectory.poses.front());
-  // Nearest-path arclength can increase even while a trajectory diverges
-  // laterally from the path. Treat that projection artifact as progress only
-  // when path-distance and subgoal-heading errors do not grow beyond the
-  // corresponding progress resolutions.
+  // Nearest-path arclength can increase during the first few samples even
+  // when the remainder of a trajectory misses a turn. Classify progress from
+  // the executable endpoint, so an early 2.5 cm projection cannot hide a
+  // later departure from the Path.
   const double maximum_path_distance_growth =
     std::max(0.0, minimum_arclength_progress);
   const double maximum_heading_error_growth =
     minimum_heading_progress > 0.0 ?
     minimum_heading_progress : std::numeric_limits<double>::infinity();
-  for (const auto & pose : trajectory.poses) {
-    PathProjection candidate_projection;
-    if (!project_pose_onto_path(path, pose, candidate_projection)) {
-      return false;
-    }
-    if (minimum_arclength_progress > 0.0 &&
-      candidate_projection.arclength - initial_projection.arclength >=
-      minimum_arclength_progress - 1.0e-12 &&
-      candidate_projection.distance <= initial_projection.distance +
-      maximum_path_distance_growth + 1.0e-12 &&
-      heading_error(pose) <= initial_heading_error +
-      maximum_heading_error_growth + 1.0e-12)
-    {
-      return true;
-    }
-    // Heading-only motion is useful when rotation is the requested fallback,
-    // but it must not compete with translational progress when both criteria
-    // are configured. Otherwise a near-zero command can satisfy the progress
-    // class by rotating a few hundredths of a radian and then win solely on
-    // clearance risk.
-    if (minimum_arclength_progress <= 0.0 &&
-      minimum_heading_progress > 0.0 &&
-      initial_heading_error - heading_error(pose) >=
-      minimum_heading_progress - 1.0e-12)
-    {
-      return true;
-    }
+  const auto & terminal_pose = trajectory.poses.back();
+  PathProjection terminal_projection;
+  if (!project_pose_onto_path(path, terminal_pose, terminal_projection)) {
+    return false;
+  }
+  if (minimum_arclength_progress > 0.0 &&
+    terminal_projection.arclength - initial_projection.arclength >=
+    minimum_arclength_progress - 1.0e-12 &&
+    terminal_projection.distance <= initial_projection.distance +
+    maximum_path_distance_growth + 1.0e-12 &&
+    heading_error(terminal_pose) <= initial_heading_error +
+    maximum_heading_error_growth + 1.0e-12)
+  {
+    return true;
+  }
+  // Heading-only motion remains available for configurations that explicitly
+  // disable translational progress. With both enabled, continuous weighted
+  // path and heading critics decide between turning and translating.
+  if (minimum_arclength_progress <= 0.0 &&
+    minimum_heading_progress > 0.0 &&
+    initial_heading_error - heading_error(terminal_pose) >=
+    minimum_heading_progress - 1.0e-12)
+  {
+    return true;
   }
   return false;
 }

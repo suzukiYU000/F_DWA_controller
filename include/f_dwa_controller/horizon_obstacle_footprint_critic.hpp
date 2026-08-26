@@ -8,7 +8,11 @@
 #ifndef F_DWA_CONTROLLER__HORIZON_OBSTACLE_FOOTPRINT_CRITIC_HPP_
 #define F_DWA_CONTROLLER__HORIZON_OBSTACLE_FOOTPRINT_CRITIC_HPP_
 
+#include <cstddef>
+#include <vector>
+
 #include "dwb_critics/obstacle_footprint.hpp"
+#include "f_dwa_controller/trajectory_certifier.hpp"
 
 namespace f_dwa_controller
 {
@@ -41,6 +45,11 @@ protected:
   double score_time_horizon_{1.25};
   double maximum_swept_distance_{0.025};
   double footprint_radius_{0.0};
+  bool enable_initial_overlap_recovery_{false};
+  double initial_overlap_footprint_inset_{0.05};
+  double initial_overlap_recovery_penalty_{1000000.0};
+  std::vector<geometry_msgs::msg::Point> inset_core_footprint_;
+  CertificationWorkspace certification_workspace_;
 };
 
 }  // namespace f_dwa_controller

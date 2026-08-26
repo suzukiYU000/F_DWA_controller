@@ -1130,11 +1130,11 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
-  ClearanceConstraintUsesWeightedScoreWhenNoCandidateMakesProgress)
+  ClearanceConstraintRanksRiskBeforeWeightedScore)
 {
-  EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
-      false, false, 3u, 4u, 120.0, 100.0, 8u, 9u));
   EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
+      false, false, 3u, 4u, 120.0, 100.0, 8u, 9u));
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
       false, false, 5u, 4u, 10.0, 100.0, 8u, 9u));
   EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
       false, false, 4u, 4u, 99.0, 100.0, 10u, 9u));
@@ -1144,16 +1144,20 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
-  ClearanceConstraintPrefersSafeProgressOverAStationaryMinimumRiskCandidate)
+  ClearanceConstraintUsesProgressOnlyAfterRiskAndWeightedScoreTie)
 {
-  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
-      true, false, 8u, 3u, 140.0, 100.0, 8u, 9u));
   EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
+      true, false, 8u, 3u, 140.0, 100.0, 8u, 9u));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
       false, true, 2u, 8u, 80.0, 140.0, 8u, 9u));
   EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
       true, true, 7u, 8u, 150.0, 140.0, 8u, 9u));
   EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
       true, true, 9u, 8u, 100.0, 140.0, 8u, 9u));
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
+      true, false, 0u, 0u, 175.58, 113.35, 127u, 74u));
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
+      true, false, 0u, 0u, 100.0, 100.0, 8u, 9u));
 }
 
 TEST_F(
@@ -1203,10 +1207,12 @@ TEST_F(
       trajectory, path, subgoal, 0.10, 0.15));
 
   trajectory.poses[1u].x = 0.10;
+  trajectory.poses[2u].x = 0.10;
   EXPECT_TRUE(ScorePlannerAdapter::has_meaningful_subgoal_progress(
       trajectory, path, subgoal, 0.10, 0.15));
 
   trajectory.poses[1u].x = -0.10;
+  trajectory.poses[2u].x = -0.10;
   EXPECT_FALSE(ScorePlannerAdapter::has_meaningful_subgoal_progress(
       trajectory, path, subgoal, 0.10, 0.15));
 
@@ -1618,6 +1624,72 @@ TEST_F(
   EXPECT_EQ(disabled->call_count(), 0u);
   EXPECT_EQ(first->call_count(), kCommonCandidateCount + 1u);
   EXPECT_EQ(last->call_count(), kCommonCandidateCount + 1u);
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  RealtimeCandidateMarkersColorLegalTrajectoriesByWeightedTotal)
+{
+  ScorePlannerAdapter planner;
+  dwb_msgs::msg::LocalPlanEvaluation evaluation;
+  evaluation.header.frame_id = "odom";
+  evaluation.best_index = 0;
+
+  const auto trajectory_score = [](const double total, const double y) {
+      dwb_msgs::msg::TrajectoryScore score;
+      score.total = total;
+      score.traj.poses.resize(2u);
+      score.traj.poses.back().x = 0.5;
+      score.traj.poses.back().y = y;
+      return score;
+    };
+  evaluation.twists.push_back(trajectory_score(1.0, 0.0));
+  evaluation.twists.push_back(trajectory_score(2.0, 0.1));
+  evaluation.twists.push_back(trajectory_score(10.0, 0.2));
+  auto pruned = trajectory_score(1.5, 0.3);
+  dwb_msgs::msg::CriticScore short_circuit;
+  short_circuit.name = "__short_circuit__";
+  pruned.scores.push_back(short_circuit);
+  evaluation.twists.push_back(pruned);
+  evaluation.twists.push_back(trajectory_score(-1.0, -0.1));
+
+  const auto markers = planner.candidate_markers(evaluation);
+  const auto valid = std::find_if(
+    markers.markers.begin(), markers.markers.end(),
+    [](const auto & marker) {
+      return marker.ns == "dwb_candidates_valid";
+    });
+  const auto rejected = std::find_if(
+    markers.markers.begin(), markers.markers.end(),
+    [](const auto & marker) {
+      return marker.ns == "dwb_candidates_rejected";
+    });
+  const auto selected = std::find_if(
+    markers.markers.begin(), markers.markers.end(),
+    [](const auto & marker) {
+      return marker.ns == "dwb_candidate_selected";
+    });
+
+  ASSERT_NE(valid, markers.markers.end());
+  ASSERT_NE(rejected, markers.markers.end());
+  ASSERT_NE(selected, markers.markers.end());
+  ASSERT_EQ(valid->points.size(), 6u);
+  ASSERT_EQ(valid->colors.size(), valid->points.size());
+  // Legal candidates are ranked by every finite accumulated cost. A
+  // short-circuited score remains a lower bound, so the 1.5 candidate is blue,
+  // the 2.0 candidate is cyan and the 10.0 candidate is yellow.
+  EXPECT_LT(valid->colors.front().r, valid->colors.front().b);
+  EXPECT_LT(valid->colors.front().g, valid->colors.front().b);
+  EXPECT_GT(valid->colors[2u].r, valid->colors[2u].b);
+  EXPECT_GT(valid->colors[2u].g, valid->colors[2u].b);
+  EXPECT_GT(valid->colors.front().b, valid->colors[2u].b);
+  EXPECT_LT(valid->colors.back().r, valid->colors.back().b);
+  EXPECT_GT(valid->colors.back().b, valid->colors.front().b);
+  EXPECT_FLOAT_EQ(valid->colors.front().a, 0.36F);
+  EXPECT_TRUE(rejected->colors.empty());
+  EXPECT_GT(rejected->color.r, rejected->color.g);
+  EXPECT_GT(rejected->color.r, rejected->color.b);
+  EXPECT_GT(selected->color.g, selected->color.r);
 }
 
 TEST_F(

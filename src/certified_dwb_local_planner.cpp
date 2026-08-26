@@ -50,6 +50,7 @@
 #include "nav2_costmap_2d/footprint.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
+#include "std_msgs/msg/color_rgba.hpp"
 
 namespace f_dwa_controller
 {
@@ -86,10 +87,43 @@ bool is_positive_finite(const double value)
   return std::isfinite(value) && value > 0.0;
 }
 
+double normalized_cost_rank(
+  const double score, const std::vector<double> & sorted_costs)
+{
+  if (sorted_costs.size() < 2u) {
+    return 0.0;
+  }
+  const auto position = std::lower_bound(
+    sorted_costs.begin(), sorted_costs.end(), score);
+  const auto rank = static_cast<double>(
+    std::distance(sorted_costs.begin(), position));
+  return std::clamp(
+    rank / static_cast<double>(sorted_costs.size() - 1u), 0.0, 1.0);
+}
+
+std_msgs::msg::ColorRGBA weighted_cost_color(const double normalized_rank)
+{
+  const double ratio = std::clamp(normalized_rank, 0.0, 1.0);
+  std_msgs::msg::ColorRGBA color;
+  if (ratio <= 0.5) {
+    const double local = ratio * 2.0;
+    color.r = static_cast<float>(0.05 * (1.0 - local));
+    color.g = static_cast<float>(0.35 + 0.55 * local);
+    color.b = static_cast<float>(1.00 - 0.05 * local);
+  } else {
+    const double local = (ratio - 0.5) * 2.0;
+    color.r = static_cast<float>(local);
+    color.g = static_cast<float>(0.90 - 0.08 * local);
+    color.b = static_cast<float>(0.95 - 0.90 * local);
+  }
+  color.a = 0.36F;
+  return color;
+}
+
 double clearance_constraint_score_limit(
   const bool constraint_active,
-  const bool candidate_has_progress,
-  const bool best_has_progress,
+  const bool,
+  const bool,
   const uint64_t candidate_guard_risk_bucket,
   const uint64_t best_guard_risk_bucket,
   const uint64_t candidate_risk_bucket,
@@ -101,22 +135,20 @@ double clearance_constraint_score_limit(
   if (!constraint_active) {
     return normal_limit;
   }
-  if (candidate_has_progress != best_has_progress) {
-    return candidate_has_progress ?
-           -1.0 : std::numeric_limits<double>::min();
-  }
-  if (!candidate_has_progress ||
-    (candidate_guard_risk_bucket == best_guard_risk_bucket &&
-    candidate_risk_bucket == best_risk_bucket))
-  {
-    return normal_limit;
-  }
   if (candidate_guard_risk_bucket != best_guard_risk_bucket) {
     return candidate_guard_risk_bucket < best_guard_risk_bucket ?
            -1.0 : std::numeric_limits<double>::min();
   }
-  return candidate_risk_bucket < best_risk_bucket ?
-         -1.0 : std::numeric_limits<double>::min();
+  if (candidate_risk_bucket != best_risk_bucket) {
+    return candidate_risk_bucket < best_risk_bucket ?
+           -1.0 : std::numeric_limits<double>::min();
+  }
+  // Once both candidates are in the same physical-clearance risk bands,
+  // evaluate the complete weighted DWB objective. Path progress is already
+  // represented by the path, heading, progress, and speed critics; using its
+  // boolean diagnostic as a higher-priority class let a candidate win after
+  // only 2.5 cm of initial progress even when its endpoint missed the turn.
+  return normal_limit;
 }
 
 std::string candidate_diagnostic_metadata(
@@ -274,6 +306,12 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".clearance_constraint_motion_preference_goal_distance",
     rclcpp::ParameterValue(0.0));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_include_footprint_approach",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".clearance_constraint_footprint_approach_trigger_risk",
+    rclcpp::ParameterValue(0.1));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".enable_nominal_delay_preview",
     rclcpp::ParameterValue(true));
   nav2_util::declare_parameter_if_not_declared(
@@ -370,6 +408,12 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".reserve_recovery_hysteresis",
     rclcpp::ParameterValue(true));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".enable_initial_overlap_recovery",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".initial_overlap_footprint_inset",
+    rclcpp::ParameterValue(0.05));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".trial_reset_service_name",
     rclcpp::ParameterValue("~/" + name + "/reset_trial_state"));
   nav2_util::declare_parameter_if_not_declared(
@@ -427,6 +471,12 @@ void CertifiedDWBLocalPlanner::configure(
   node->get_parameter(
     name + ".clearance_constraint_motion_preference_goal_distance",
     clearance_constraint_motion_preference_goal_distance_);
+  node->get_parameter(
+    name + ".clearance_constraint_include_footprint_approach",
+    clearance_constraint_include_footprint_approach_);
+  node->get_parameter(
+    name + ".clearance_constraint_footprint_approach_trigger_risk",
+    clearance_constraint_footprint_approach_trigger_risk_);
   node->get_parameter(
     name + ".enable_no_valid_control_deceleration_fallback",
     no_valid_control_deceleration_fallback_enabled_);
@@ -532,6 +582,12 @@ void CertifiedDWBLocalPlanner::configure(
     name + ".reserve_recovery_hysteresis",
     reserve_recovery_hysteresis_);
   node->get_parameter(
+    name + ".enable_initial_overlap_recovery",
+    enable_initial_overlap_recovery_);
+  node->get_parameter(
+    name + ".initial_overlap_footprint_inset",
+    initial_overlap_footprint_inset_);
+  node->get_parameter(
     name + ".planning_metrics_enabled", planning_metrics_enabled_);
   node->get_parameter(
     name + ".planning_metrics_report_interval",
@@ -577,6 +633,8 @@ void CertifiedDWBLocalPlanner::configure(
     terminal_stop_goal_capture_yaw_tolerance_ < 0.0 ||
     !std::isfinite(minimum_certified_margin_) ||
     minimum_certified_margin_ < 0.0 ||
+    !std::isfinite(initial_overlap_footprint_inset_) ||
+    initial_overlap_footprint_inset_ <= 0.0 ||
     !std::isfinite(clearance_constraint_admissible_risk_) ||
     clearance_constraint_admissible_risk_ < 0.0 ||
     clearance_constraint_admissible_risk_ > 1.0 ||
@@ -598,6 +656,9 @@ void CertifiedDWBLocalPlanner::configure(
     clearance_constraint_minimum_subgoal_heading_progress_ < 0.0 ||
     !std::isfinite(clearance_constraint_motion_preference_goal_distance_) ||
     clearance_constraint_motion_preference_goal_distance_ < 0.0 ||
+    !std::isfinite(clearance_constraint_footprint_approach_trigger_risk_) ||
+    clearance_constraint_footprint_approach_trigger_risk_ < 0.0 ||
+    clearance_constraint_footprint_approach_trigger_risk_ > 1.0 ||
     !is_positive_finite(maximum_swept_distance_) ||
     planning_metrics_report_interval_ <= 0 ||
     !is_positive_finite(planning_deadline_seconds_) ||
@@ -622,6 +683,15 @@ void CertifiedDWBLocalPlanner::configure(
   clearance_constraint_trigger_critic_.reset();
   clearance_constraint_guard_critic_.reset();
   for (const auto & critic : critics_) {
+    if (critic->getName() == clearance_constraint_trigger_critic_name_) {
+      if (clearance_constraint_trigger_critic_) {
+        throw nav2_core::ControllerException(
+                "clearance_constraint_trigger_critic_name is not unique: " +
+                clearance_constraint_trigger_critic_name_);
+      }
+      clearance_constraint_trigger_critic_ = critic;
+    }
+
     const auto clearance_critic =
       std::dynamic_pointer_cast<FootprintClearanceCritic>(critic);
     if (!clearance_critic) {
@@ -634,16 +704,6 @@ void CertifiedDWBLocalPlanner::configure(
                 clearance_constraint_critic_name_);
       }
       clearance_constraint_critic_ = clearance_critic;
-    }
-    if (clearance_critic->getName() ==
-      clearance_constraint_trigger_critic_name_)
-    {
-      if (clearance_constraint_trigger_critic_) {
-        throw nav2_core::ControllerException(
-                "clearance_constraint_trigger_critic_name is not unique: " +
-                clearance_constraint_trigger_critic_name_);
-      }
-      clearance_constraint_trigger_critic_ = clearance_critic;
     }
     if (clearance_critic->getName() ==
       clearance_constraint_guard_critic_name_)
@@ -818,8 +878,8 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
       // critic preparation, and candidate certification use one snapshot.
       certification_costmap_lock.lock();
     }
-    if (certification_enabled_) {
-      prepare_certified_footprint();
+    if (certification_enabled_ || enable_initial_overlap_recovery_) {
+      prepare_collision_footprints();
     }
     planning_snapshot_ = build_planning_snapshot(pose, velocity);
     if (!planning_snapshot_->valid) {
@@ -916,9 +976,26 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
         *costmap, costmap_ros_->getRobotFootprint(),
         planning_snapshot_->delay_trajectory, maximum_swept_distance_);
       if (!physical_delay_result.safe) {
-        throw nav2_core::NoValidControl(
-                std::string("Predicted real response prefix is unsafe: ") +
-                certification_failure_name(physical_delay_result.failure));
+        const bool recoverable_boundary_overlap =
+          enable_initial_overlap_recovery_ &&
+          physical_delay_result.failure ==
+          CertificationFailure::kLethalObstacle &&
+          certify_initial_overlap_margin_sequence(
+          *costmap, costmap_ros_->getRobotFootprint(),
+          initial_overlap_core_footprint_,
+          planning_snapshot_->delay_trajectory,
+          maximum_swept_distance_, nullptr,
+          &certification_workspace_, true);
+        if (recoverable_boundary_overlap) {
+          RCLCPP_WARN_THROTTLE(
+            logger_, *clock_, 1000,
+            "Committed response overlaps only the physical-footprint "
+            "boundary strip; evaluating core-safe maximum-effort candidates");
+        } else {
+          throw nav2_core::NoValidControl(
+                  std::string("Predicted real response prefix is unsafe: ") +
+                  certification_failure_name(physical_delay_result.failure));
+        }
       }
     }
 
@@ -1626,20 +1703,6 @@ bool CertifiedDWBLocalPlanner::clearance_constraint_prefers_candidate(
   const std::size_t candidate_canonical_index,
   const std::size_t best_canonical_index)
 {
-  if (candidate_has_meaningful_progress != best_has_meaningful_progress) {
-    return candidate_has_meaningful_progress;
-  }
-  // When no legal candidate can make immediate subgoal progress, preserve the
-  // conventional weighted DWB objective. Ranking that recovery set by minimum
-  // clearance risk alone can keep steering away from the Path indefinitely.
-  // Every candidate reaching this comparator has already passed the hard
-  // footprint and full-stop admissibility checks.
-  if (!candidate_has_meaningful_progress) {
-    if (candidate_total != best_total) {
-      return candidate_total < best_total;
-    }
-    return candidate_canonical_index < best_canonical_index;
-  }
   if (candidate_guard_risk_bucket != best_guard_risk_bucket) {
     return candidate_guard_risk_bucket < best_guard_risk_bucket;
   }
@@ -1648,6 +1711,13 @@ bool CertifiedDWBLocalPlanner::clearance_constraint_prefers_candidate(
   }
   if (candidate_total != best_total) {
     return candidate_total < best_total;
+  }
+  // Progress is a deterministic tie-break only. The weighted objective
+  // already contains continuous path-progress and mean-speed terms, while
+  // this boolean cannot describe how a candidate behaves after first meeting
+  // its resolution-level threshold.
+  if (candidate_has_meaningful_progress != best_has_meaningful_progress) {
+    return candidate_has_meaningful_progress;
   }
   return candidate_canonical_index < best_canonical_index;
 }
@@ -1956,6 +2026,18 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
   status.color.a = 0.96F;
 
   const int best_index = evaluation.best_index;
+  std::vector<double> ranked_valid_costs;
+  ranked_valid_costs.reserve(evaluation.twists.size());
+  for (std::size_t index = 0u; index < evaluation.twists.size(); ++index) {
+    const auto & score = evaluation.twists[index];
+    if (static_cast<int>(index) != best_index &&
+      std::isfinite(score.total) && score.total >= 0.0)
+    {
+      ranked_valid_costs.push_back(static_cast<double>(score.total));
+    }
+  }
+  std::sort(ranked_valid_costs.begin(), ranked_valid_costs.end());
+
   std::size_t valid_count = 0u;
   std::map<std::string, std::size_t> rejection_counts;
   bool status_position_set = false;
@@ -2005,7 +2087,15 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
       continue;
     }
     auto & points = legal ? valid.points : rejected.points;
+    auto * colors = legal ? &valid.colors : nullptr;
+    const auto color = legal ?
+      weighted_cost_color(
+      normalized_cost_rank(score.total, ranked_valid_costs)) :
+      std_msgs::msg::ColorRGBA();
     points.reserve(points.size() + 2u * (poses.size() - 1u));
+    if (colors) {
+      colors->reserve(colors->size() + 2u * (poses.size() - 1u));
+    }
     for (std::size_t pose_index = 1; pose_index < poses.size(); ++pose_index) {
       const auto & first = poses[pose_index - 1u];
       const auto & second = poses[pose_index];
@@ -2022,6 +2112,10 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
       second_point.z = 0.02;
       points.push_back(first_point);
       points.push_back(second_point);
+      if (colors) {
+        colors->push_back(color);
+        colors->push_back(color);
+      }
     }
   }
   if (selected_no_valid_control_fallback) {
@@ -2379,9 +2473,11 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       uint64_t candidate_clearance_risk_bucket = 0u;
       uint64_t candidate_clearance_trigger_bucket = 0u;
       uint64_t candidate_clearance_guard_bucket = 0u;
+      double footprint_approach_risk = 0.0;
       if (clearance_constraint_enabled_) {
         const double clearance_risk =
-          clearance_constraint_critic_->scoreTrajectory(trajectory_scratch);
+          clearance_constraint_critic_->scoreTrajectoryWithApproachRisk(
+          trajectory_scratch, &footprint_approach_risk);
         if (!std::isfinite(clearance_risk) || clearance_risk < 0.0 ||
           clearance_risk > 1.0 + 1.0e-9)
         {
@@ -2394,30 +2490,41 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           *precomputed_clearance_risk,
           clearance_constraint_admissible_risk_,
           clearance_constraint_risk_resolution_);
-        const double clearance_trigger_risk =
+        const double configured_trigger_risk =
           clearance_constraint_trigger_critic_.get() ==
           clearance_constraint_critic_.get() ?
           *precomputed_clearance_risk :
           clearance_constraint_trigger_critic_->scoreTrajectory(
           trajectory_scratch);
-        if (!std::isfinite(clearance_trigger_risk) ||
-          clearance_trigger_risk < 0.0 ||
-          clearance_trigger_risk > 1.0 + 1.0e-9)
+        if (!std::isfinite(configured_trigger_risk) ||
+          configured_trigger_risk < 0.0 ||
+          configured_trigger_risk > 1.0 + 1.0e-9 ||
+          !std::isfinite(footprint_approach_risk) ||
+          footprint_approach_risk < 0.0 ||
+          footprint_approach_risk > 1.0 + 1.0e-9)
         {
           throw dwb_core::IllegalTrajectoryException(
                   "ClearanceConstraint",
                   "Clearance trigger risk is outside [0, 1]");
         }
         precomputed_clearance_trigger_risk =
-          std::clamp(clearance_trigger_risk, 0.0, 1.0);
+          std::clamp(configured_trigger_risk, 0.0, 1.0);
         const double trigger_risk =
           clearance_constraint_trigger_risk_ >= 0.0 ?
           clearance_constraint_trigger_risk_ :
           clearance_constraint_admissible_risk_;
         candidate_clearance_trigger_bucket = clearance_constraint_bucket(
-          std::clamp(clearance_trigger_risk, 0.0, 1.0),
+          *precomputed_clearance_trigger_risk,
           trigger_risk,
           clearance_constraint_risk_resolution_);
+        if (clearance_constraint_include_footprint_approach_) {
+          candidate_clearance_trigger_bucket = std::max(
+            candidate_clearance_trigger_bucket,
+            clearance_constraint_bucket(
+              std::clamp(footprint_approach_risk, 0.0, 1.0),
+              clearance_constraint_footprint_approach_trigger_risk_,
+              clearance_constraint_risk_resolution_));
+        }
         const double clearance_guard_risk =
           clearance_constraint_guard_critic_.get() ==
           clearance_constraint_critic_.get() ?
@@ -2477,6 +2584,7 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         candidate_best_score = -1.0;
       }
       bool candidate_uses_reserve_recovery = false;
+      bool completed_weighted_score = true;
       double candidate_clearance_risk = 0.0;
       score_trajectory_components(
         trajectory_scratch,
@@ -2486,8 +2594,25 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         precomputed_clearance_trigger_risk,
         precomputed_clearance_guard_risk,
         &candidate_clearance_risk,
-        terminal_endpoint_policy_enabled ? &candidate_stop_poses : nullptr);
+        terminal_endpoint_policy_enabled ? &candidate_stop_poses : nullptr,
+        &completed_weighted_score);
       (void)candidate_clearance_risk;
+      if (record_full_evaluation_details_ &&
+        clearance_constraint_include_footprint_approach_)
+      {
+        dwb_msgs::msg::CriticScore approach_detail;
+        approach_detail.name = "__footprint_approach__";
+        approach_detail.scale = 0.0;
+        approach_detail.raw_score = footprint_approach_risk;
+        score_scratch.scores.push_back(std::move(approach_detail));
+      }
+      if (record_full_evaluation_details_ && !completed_weighted_score) {
+        dwb_msgs::msg::CriticScore short_circuit_detail;
+        short_circuit_detail.name = "__short_circuit__";
+        short_circuit_detail.scale = 0.0;
+        short_circuit_detail.raw_score = 1.0;
+        score_scratch.scores.push_back(std::move(short_circuit_detail));
+      }
       if (terminal_endpoint_policy_enabled &&
         terminal_stop_assessment.crosses_terminal_limit)
       {
@@ -2563,7 +2688,11 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       tracker.addLegalTrajectory();
       if (results) {
         score_scratch.traj = trajectory_scratch;
+        // A short-circuited total is a valid lower bound on the final weighted
+        // cost. Preserve it for diagnostic color ranking instead of mapping
+        // every pruned candidate to the same artificial maximum.
         results->twists.push_back(score_scratch);
+        score_scratch.total = score_total;
       }
       if (is_best) {
         if (native_generator) {
@@ -2813,8 +2942,12 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
   const std::optional<double> precomputed_clearance_trigger_risk,
   const std::optional<double> precomputed_clearance_guard_risk,
   double * clearance_risk,
-  const std::vector<geometry_msgs::msg::Pose2D> * precomputed_stop_poses)
+  const std::vector<geometry_msgs::msg::Pose2D> * precomputed_stop_poses,
+  bool * completed_weighted_score)
 {
+  if (completed_weighted_score) {
+    *completed_weighted_score = true;
+  }
   if (used_reserve_recovery) {
     *used_reserve_recovery = false;
   }
@@ -2889,6 +3022,9 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
     if (short_circuit_trajectory_evaluation_ &&
       best_score > 0.0 && score.total > best_score)
     {
+      if (completed_weighted_score) {
+        *completed_weighted_score = false;
+      }
       break;
     }
   }
@@ -2965,12 +3101,12 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
   }
 
   if (stop_admissibility_enabled_) {
-    const CertificationResult stop_admissibility_result =
-      certify_pose_sequence(
-      *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
-      *precomputed_stop_poses, maximum_swept_distance_,
-      &certification_workspace_);
-    if (!stop_admissibility_result.safe) {
+    CertificationResult stop_admissibility_result;
+    bool used_initial_overlap_recovery = false;
+    if (!certify_physical_sequence(
+        *precomputed_stop_poses, &stop_admissibility_result,
+        &used_initial_overlap_recovery))
+    {
       throw dwb_core::IllegalTrajectoryException(
               "StopAdmissibility",
               certification_failure_name(
@@ -2982,6 +3118,13 @@ void CertifiedDWBLocalPlanner::score_trajectory_components(
       admissibility_score.scale = 0.0;
       admissibility_score.raw_score = 0.0;
       score.scores.push_back(std::move(admissibility_score));
+      if (used_initial_overlap_recovery) {
+        dwb_msgs::msg::CriticScore recovery_score;
+        recovery_score.name = "InitialOverlapRecovery";
+        recovery_score.scale = 0.0;
+        recovery_score.raw_score = 1.0;
+        score.scores.push_back(std::move(recovery_score));
+      }
     }
   }
 
@@ -3152,6 +3295,7 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
   }
 
   bool used_reserve_recovery = false;
+  bool used_initial_overlap_recovery = false;
   bool used_receding_horizon_deceleration = false;
   CertificationFailure failure = CertificationFailure::kInvalidInput;
   bool backup_is_valid = false;
@@ -3159,12 +3303,11 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
     backup_is_valid = certify_stop_poses(
       poses, failure, nullptr, &used_reserve_recovery);
   } else {
-    const CertificationResult planning_footprint_result =
-      certify_pose_sequence(
-      *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
-      poses, maximum_swept_distance_);
+    CertificationResult planning_footprint_result;
+    backup_is_valid = certify_physical_sequence(
+      poses, &planning_footprint_result,
+      &used_initial_overlap_recovery);
     failure = planning_footprint_result.failure;
-    backup_is_valid = planning_footprint_result.safe;
   }
   if (!backup_is_valid) {
     const CertificationResult planning_footprint_result =
@@ -3228,6 +3371,13 @@ bool CertifiedDWBLocalPlanner::build_revalidated_backup(
     recovery_score.raw_score = 1.0;
     backup_score.scores.push_back(recovery_score);
   }
+  if (used_initial_overlap_recovery) {
+    dwb_msgs::msg::CriticScore recovery_score;
+    recovery_score.name = "InitialOverlapRecovery";
+    recovery_score.scale = 0.0;
+    recovery_score.raw_score = 1.0;
+    backup_score.scores.push_back(recovery_score);
+  }
   auto native_generator =
     std::dynamic_pointer_cast<NativeInputTrajectoryGenerator>(
     traj_generator_);
@@ -3278,12 +3428,74 @@ bool CertifiedDWBLocalPlanner::certify_stop_poses(
   return true;
 }
 
-void CertifiedDWBLocalPlanner::prepare_certified_footprint()
+bool CertifiedDWBLocalPlanner::certify_physical_sequence(
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  CertificationResult * output_result,
+  bool * used_initial_overlap_recovery) const
+{
+  if (used_initial_overlap_recovery) {
+    *used_initial_overlap_recovery = false;
+  }
+  const CertificationResult result = certify_pose_sequence(
+    *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
+    poses, maximum_swept_distance_, &certification_workspace_);
+  if (output_result) {
+    *output_result = result;
+  }
+  if (result.safe) {
+    return true;
+  }
+  if (!enable_initial_overlap_recovery_ ||
+    result.failure != CertificationFailure::kLethalObstacle)
+  {
+    return false;
+  }
+  if (!certify_initial_overlap_margin_sequence(
+      *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
+      initial_overlap_core_footprint_, poses, maximum_swept_distance_,
+      nullptr, &certification_workspace_))
+  {
+    return false;
+  }
+  if (used_initial_overlap_recovery) {
+    *used_initial_overlap_recovery = true;
+  }
+  return true;
+}
+
+void CertifiedDWBLocalPlanner::prepare_collision_footprints()
 {
   invalidate_certification_broadphase(certification_workspace_);
   certified_footprint_ = costmap_ros_->getRobotFootprint();
+  if (certification_enabled_) {
+    nav2_costmap_2d::padFootprint(
+      certified_footprint_, minimum_certified_margin_);
+  }
+  initial_overlap_core_footprint_ = costmap_ros_->getRobotFootprint();
+  if (!enable_initial_overlap_recovery_) {
+    return;
+  }
   nav2_costmap_2d::padFootprint(
-    certified_footprint_, minimum_certified_margin_);
+    initial_overlap_core_footprint_, -initial_overlap_footprint_inset_);
+  double twice_area = 0.0;
+  for (std::size_t index = 0u;
+    index < initial_overlap_core_footprint_.size(); ++index)
+  {
+    const auto & first = initial_overlap_core_footprint_[index];
+    const auto & second = initial_overlap_core_footprint_[
+      (index + 1u) % initial_overlap_core_footprint_.size()];
+    if (!std::isfinite(first.x) || !std::isfinite(first.y)) {
+      throw nav2_core::ControllerException(
+              "Initial-overlap inset produced a non-finite footprint");
+    }
+    twice_area += first.x * second.y - second.x * first.y;
+  }
+  if (initial_overlap_core_footprint_.size() < 3u ||
+    std::abs(twice_area) <= 1.0e-9)
+  {
+    throw nav2_core::ControllerException(
+            "Initial-overlap inset collapses the planning footprint");
+  }
 }
 
 AxisLimits CertifiedDWBLocalPlanner::linear_limits() const

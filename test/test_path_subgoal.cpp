@@ -159,6 +159,24 @@ TEST(PathSubgoal, ArclengthProgressRejectsGrowingPathDistance)
       trajectory, path, heading_target, 0.025, 0.025));
 }
 
+TEST(PathSubgoal, EarlyProgressCannotHideTerminalDeparture)
+{
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(2u);
+  path.poses[1u].x = 2.0;
+  geometry_msgs::msg::Pose2D heading_target;
+  heading_target.x = 2.0;
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(3u);
+  trajectory.poses[0u].x = 0.5;
+  trajectory.poses[1u].x = 0.55;
+  trajectory.poses[2u].x = 1.0;
+  trajectory.poses[2u].y = 1.0;
+
+  EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.025, 0.025));
+}
+
 TEST(PathSubgoal, ArclengthProgressAllowsBoundedPathDistanceGrowth)
 {
   nav_2d_msgs::msg::Path2D path;

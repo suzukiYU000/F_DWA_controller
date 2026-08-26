@@ -111,7 +111,8 @@ protected:
     std::optional<double> precomputed_clearance_guard_risk = std::nullopt,
     double * clearance_risk = nullptr,
     const std::vector<geometry_msgs::msg::Pose2D> *
-    precomputed_stop_poses = nullptr);
+    precomputed_stop_poses = nullptr,
+    bool * completed_weighted_score = nullptr);
   visualization_msgs::msg::MarkerArray build_candidate_markers(
     const dwb_msgs::msg::LocalPlanEvaluation & evaluation) const;
   static bool coalesce_stale_marker_publication(
@@ -221,7 +222,7 @@ private:
   bool should_publish_candidate_markers() const;
   void publish_candidate_markers(
     const dwb_msgs::msg::LocalPlanEvaluation & evaluation);
-  void prepare_certified_footprint();
+  void prepare_collision_footprints();
   void prepare_terminal_targets(const geometry_msgs::msg::Pose2D & pose);
   bool build_stop_trajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory,
@@ -238,6 +239,10 @@ private:
     CertificationFailure & failure,
     CertificationResult * result = nullptr,
     bool * used_reserve_recovery = nullptr) const;
+  bool certify_physical_sequence(
+    const std::vector<geometry_msgs::msg::Pose2D> & poses,
+    CertificationResult * result = nullptr,
+    bool * used_initial_overlap_recovery = nullptr) const;
   AxisLimits linear_limits() const;
   AxisLimits angular_limits() const;
   void reset_trial_callback(
@@ -285,9 +290,10 @@ private:
   double clearance_constraint_minimum_subgoal_distance_progress_{0.0};
   double clearance_constraint_minimum_subgoal_heading_progress_{0.0};
   double clearance_constraint_motion_preference_goal_distance_{0.0};
+  bool clearance_constraint_include_footprint_approach_{false};
+  double clearance_constraint_footprint_approach_trigger_risk_{0.1};
   std::shared_ptr<FootprintClearanceCritic> clearance_constraint_critic_;
-  std::shared_ptr<FootprintClearanceCritic>
-  clearance_constraint_trigger_critic_;
+  dwb_core::TrajectoryCritic::Ptr clearance_constraint_trigger_critic_;
   std::shared_ptr<FootprintClearanceCritic> clearance_constraint_guard_critic_;
   bool no_valid_control_deceleration_fallback_enabled_{false};
   bool stop_admissibility_enabled_{false};
@@ -320,6 +326,8 @@ private:
   double maximum_swept_distance_{0.025};
   bool enable_reserve_recovery_{false};
   bool reserve_recovery_hysteresis_{true};
+  bool enable_initial_overlap_recovery_{false};
+  double initial_overlap_footprint_inset_{0.05};
   double minimum_linear_velocity_{0.0};
   double maximum_linear_velocity_{1.2};
   double maximum_angular_velocity_{1.57};
@@ -351,6 +359,7 @@ private:
   retained_backup_states_;
   bool terminal_stop_goal_capture_active_{false};
   std::vector<geometry_msgs::msg::Point> certified_footprint_;
+  std::vector<geometry_msgs::msg::Point> initial_overlap_core_footprint_;
   mutable CertificationWorkspace certification_workspace_;
   std::vector<geometry_msgs::msg::Pose2D> stop_pose_scratch_;
   geometry_msgs::msg::Pose2D current_goal_pose_;

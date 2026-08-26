@@ -102,6 +102,40 @@ bool certify_reserve_recovery_sequence(
   bool require_clear_suffix,
   CertificationWorkspace * workspace = nullptr);
 
+// A bounded initial-overlap recovery may encounter a lethal cell in the
+// physical-footprint boundary strip before first_required_clear_pose. The
+// inset core must remain hard-safe for the complete sweep, and the physical
+// footprint must be continuously clear from that pose onward. Unknown and
+// off-costmap overlap is never recoverable.
+bool certify_initial_overlap_recovery_sequence(
+  nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & physical_footprint,
+  const std::vector<geometry_msgs::msg::Point> & inset_core_footprint,
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  double maximum_swept_distance,
+  std::size_t first_required_clear_pose,
+  CertificationWorkspace * workspace = nullptr);
+
+// A boundary-margin sequence is available only when the physical footprint is
+// on a lethal cell at the current pose or enters it during the first response
+// segment. A caller checking an already-issued, no-longer-changeable command
+// prefix may opt into later entry within that prefix. Lethal cells may remain
+// in the physical footprint's outer strip,
+// but the inset core must remain safe over the complete swept sequence. Later
+// entry, re-entry after clearing, unknown space, and off-costmap overlap are
+// never accepted. overlap_fraction reports
+// how much of the swept sequence used the margin so callers can prefer prompt
+// clearance without imposing a deadline that can deadlock beside a wall.
+bool certify_initial_overlap_margin_sequence(
+  nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & physical_footprint,
+  const std::vector<geometry_msgs::msg::Point> & inset_core_footprint,
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  double maximum_swept_distance,
+  double * overlap_fraction = nullptr,
+  CertificationWorkspace * workspace = nullptr,
+  bool allow_committed_prefix_entry = false);
+
 const char * certification_failure_name(CertificationFailure failure);
 
 }  // namespace f_dwa_controller

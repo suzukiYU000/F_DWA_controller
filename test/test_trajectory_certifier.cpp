@@ -47,6 +47,32 @@ std::vector<geometry_msgs::msg::Point> rectangle_footprint()
   return footprint;
 }
 
+std::vector<geometry_msgs::msg::Point> whill_footprint()
+{
+  std::vector<geometry_msgs::msg::Point> footprint(4);
+  footprint[0].x = -0.2;
+  footprint[0].y = -0.3;
+  footprint[1].x = 0.8;
+  footprint[1].y = -0.3;
+  footprint[2].x = 0.8;
+  footprint[2].y = 0.3;
+  footprint[3].x = -0.2;
+  footprint[3].y = 0.3;
+  return footprint;
+}
+
+std::vector<geometry_msgs::msg::Point> inset_footprint(
+  const std::vector<geometry_msgs::msg::Point> & footprint,
+  const double inset)
+{
+  std::vector<geometry_msgs::msg::Point> result = footprint;
+  for (geometry_msgs::msg::Point & point : result) {
+    point.x = std::copysign(std::abs(point.x) - inset, point.x);
+    point.y = std::copysign(std::abs(point.y) - inset, point.y);
+  }
+  return result;
+}
+
 void expect_same_certification(
   const CertificationResult & reference,
   const CertificationResult & broadphase)
@@ -280,6 +306,318 @@ TEST(TrajectoryCertifier, ReserveRecoveryAllowsHardSafeNonmonotonicDetour)
     certify_reserve_recovery_sequence(
       costmap, certified_footprint, planning_footprint, poses, 0.025,
       true));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapRecoveryClearsPhysicalFootprint)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.28, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    rectangle_footprint();
+  std::vector<geometry_msgs::msg::Point> inset_core = physical_footprint;
+  for (geometry_msgs::msg::Point & point : inset_core) {
+    point.x = std::copysign(std::abs(point.x) - 0.05, point.x);
+    point.y = std::copysign(std::abs(point.y) - 0.05, point.y);
+  }
+  std::vector<geometry_msgs::msg::Pose2D> poses(4);
+  poses[1].y = -0.02;
+  poses[2].y = -0.08;
+  poses[3].y = -0.12;
+
+  EXPECT_TRUE(
+    certify_initial_overlap_recovery_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005, 2u));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapRecoveryIsBoundedAndRejectsReentry)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.28, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    rectangle_footprint();
+  std::vector<geometry_msgs::msg::Point> inset_core = physical_footprint;
+  for (geometry_msgs::msg::Point & point : inset_core) {
+    point.x = std::copysign(std::abs(point.x) - 0.05, point.x);
+    point.y = std::copysign(std::abs(point.y) - 0.05, point.y);
+  }
+  std::vector<geometry_msgs::msg::Pose2D> poses(4);
+  poses[1].y = -0.005;
+  poses[2].y = -0.08;
+  poses[3].y = -0.12;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_recovery_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005, 1u));
+  EXPECT_TRUE(
+    certify_initial_overlap_recovery_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005, 2u));
+
+  poses[3].y = 0.0;
+  EXPECT_FALSE(
+    certify_initial_overlap_recovery_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005, 2u));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapRecoveryRejectsCoreCollision)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.24, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    rectangle_footprint();
+  std::vector<geometry_msgs::msg::Point> inset_core = physical_footprint;
+  for (geometry_msgs::msg::Point & point : inset_core) {
+    point.x = std::copysign(std::abs(point.x) - 0.05, point.x);
+    point.y = std::copysign(std::abs(point.y) - 0.05, point.y);
+  }
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].y = -0.08;
+  poses[2].y = -0.12;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_recovery_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005, 1u));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapRecoveryAllowsRearClearanceEscape)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(-0.18, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].x = 0.08;
+  poses[2].x = 0.16;
+
+  EXPECT_TRUE(
+    certify_initial_overlap_recovery_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005, 1u));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapRecoveryRejectsRearRotationIntoWall)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(-0.18, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].theta = 0.30;
+  poses[2].theta = 0.60;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_recovery_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005, 1u));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapMarginAllowsRearParallelStop)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(-0.18, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  const std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  double overlap_fraction = 0.0;
+
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005,
+      &overlap_fraction));
+  EXPECT_DOUBLE_EQ(overlap_fraction, 1.0);
+}
+
+TEST(TrajectoryCertifier, InitialOverlapMarginPrefersRearClearanceEscape)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(-0.18, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  const std::vector<geometry_msgs::msg::Pose2D> stationary_poses(3);
+  std::vector<geometry_msgs::msg::Pose2D> escape_poses(3);
+  escape_poses[1].x = 0.08;
+  escape_poses[2].x = 0.16;
+  double stationary_overlap = 0.0;
+  double escape_overlap = 0.0;
+
+  ASSERT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, stationary_poses, 0.005,
+      &stationary_overlap));
+  ASSERT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, escape_poses, 0.005,
+      &escape_overlap));
+  EXPECT_LT(escape_overlap, stationary_overlap);
+}
+
+TEST(TrajectoryCertifier, InitialOverlapMarginRejectsNewBoundaryEntry)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.82, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[2].x = 0.04;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005));
+}
+
+TEST(TrajectoryCertifier, CommittedPrefixMayEnterSafeBoundaryStrip)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.82, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[2].x = 0.04;
+
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005,
+      nullptr, nullptr, true));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapMarginAllowsFirstResponseEntry)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.82, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].x = 0.04;
+  poses[2].x = -0.04;
+
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapMarginRejectsBoundaryReentry)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(-0.18, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].x = 0.16;
+  poses[2].x = 0.0;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapMarginRejectsRearRotationIntoWall)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(-0.18, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].theta = 0.30;
+  poses[2].theta = 0.60;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005));
+}
+
+TEST(TrajectoryCertifier, InitialOverlapMarginRejectsUnknownOuterStrip)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(-0.18, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::NO_INFORMATION);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  const std::vector<geometry_msgs::msg::Pose2D> poses(3);
+
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005));
 }
 
 TEST(TrajectoryCertifier, ReusedWorkspacePreservesCertificationResult)

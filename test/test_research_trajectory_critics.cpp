@@ -657,18 +657,37 @@ TEST(PathDeviationCritic, IsNeutralAtOrInsideMaximumDistance)
 {
   f_dwa_controller::PathDeviationCritic critic;
   geometry_msgs::msg::Pose2D current_pose;
+  current_pose.y = 1.0;
   geometry_msgs::msg::Pose2D goal;
   nav_2d_msgs::msg::Twist2D velocity;
   ASSERT_TRUE(critic.prepare(
       current_pose, velocity, goal, straight_path(10.0)));
 
   auto trajectory = trajectory_to(1.0, 1.0);
-  trajectory.poses.front().y = 1.5;
-  trajectory.poses.back().y = -1.5;
+  trajectory.poses.front().y = 1.0;
+  trajectory.poses.back().y = -1.0;
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(trajectory), 0.0);
 }
 
-TEST(PathDeviationCritic, AppliesOneFixedPenaltyForAnyOutsidePose)
+TEST(PathDeviationCritic, ContinuouslyPenalizesDepartureInsideCorridor)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  geometry_msgs::msg::Pose2D current_pose;
+  geometry_msgs::msg::Pose2D goal;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(
+      current_pose, velocity, goal, straight_path(10.0)));
+
+  auto near_departure = trajectory_to(1.0, 1.0);
+  near_departure.poses.back().y = 0.25;
+  auto far_departure = trajectory_to(1.0, 1.0);
+  far_departure.poses.back().y = 0.50;
+
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(near_departure), 30.0);
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(far_departure), 60.0);
+}
+
+TEST(PathDeviationCritic, PreservesOrderingOutsideCorridor)
 {
   f_dwa_controller::PathDeviationCritic critic;
   geometry_msgs::msg::Pose2D current_pose;
@@ -678,12 +697,38 @@ TEST(PathDeviationCritic, AppliesOneFixedPenaltyForAnyOutsidePose)
       current_pose, velocity, goal, straight_path(10.0)));
 
   auto slightly_outside = trajectory_to(1.0, 1.0);
-  slightly_outside.poses.front().y = 1.500001;
+  slightly_outside.poses.front().y = 1.000001;
   auto far_outside = trajectory_to(1.0, 1.0);
   far_outside.poses.back().y = -3.0;
 
-  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(slightly_outside), 1000.0);
-  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(far_outside), 1000.0);
+  const double slightly_outside_score =
+    critic.scoreTrajectory(slightly_outside);
+  const double far_outside_score = critic.scoreTrajectory(far_outside);
+
+  EXPECT_TRUE(std::isfinite(slightly_outside_score));
+  EXPECT_GT(slightly_outside_score, 1000.0);
+  EXPECT_GT(far_outside_score, slightly_outside_score);
+}
+
+TEST(PathDeviationCritic, PrefersRecoveryWhenRobotStartsOutsideCorridor)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  geometry_msgs::msg::Pose2D current_pose;
+  current_pose.y = 1.2;
+  geometry_msgs::msg::Pose2D goal;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(
+      current_pose, velocity, goal, straight_path(10.0)));
+
+  auto recovering = trajectory_to(1.0, 1.0);
+  recovering.poses.front().y = 1.2;
+  recovering.poses.back().y = 0.8;
+  auto departing = recovering;
+  departing.poses.back().y = 1.4;
+
+  EXPECT_LT(
+    critic.scoreTrajectory(recovering),
+    critic.scoreTrajectory(departing));
 }
 
 TEST(ForwardObstacleCritic, PenalizesBlockedNominalPath)
@@ -819,6 +864,45 @@ TEST(FootprintClearanceCritic, SoftlyObservesBeyondExecutableEndpoint)
 
   const auto trajectory = trajectory_to(0.5, 1.0);
   EXPECT_NEAR(critic.scoreTrajectory(trajectory), 0.5625, 1.0e-12);
+}
+
+TEST(FootprintClearanceCritic, ReportsApproachWithoutPenalizingParallelRisk)
+{
+  StubFootprintClearanceCritic critic;
+  critic.setFirstCollidingBand(0);
+  critic.setMinimumCollisionX(0.75);
+  critic.setRiskPath(1.0, 2);
+
+  const auto approaching = trajectory_to(1.0, 1.0);
+  double approach_risk = -1.0;
+  EXPECT_GT(
+    critic.scoreTrajectoryWithApproachRisk(approaching, &approach_risk),
+    0.0);
+  EXPECT_NEAR(approach_risk, 0.9, 1.0e-12);
+
+  critic.setMinimumCollisionX(
+    -std::numeric_limits<double>::infinity());
+  const auto parallel = trajectory_to(1.0, 1.0);
+  approach_risk = -1.0;
+  EXPECT_DOUBLE_EQ(
+    critic.scoreTrajectoryWithApproachRisk(parallel, &approach_risk), 0.9);
+  EXPECT_DOUBLE_EQ(approach_risk, 0.0);
+}
+
+TEST(FootprintClearanceCritic, PlanContinuationCannotActivateApproach)
+{
+  StubFootprintClearanceCritic critic;
+  critic.setFirstCollidingBand(0);
+  critic.setMinimumCollisionX(1.0);
+  critic.setRiskPath(1.0, 2);
+
+  const auto executable_prefix_stays_clear = trajectory_to(0.5, 1.0);
+  double approach_risk = -1.0;
+  EXPECT_NEAR(
+    critic.scoreTrajectoryWithApproachRisk(
+      executable_prefix_stays_clear, &approach_risk),
+    0.5625, 1.0e-12);
+  EXPECT_DOUBLE_EQ(approach_risk, 0.0);
 }
 
 TEST(FootprintClearanceCritic, WeightsShortFinalDistanceInterval)

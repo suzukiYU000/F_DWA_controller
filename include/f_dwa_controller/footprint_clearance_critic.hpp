@@ -57,6 +57,19 @@ public:
   double scoreTrajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory) override;
 
+  /**
+   * @brief Score clearance and report whether the footprint moves closer.
+   *
+   * The returned score is identical to scoreTrajectory(). approach_risk is a
+   * bounded [0, 1] increase from the best clearance already reached along the
+   * fixed-distance risk path. A constant parallel-wall clearance therefore
+   * reports zero while a future side or corner encounter reports a positive
+   * value.
+   */
+  double scoreTrajectoryWithApproachRisk(
+    const dwb_msgs::msg::Trajectory2D & trajectory,
+    double * approach_risk);
+
 protected:
   bool excludedByStaticLayer(double world_x, double world_y) const;
 

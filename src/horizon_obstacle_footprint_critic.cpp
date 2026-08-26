@@ -18,6 +18,7 @@
 #include "f_dwa_controller/trajectory_certifier.hpp"
 #include "nav2_costmap_2d/cost_values.hpp"
 #include "nav2_costmap_2d/costmap_layer.hpp"
+#include "nav2_costmap_2d/footprint.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 
@@ -45,8 +46,30 @@ void HorizonObstacleFootprintCritic::onInit()
   node->get_parameter(
     dwb_plugin_name_ + "." + name_ + ".maximum_swept_distance",
     maximum_swept_distance_);
+  nav2_util::declare_parameter_if_not_declared(
+    node, dwb_plugin_name_ + ".enable_initial_overlap_recovery",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
+    node, dwb_plugin_name_ + ".initial_overlap_footprint_inset",
+    rclcpp::ParameterValue(0.05));
+  nav2_util::declare_parameter_if_not_declared(
+    node, dwb_plugin_name_ + ".initial_overlap_recovery_penalty",
+    rclcpp::ParameterValue(1000000.0));
+  node->get_parameter(
+    dwb_plugin_name_ + ".enable_initial_overlap_recovery",
+    enable_initial_overlap_recovery_);
+  node->get_parameter(
+    dwb_plugin_name_ + ".initial_overlap_footprint_inset",
+    initial_overlap_footprint_inset_);
+  node->get_parameter(
+    dwb_plugin_name_ + ".initial_overlap_recovery_penalty",
+    initial_overlap_recovery_penalty_);
   if (!std::isfinite(score_time_horizon_) || score_time_horizon_ < 0.0 ||
-    !std::isfinite(maximum_swept_distance_) || maximum_swept_distance_ <= 0.0)
+    !std::isfinite(maximum_swept_distance_) || maximum_swept_distance_ <= 0.0 ||
+    !std::isfinite(initial_overlap_footprint_inset_) ||
+    initial_overlap_footprint_inset_ <= 0.0 ||
+    !std::isfinite(initial_overlap_recovery_penalty_) ||
+    initial_overlap_recovery_penalty_ <= 0.0)
   {
     throw std::runtime_error{
             "HorizonObstacleFootprintCritic parameters must be finite"};
@@ -68,6 +91,29 @@ bool HorizonObstacleFootprintCritic::prepare(
   for (const auto & point : footprint_spec_) {
     footprint_radius_ = std::max(
       footprint_radius_, std::hypot(point.x, point.y));
+  }
+  inset_core_footprint_ = footprint_spec_;
+  nav2_costmap_2d::padFootprint(
+    inset_core_footprint_, -initial_overlap_footprint_inset_);
+  double twice_area = 0.0;
+  for (std::size_t index = 0u; index < inset_core_footprint_.size(); ++index) {
+    const auto & first = inset_core_footprint_[index];
+    const auto & second =
+      inset_core_footprint_[(index + 1u) % inset_core_footprint_.size()];
+    if (!std::isfinite(first.x) || !std::isfinite(first.y)) {
+      return false;
+    }
+    twice_area += first.x * second.y - second.x * first.y;
+  }
+  if (enable_initial_overlap_recovery_ &&
+    (inset_core_footprint_.size() < 3u || std::abs(twice_area) <= 1.0e-9))
+  {
+    throw std::runtime_error{
+            "Initial-overlap inset collapses the planning footprint"};
+  }
+  if (costmap_) {
+    static_cast<void>(prepare_certification_broadphase(
+      *costmap_, certification_workspace_));
   }
   return std::isfinite(footprint_radius_);
 }
@@ -102,7 +148,7 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
             checked_pose};
           result = certify_pose_sequence(
             *costmap_, footprint_spec_, single_pose,
-            maximum_swept_distance_);
+            maximum_swept_distance_, &certification_workspace_);
         }
         if (result.has_failure_cell) {
           detail <<
@@ -151,56 +197,71 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
       }
     };
 
-  for (std::size_t index = 0u; index < trajectory.poses.size(); ++index) {
-    const auto & pose = trajectory.poses[index];
-    if (!std::isfinite(pose.x) || !std::isfinite(pose.y) ||
-      !std::isfinite(pose.theta))
-    {
-      throw dwb_core::IllegalTrajectoryException(
-              name_, "Trajectory contains a non-finite pose.");
-    }
+  try {
+    for (std::size_t index = 0u; index < trajectory.poses.size(); ++index) {
+      const auto & pose = trajectory.poses[index];
+      if (!std::isfinite(pose.x) || !std::isfinite(pose.y) ||
+        !std::isfinite(pose.theta))
+      {
+        throw dwb_core::IllegalTrajectoryException(
+                name_, "Trajectory contains a non-finite pose.");
+      }
 
-    // Numeric legal-cell cost is intentionally ignored. This critic defines
-    // only the physical hard gate; the common soft critics rank legal poses.
-    score_pose_with_diagnostics(pose, index, 0u);
+      // Numeric legal-cell cost is intentionally ignored. This critic defines
+      // only the physical hard gate; the common soft critics rank legal poses.
+      score_pose_with_diagnostics(pose, index, 0u);
 
-    if (index == 0u) {
-      continue;
+      if (index == 0u) {
+        continue;
+      }
+      const auto & previous = trajectory.poses[index - 1u];
+      const double delta_x = pose.x - previous.x;
+      const double delta_y = pose.y - previous.y;
+      const double delta_yaw = std::remainder(
+        pose.theta - previous.theta, 2.0 * M_PI);
+      const double corner_sweep =
+        std::hypot(delta_x, delta_y) +
+        footprint_radius_ * std::abs(delta_yaw);
+      if (!std::isfinite(corner_sweep)) {
+        throw dwb_core::IllegalTrajectoryException(
+                name_, "Trajectory sweep is non-finite.");
+      }
+      const std::size_t subdivisions = std::max<std::size_t>(
+        1u, static_cast<std::size_t>(
+          std::ceil(corner_sweep / maximum_swept_distance_)));
+      constexpr std::size_t kMaximumSubdivisions = 10000u;
+      if (subdivisions > kMaximumSubdivisions) {
+        throw dwb_core::IllegalTrajectoryException(
+                name_, "Trajectory sweep requires too many samples.");
+      }
+      for (std::size_t subdivision = 1u;
+        subdivision < subdivisions; ++subdivision)
+      {
+        const double ratio = static_cast<double>(subdivision) /
+          static_cast<double>(subdivisions);
+        geometry_msgs::msg::Pose2D intermediate;
+        intermediate.x = previous.x + ratio * delta_x;
+        intermediate.y = previous.y + ratio * delta_y;
+        intermediate.theta = previous.theta + ratio * delta_yaw;
+        // Ignore the legal-cell numeric cost: this sample exists solely to
+        // prevent a physical footprint from crossing a lethal/unknown cell
+        // between two 50 ms rollout poses.
+        score_pose_with_diagnostics(intermediate, index, subdivision);
+      }
     }
-    const auto & previous = trajectory.poses[index - 1u];
-    const double delta_x = pose.x - previous.x;
-    const double delta_y = pose.y - previous.y;
-    const double delta_yaw = std::remainder(
-      pose.theta - previous.theta, 2.0 * M_PI);
-    const double corner_sweep =
-      std::hypot(delta_x, delta_y) +
-      footprint_radius_ * std::abs(delta_yaw);
-    if (!std::isfinite(corner_sweep)) {
-      throw dwb_core::IllegalTrajectoryException(
-              name_, "Trajectory sweep is non-finite.");
+  } catch (const dwb_core::IllegalTrajectoryException &) {
+    if (enable_initial_overlap_recovery_ && costmap_) {
+      double overlap_fraction = 0.0;
+      if (certify_initial_overlap_margin_sequence(
+          *costmap_, footprint_spec_, inset_core_footprint_, trajectory.poses,
+          maximum_swept_distance_, &overlap_fraction,
+          &certification_workspace_))
+      {
+        return initial_overlap_recovery_penalty_ *
+               (1.0 + overlap_fraction);
+      }
     }
-    const std::size_t subdivisions = std::max<std::size_t>(
-      1u, static_cast<std::size_t>(
-        std::ceil(corner_sweep / maximum_swept_distance_)));
-    constexpr std::size_t kMaximumSubdivisions = 10000u;
-    if (subdivisions > kMaximumSubdivisions) {
-      throw dwb_core::IllegalTrajectoryException(
-              name_, "Trajectory sweep requires too many samples.");
-    }
-    for (std::size_t subdivision = 1u;
-      subdivision < subdivisions; ++subdivision)
-    {
-      const double ratio = static_cast<double>(subdivision) /
-        static_cast<double>(subdivisions);
-      geometry_msgs::msg::Pose2D intermediate;
-      intermediate.x = previous.x + ratio * delta_x;
-      intermediate.y = previous.y + ratio * delta_y;
-      intermediate.theta = previous.theta + ratio * delta_yaw;
-      // Ignore the legal-cell numeric cost: this sample exists solely to
-      // prevent a physical footprint from crossing a lethal/unknown cell
-      // between two 50 ms rollout poses.
-      score_pose_with_diagnostics(intermediate, index, subdivision);
-    }
+    throw;
   }
   return 0.0;
 }

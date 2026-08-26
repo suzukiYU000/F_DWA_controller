@@ -92,9 +92,14 @@ CertificationResult check_pose(
   const geometry_msgs::msg::Pose2D & pose,
   std::vector<nav2_costmap_2d::MapLocation> & map_footprint,
   std::vector<nav2_costmap_2d::MapLocation> & footprint_cells,
-  const CertificationWorkspace & workspace)
+  const CertificationWorkspace & workspace,
+  const bool allow_lethal = false,
+  bool * lethal_overlap = nullptr)
 {
   CertificationResult result;
+  if (lethal_overlap) {
+    *lethal_overlap = false;
+  }
   result.checked_pose_count = 1;
   map_footprint.clear();
   map_footprint.reserve(footprint.size());
@@ -150,6 +155,12 @@ CertificationResult check_pose(
       return result;
     }
     if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
+      if (lethal_overlap) {
+        *lethal_overlap = true;
+      }
+      if (allow_lethal) {
+        continue;
+      }
       result.failure = CertificationFailure::kLethalObstacle;
       result.has_failure_cell = true;
       result.failure_cell_x = cell.x;
@@ -504,6 +515,171 @@ bool certify_reserve_recovery_sequence(
     }
   }
 
+  return true;
+}
+
+bool certify_initial_overlap_recovery_sequence(
+  nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & physical_footprint,
+  const std::vector<geometry_msgs::msg::Point> & inset_core_footprint,
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  const double maximum_swept_distance,
+  const std::size_t first_required_clear_pose,
+  CertificationWorkspace * workspace)
+{
+  if (poses.size() < 2u || first_required_clear_pose == 0u ||
+    first_required_clear_pose >= poses.size())
+  {
+    return false;
+  }
+
+  const std::vector<geometry_msgs::msg::Pose2D> overlap_prefix(
+    poses.begin(),
+    poses.begin() + static_cast<std::ptrdiff_t>(first_required_clear_pose));
+  const CertificationResult overlap_result =
+    certify_pose_sequence(
+    costmap, physical_footprint, overlap_prefix,
+    maximum_swept_distance, workspace);
+  if (overlap_result.safe ||
+    overlap_result.failure != CertificationFailure::kLethalObstacle)
+  {
+    return false;
+  }
+
+  if (!certify_pose_sequence(
+      costmap, inset_core_footprint, poses,
+      maximum_swept_distance, workspace).safe)
+  {
+    return false;
+  }
+
+  const std::vector<geometry_msgs::msg::Pose2D> clear_suffix(
+    poses.begin() + static_cast<std::ptrdiff_t>(first_required_clear_pose),
+    poses.end());
+  return certify_pose_sequence(
+    costmap, physical_footprint, clear_suffix,
+    maximum_swept_distance, workspace).safe;
+}
+
+bool certify_initial_overlap_margin_sequence(
+  nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & physical_footprint,
+  const std::vector<geometry_msgs::msg::Point> & inset_core_footprint,
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  const double maximum_swept_distance,
+  double * overlap_fraction,
+  CertificationWorkspace * workspace,
+  const bool allow_committed_prefix_entry)
+{
+  if (overlap_fraction) {
+    *overlap_fraction = 0.0;
+  }
+  if (physical_footprint.size() < 3u || poses.empty() ||
+    !std::isfinite(maximum_swept_distance) ||
+    maximum_swept_distance <= 0.0)
+  {
+    return false;
+  }
+
+  double maximum_footprint_radius = 0.0;
+  for (const geometry_msgs::msg::Point & point : physical_footprint) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
+      return false;
+    }
+    maximum_footprint_radius =
+      std::max(maximum_footprint_radius, std::hypot(point.x, point.y));
+  }
+
+  CertificationWorkspace local_workspace;
+  CertificationWorkspace & active_workspace =
+    workspace ? *workspace : local_workspace;
+  bool initial_lethal_overlap = false;
+  const CertificationResult initial_result = check_pose(
+    costmap, physical_footprint, poses.front(),
+    active_workspace.map_footprint, active_workspace.footprint_cells,
+    active_workspace, true, &initial_lethal_overlap);
+  if (!initial_result.safe) {
+    return false;
+  }
+
+  // This is the hard body certificate. Densification accounts for the rear
+  // corner arc as well as translation, so turning away beside a wall cannot
+  // sweep the tail through an obstacle.
+  if (!certify_pose_sequence(
+      costmap, inset_core_footprint, poses,
+      maximum_swept_distance, &active_workspace).safe)
+  {
+    return false;
+  }
+
+  std::size_t checked_pose_count = 1u;
+  std::size_t overlap_pose_count = initial_lethal_overlap ? 1u : 0u;
+  bool margin_started = initial_lethal_overlap;
+  bool physical_clear_observed = false;
+  for (std::size_t pose_index = 1u; pose_index < poses.size(); ++pose_index) {
+    const geometry_msgs::msg::Pose2D & previous = poses[pose_index - 1u];
+    const geometry_msgs::msg::Pose2D & next = poses[pose_index];
+    if (!std::isfinite(previous.x) || !std::isfinite(previous.y) ||
+      !std::isfinite(previous.theta) || !std::isfinite(next.x) ||
+      !std::isfinite(next.y) || !std::isfinite(next.theta))
+    {
+      return false;
+    }
+    const double angle_difference =
+      normalized_angle_difference(previous.theta, next.theta);
+    const double swept_distance =
+      std::hypot(next.x - previous.x, next.y - previous.y) +
+      maximum_footprint_radius * std::abs(angle_difference);
+    const int interpolation_count = std::max(
+      1, static_cast<int>(
+        std::ceil(swept_distance / maximum_swept_distance)));
+    for (int interpolation_index = 1;
+      interpolation_index <= interpolation_count; ++interpolation_index)
+    {
+      const double ratio =
+        static_cast<double>(interpolation_index) /
+        static_cast<double>(interpolation_count);
+      geometry_msgs::msg::Pose2D interpolated;
+      interpolated.x = previous.x + ratio * (next.x - previous.x);
+      interpolated.y = previous.y + ratio * (next.y - previous.y);
+      interpolated.theta = previous.theta + ratio * angle_difference;
+      bool lethal_overlap = false;
+      const CertificationResult pose_result = check_pose(
+        costmap, physical_footprint, interpolated,
+        active_workspace.map_footprint, active_workspace.footprint_cells,
+        active_workspace, true, &lethal_overlap);
+      if (!pose_result.safe) {
+        return false;
+      }
+      ++checked_pose_count;
+      if (lethal_overlap) {
+        if (!margin_started) {
+          // A newly commanded candidate may use only its common first 50 ms
+          // response. An already-issued delay prefix is no longer alterable,
+          // so let its boundary strip reach the predicted activation pose and
+          // require the candidate beginning there to clear it.
+          if (pose_index != 1u && !allow_committed_prefix_entry) {
+            return false;
+          }
+          margin_started = true;
+        }
+        if (physical_clear_observed) {
+          return false;
+        }
+        ++overlap_pose_count;
+      } else if (margin_started) {
+        physical_clear_observed = true;
+      }
+    }
+  }
+
+  if (!margin_started) {
+    return false;
+  }
+  if (overlap_fraction) {
+    *overlap_fraction = static_cast<double>(overlap_pose_count) /
+      static_cast<double>(checked_pose_count);
+  }
   return true;
 }
 

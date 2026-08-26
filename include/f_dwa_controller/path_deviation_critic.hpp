@@ -14,10 +14,11 @@ namespace f_dwa_controller
 {
 
 /**
- * @brief Apply one fixed soft cost when any predicted pose leaves a Path corridor.
+ * @brief Penalize motion away from the Path and departure from a soft corridor.
  *
- * Poses on the corridor boundary remain neutral. The critic never rejects a
- * trajectory, and the penalty does not grow with the amount of deviation.
+ * The critic continuously penalizes terminal path-distance growth. Crossing
+ * the corridor adds a finite penalty plus costs proportional to the maximum
+ * and terminal excess. It never rejects a trajectory.
  */
 class PathDeviationCritic : public dwb_core::TrajectoryCritic
 {
@@ -37,8 +38,10 @@ protected:
   void validateParameters() const;
 
   nav_2d_msgs::msg::Path2D reference_path_;
-  double maximum_path_distance_{1.5};
+  double maximum_path_distance_{1.0};
   double deviation_penalty_{1000.0};
+  double departure_cost_per_meter_{120.0};
+  double current_path_distance_{0.0};
   bool reference_path_valid_{false};
 };
 

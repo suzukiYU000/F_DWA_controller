@@ -113,41 +113,38 @@ controller_server:
       # common to V/A/J/F, so faster ranking cannot consume the last braking
       # room before an obstacle.
       enable_stop_admissibility: true
-      # When an unexplained live-sensor obstacle is present, constrain its
-      # dynamic clearance risk so acceleration-limited steering accumulates
-      # before the physical stop gate. Outside that context, static clearance
-      # remains only the bounded weighted preference below.
+      # Enter hierarchical avoidance only when the candidate's forward risk
+      # path sees inflated obstacle cost. Once active, rank the conservative
+      # union of static-map and live-sensor footprint clearance. This keeps
+      # mapped walls observable before sensors see them, but a parallel wall
+      # beside or behind the footprint no longer suppresses acceleration by
+      # itself. Hard swept-footprint and complete-stop gates remain active.
       enable_clearance_constraint: true
-      clearance_constraint_critic_name: "DynamicClearance"
-      # Start constrained ranking only for sensor observations that cannot be
-      # explained by the static map. This prevents a mapped doorway wall from
-      # activating constrained rank and forcing the Controller away from a
-      # collision-free reference turn.
-      clearance_constraint_trigger_critic_name: "DynamicClearance"
-      # During dynamic avoidance, reject only the high-risk part of the static
-      # map objective before comparing dynamic risk. This prevents a
-      # sensor-only detour from ending against a known wall without restoring
-      # the doorway bias caused by always minimizing static clearance.
-      clearance_constraint_guard_critic_name: "StaticClearance"
+      clearance_constraint_critic_name: "FootprintClearance"
+      clearance_constraint_trigger_critic_name: "ForwardObstacle"
+      clearance_constraint_guard_critic_name: "FootprintClearance"
+      # Also activate when the physical footprint's clearance gets worse
+      # inside the method-native executable candidate itself. The separate
+      # Path continuation remains part of soft scoring but cannot trigger the
+      # hierarchy globally. Constant risk beside a parallel wall is neutral.
+      clearance_constraint_include_footprint_approach: true
+      # Trigger the avoidance hierarchy before a side or corner encounter in
+      # the executable horizon reaches the hard footprint gate.
+      clearance_constraint_footprint_approach_trigger_risk: 0.10
       clearance_constraint_guard_admissible_risk: 0.80
       clearance_constraint_guard_risk_resolution: 0.02
-      # Epsilon-constraint boundary for normalized footprint-clearance risk.
-      # Candidates at or below the measured dynamic background ceiling remain
-      # one feasible set and are ranked by the ordinary DWB objective. Above
-      # it, the Controller must accumulate the small risk improvement produced
-      # by each acceleration-limited V-DWA steering step. In the LB_C replay,
-      # keeping this boundary at 0.65 treated risks 0.563--0.573 as equal and
-      # delayed the bypass until no translating stop was admissible. The
-      # corrected replay exposed master clearance risks 0.544--0.551 while
-      # DynamicClearance was above the measured background ceiling. Resolving
-      # that band makes V-DWA accumulate the available steering early.
-      clearance_constraint_admissible_risk: 0.50
-      # Start avoidance before the physical footprint reaches the obstacle.
-      # In the fixed-obstacle replay, 0.75 activated only after clearance had
-      # fallen to 0.085 m, leaving no translating stop-admissible candidate.
-      # A 0.50 trigger clears the measured 0.485 dynamic background floor.
-      # Hard footprint and full-stop checks remain active at every risk level.
-      clearance_constraint_trigger_risk: 0.50
+      # Keep every hard-legal candidate below the mapped-wall guard in one
+      # soft-risk set. The former 0.18 boundary made a narrow but traversable
+      # mapped entrance lexicographically worse than driving straight into
+      # open space, so PathDeviation's finite corridor cost was never compared.
+      # Risk above 0.80 is still ranked before the weighted objective; swept
+      # physical-footprint and complete-stop checks remain hard at every value.
+      clearance_constraint_admissible_risk: 0.80
+      # In Sim152727 the safe entrance turn measured ForwardObstacle=0.256,
+      # while the fused all-around clearance was 0.924 and unnecessarily
+      # suppressed future acceleration. Keep that case weight-driven; enter
+      # hierarchical avoidance only for a stronger forward encounter.
+      clearance_constraint_trigger_risk: 0.30
       # Compare unavoidable dynamic-risk violations in half-percent bands.
       # This separates the 0.563 and 0.568 candidates available in one V-DWA
       # dynamic window while still grouping sub-resolution sensor noise.
@@ -203,6 +200,22 @@ controller_server:
       # only the additional 0.05 m reserve.
       enable_reserve_recovery: false
       reserve_recovery_hysteresis: true
+      # Costmap cells quantize a measured obstacle to a 0.05 m square. At the
+      # doorway this can put one voxel-layer cell across the rasterized edge of
+      # the measured footprint even when its center remains outside the body.
+      # Keep the measured footprint as the normal hard gate. Only when every
+      # pose of a candidate is safe for the 0.05 m inset core may a boundary
+      # overlap at the current pose or the first 50 ms response be considered.
+      # Entry after that first response remains a hard rejection. This
+      # accommodates the rear corner sweep while escaping nearly parallel to a
+      # wall without imposing a clear-by deadline that can reject a safe stop.
+      # After clearing the strip, a candidate cannot enter it again.
+      # Unknown space and a core collision remain hard failures. The finite
+      # penalty makes every normal physical-footprint-safe candidate preferable
+      # in ordinary score ranges.
+      enable_initial_overlap_recovery: true
+      initial_overlap_footprint_inset: 0.05
+      initial_overlap_recovery_penalty: 1000000.0
       # At 0.05 m costmap resolution, checking at half-cell swept distance
       # prevents translation plus rectangle-corner rotation from skipping a cell.
       maximum_swept_distance: 0.025
@@ -254,8 +267,10 @@ controller_server:
         # Soft footprint-aware clearance ranking. This never changes the
         # physical footprint or hard collision rejection; the GUI exposes
         # only its zero-cost margin for common V/A/J/F/DWB comparisons.
-        - DynamicClearance
-        - StaticClearance
+        # DynamicClearance and StaticClearance remain configured below for
+        # offline ablations.  The online constraint uses FootprintClearance
+        # once, avoiding three equivalent 2.5 m risk-path evaluations per
+        # candidate and keeping the 20 Hz control deadline observable.
         - FootprintClearance
         # The common certification layer performs exact swept-footprint safety
         # checks. Use the standard center-cell critic only for the continuous
@@ -270,13 +285,20 @@ controller_server:
       BaseObstacle.scale: 0.003125
       # BaseObstacle.scale: 0.15  # stronger-clearance ablation; recording invalid
       BaseObstacle.sum_scores: true
-      # ENGINEERING SAFEGUARD: keep the ordinary continuous path-ranking
-      # critics unchanged, but add one finite cost when any predicted pose
-      # leaves the 1.5 m Euclidean corridor around the transformed Path. The
-      # boundary itself is neutral, and this never rejects a trajectory.
+      # ENGINEERING SAFEGUARD: preserve the ordinary DWB path critics while
+      # continuously charging candidates that finish farther from the Path
+      # than the current robot pose. Crossing the 1.0 m corridor adds a finite
+      # penalty and proportional maximum/terminal excess costs, so candidates
+      # remain ordered even when every candidate is outside. This never rejects
+      # a trajectory; hard footprint safety and clearance ranking remain in
+      # charge of obstacle avoidance.
       PathDeviation.class: "f_dwa_controller::PathDeviationCritic"
-      PathDeviation.maximum_path_distance: 1.5
+      PathDeviation.maximum_path_distance: 1.0
       PathDeviation.deviation_penalty: 1000.0
+      # 0.25 m of additional departure costs 30 points and 0.50 m costs 60.
+      # This is enough to distinguish the observed straight overshoot without
+      # making a collision-free obstacle detour illegal.
+      PathDeviation.departure_cost_per_meter: 120.0
       PathDeviation.scale: 1.0
       # Keep the heading/path observation terms identical to the passing Nav2
       # DWB baseline.  R1 evidence showed that the former research-only values

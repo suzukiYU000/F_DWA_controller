@@ -678,6 +678,16 @@ double FootprintClearanceCritic::scorePoseClearance(
 double FootprintClearanceCritic::scoreTrajectory(
   const dwb_msgs::msg::Trajectory2D & trajectory)
 {
+  return scoreTrajectoryWithApproachRisk(trajectory, nullptr);
+}
+
+double FootprintClearanceCritic::scoreTrajectoryWithApproachRisk(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  double * approach_risk)
+{
+  if (approach_risk) {
+    *approach_risk = 0.0;
+  }
   if (!prepared_) {
     throw dwb_core::IllegalTrajectoryException(
             name_, "clearance field is not prepared");
@@ -742,6 +752,80 @@ double FootprintClearanceCritic::scoreTrajectory(
   }
   const double mean_penalty = std::clamp(
     exposure_integral / risk_distance_, 0.0, 1.0);
+  if (approach_risk) {
+    // Activation must describe the candidate the Controller can actually
+    // dispatch. The fixed-distance score above deliberately continues beyond
+    // the executable endpoint along the Path; using that continuation here
+    // made every candidate appear to approach the same future wall and kept
+    // the avoidance hierarchy active over the entire route.
+    constexpr double kTimeTolerance = 1.0e-9;
+    constexpr double kAngularSampleResolution = 0.10;
+    double minimum_candidate_penalty =
+      scorePoseClearance(trajectory.poses.front());
+    double maximum_approach_risk = 0.0;
+    geometry_msgs::msg::Pose2D previous_sample = trajectory.poses.front();
+    const auto update_approach =
+      [this, &minimum_candidate_penalty, &maximum_approach_risk,
+        &previous_sample](const geometry_msgs::msg::Pose2D & pose)
+      {
+        const double penalty = scorePoseClearance(pose);
+        if (penalty > minimum_candidate_penalty) {
+          const double available_increase = std::max(
+            1.0 - minimum_candidate_penalty, 1.0e-9);
+          maximum_approach_risk = std::max(
+            maximum_approach_risk,
+            std::clamp(
+              (penalty - minimum_candidate_penalty) /
+              available_increase,
+              0.0, 1.0));
+        }
+        minimum_candidate_penalty = std::min(
+          minimum_candidate_penalty, penalty);
+        previous_sample = pose;
+      };
+    const std::size_t timed_pose_count = trajectory.time_offsets.size();
+    for (std::size_t index = 1u; index < timed_pose_count; ++index) {
+      const auto duration_seconds = [](const auto & duration) {
+          return static_cast<double>(duration.sec) +
+                 1.0e-9 * static_cast<double>(duration.nanosec);
+        };
+      const double pose_time = duration_seconds(
+        trajectory.time_offsets[index]);
+      geometry_msgs::msg::Pose2D candidate_pose = trajectory.poses[index];
+      bool reached_seed =
+        pose_time >= risk_seed_time_ - kTimeTolerance;
+      if (pose_time > risk_seed_time_ + kTimeTolerance) {
+        const double previous_time = duration_seconds(
+          trajectory.time_offsets[index - 1u]);
+        const double ratio = std::clamp(
+          (risk_seed_time_ - previous_time) /
+          (pose_time - previous_time), 0.0, 1.0);
+        const auto & first = trajectory.poses[index - 1u];
+        const auto & second = trajectory.poses[index];
+        candidate_pose.x = first.x + ratio * (second.x - first.x);
+        candidate_pose.y = first.y + ratio * (second.y - first.y);
+        candidate_pose.theta = first.theta + ratio * std::remainder(
+          second.theta - first.theta, 2.0 * M_PI);
+        reached_seed = true;
+      }
+      const double translation = std::hypot(
+        candidate_pose.x - previous_sample.x,
+        candidate_pose.y - previous_sample.y);
+      const double rotation = std::abs(std::remainder(
+        candidate_pose.theta - previous_sample.theta, 2.0 * M_PI));
+      const bool final_timed_pose = index + 1u == timed_pose_count;
+      if (translation >= effective_resolution - 1.0e-12 ||
+        rotation >= kAngularSampleResolution - 1.0e-12 ||
+        reached_seed || final_timed_pose)
+      {
+        update_approach(candidate_pose);
+      }
+      if (reached_seed) {
+        break;
+      }
+    }
+    *approach_risk = maximum_approach_risk;
+  }
   return peak_weight_ * maximum_penalty +
          (1.0 - peak_weight_) * mean_penalty;
 }
