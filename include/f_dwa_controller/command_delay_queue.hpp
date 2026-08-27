@@ -40,6 +40,7 @@ struct DelayedCommand
   rclcpp::Time received_at;
   uint64_t received_steady_time_ns;
   rclcpp::Time eligible_at;
+  uint64_t eligible_steady_time_ns;
   uint64_t sequence;
   double sampled_delay_ms;
 };
@@ -68,6 +69,7 @@ public:
     uint64_t received_steady_time_ns);
 
   [[nodiscard]] std::optional<DelayedCommand> pop_due(const rclcpp::Time & now);
+  [[nodiscard]] std::optional<DelayedCommand> pop_due_steady(uint64_t now_steady_time_ns);
   [[nodiscard]] std::size_t size() const;
   [[nodiscard]] bool empty() const;
   [[nodiscard]] const DelayedCommand * front() const;

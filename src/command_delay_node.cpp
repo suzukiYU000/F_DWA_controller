@@ -218,7 +218,7 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
   const auto publish_period = std::chrono::nanoseconds(
     static_cast<int64_t>(std::llround(1.0e9 / publish_frequency_hz)));
   publish_period_nanoseconds_ = publish_period.count();
-  publish_timer_ = create_timer(
+  publish_timer_ = create_wall_timer(
     publish_period,
     std::bind(&CommandDelayNode::timer_callback, this));
   reset_trial_service_ = create_service<std_srvs::srv::Trigger>(
@@ -298,9 +298,10 @@ void CommandDelayNode::command_callback(
       invalidate_transport(received_at, "received a non-finite command");
       return;
     }
-    if (has_command_received_time_) {
+    if (has_command_received_steady_time_) {
       const double input_interval_seconds =
-        (received_at - last_command_received_time_).seconds();
+        static_cast<double>(
+        received_steady_time_ns - last_command_received_steady_time_ns_) * 1.0e-9;
       if (input_interval_seconds < minimum_input_interval_seconds_) {
         std::ostringstream reason;
         reason << "command input interval " <<
@@ -313,6 +314,8 @@ void CommandDelayNode::command_callback(
     }
     last_command_received_time_ = received_at;
     has_command_received_time_ = true;
+    last_command_received_steady_time_ns_ = received_steady_time_ns;
+    has_command_received_steady_time_ = true;
 
     if (!delay_queue_->enqueue(
         *message, received_at, received_steady_time_ns))
@@ -333,6 +336,8 @@ void CommandDelayNode::timer_callback()
   geometry_msgs::msg::Twist target_to_publish;
   geometry_msgs::msg::Twist dispatched_command;
   const auto callback_started_at = std::chrono::steady_clock::now();
+  const uint64_t callback_started_steady_time_ns =
+    steady_time_nanoseconds(callback_started_at);
   const rclcpp::Time callback_time = now();
   rclcpp::Time dispatch_time(0, 0, callback_time.get_clock_type());
   rclcpp::Time command_received_at(0, 0, callback_time.get_clock_type());
@@ -348,18 +353,15 @@ void CommandDelayNode::timer_callback()
     const bool reset_can_be_applied =
       reset_publication_pending_ &&
       callback_started_at >= pending_reset_requested_at_;
-    const bool ros_time_moved_backwards =
-      has_robot_publish_time_ &&
-      callback_time < last_robot_publish_time_;
     if (!reset_can_be_applied && transport_valid_ &&
       !observe_time_locked(callback_time))
     {
       invalidate_transport(callback_time, "ROS time moved backwards");
     }
-    if (has_robot_publish_time_ &&
-      !ros_time_moved_backwards &&
-      (callback_time - last_robot_publish_time_).nanoseconds() <
-      publish_period_nanoseconds_)
+    if (has_robot_publish_steady_time_ &&
+      callback_started_steady_time_ns >= last_robot_publish_steady_time_ns_ &&
+      callback_started_steady_time_ns - last_robot_publish_steady_time_ns_ <
+      static_cast<uint64_t>(publish_period_nanoseconds_))
     {
       // A reset request or executor scheduling race can make a callback ready
       // before one complete robot-facing period has elapsed. It must neither
@@ -381,11 +383,14 @@ void CommandDelayNode::timer_callback()
       last_command_received_time_ =
         rclcpp::Time(0, 0, callback_time.get_clock_type());
       has_command_received_time_ = false;
+      last_command_received_steady_time_ns_ = 0u;
+      has_command_received_steady_time_ = false;
       reset_publication_pending_ = false;
       reset_applied = true;
     } else if (transport_valid_) {
       advance_velocity_response_locked(callback_time);
-      const auto due_command = delay_queue_->pop_due(callback_time);
+      const auto due_command = delay_queue_->pop_due_steady(
+        callback_started_steady_time_ns);
       if (due_command.has_value()) {
         last_dispatched_command_ = due_command->command;
         if (velocity_response_model_enabled_) {
@@ -420,14 +425,14 @@ void CommandDelayNode::timer_callback()
     dispatch_time = now();
     dispatch_steady_time_ns =
       steady_time_nanoseconds(std::chrono::steady_clock::now());
-    last_robot_publish_time_ = dispatch_time;
-    has_robot_publish_time_ = true;
+    last_robot_publish_steady_time_ns_ = dispatch_steady_time_ns;
+    has_robot_publish_steady_time_ = true;
   }
 
   // Re-anchor at the Timer-owned robot handoff epoch before DDS and status
   // work. In accelerated simulation, adding that work to every period makes
   // an equally rated upstream producer slowly fill the bounded FIFO.
-  // The strict last_robot_publish_time_ gate above still prevents catch-up.
+  // The strict steady-time handoff gate above still prevents catch-up.
   publish_timer_->reset();
 
   std::lock_guard<std::mutex> publication_lock(publish_mutex_);
@@ -551,8 +556,10 @@ void CommandDelayNode::emergency_stop_callback(
     last_command_received_time_ =
       rclcpp::Time(0, 0, stopped_at.get_clock_type());
     has_command_received_time_ = false;
-    last_robot_publish_time_ = stopped_at;
-    has_robot_publish_time_ = true;
+    last_command_received_steady_time_ns_ = 0u;
+    has_command_received_steady_time_ = false;
+    last_robot_publish_steady_time_ns_ = stopped_steady_time_ns;
+    has_robot_publish_steady_time_ = true;
   }
 
   // Emergency stop is the only deliberate bypass of the nominal-delay FIFO.
@@ -713,7 +720,8 @@ void CommandDelayNode::invalidate_transport(
     queued_timing << queued.sequence << "@" <<
       queued.received_at.seconds() <<
       "[steady_ns=" << queued.received_steady_time_ns << "]->" <<
-      queued.eligible_at.seconds();
+      queued.eligible_at.seconds() <<
+      "[steady_ns=" << queued.eligible_steady_time_ns << "]";
   }
 
   transport_valid_ = false;
@@ -831,6 +839,7 @@ void CommandDelayNode::publish_diagnostic(
       ",received_at=" << queued.received_at.seconds() <<
       ",received_steady_time_ns=" << queued.received_steady_time_ns <<
       ",eligible_at=" << queued.eligible_at.seconds() <<
+      ",eligible_steady_time_ns=" << queued.eligible_steady_time_ns <<
       ",sampled_delay_ms=" << queued.sampled_delay_ms <<
       "," << command_to_string(queued.command);
     status.values.push_back(

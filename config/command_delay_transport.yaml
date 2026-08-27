@@ -40,8 +40,8 @@ command_delay_transport:
     # F-8's first valid increment is smaller than 0.01 m/s.
     command_zero_threshold: 0.0
     # At a 20 Hz producer rate, at most two commands normally occupy the
-    # bounded delay window. Gazebo /clock may briefly stop while wall-time
-    # controller callbacks continue; 24 slots preserve FIFO order through
-    # 1.0 s of bounded clock stall. Further growth remains a hard failure.
+    # steady-clock delay window. Twenty-four slots preserve FIFO order through
+    # more than 1.0 s of bounded executor stall. Further growth remains a hard
+    # failure rather than masking a broken command transport.
     max_queue_depth: 24
     random_seed: 0

@@ -64,6 +64,31 @@ TEST(CommandDelayQueue, AppliesFixedDelayInFifoOrder)
   EXPECT_DOUBLE_EQ(second_due->command.linear.x, 0.4);
 }
 
+TEST(CommandDelayQueue, SteadyEligibilityDoesNotDependOnRosClockProgress)
+{
+  CommandDelayParameters parameters;
+  parameters.min_delay_ms = 20.0;
+  parameters.max_delay_ms = 20.0;
+  parameters.mean_delay_ms = 20.0;
+  parameters.delay_stddev_ms = 0.0;
+  CommandDelayQueue queue(parameters);
+
+  geometry_msgs::msg::Twist command;
+  command.linear.x = 0.5;
+  constexpr uint64_t received_steady_time_ns = 1000000000u;
+  ASSERT_TRUE(queue.enqueue(
+      command, rclcpp::Time(1, 0, RCL_ROS_TIME),
+      received_steady_time_ns));
+
+  const DelayedCommand * queued = queue.front();
+  ASSERT_NE(queued, nullptr);
+  EXPECT_EQ(queued->eligible_steady_time_ns, 1020000000u);
+  EXPECT_FALSE(queue.pop_due_steady(1019999999u).has_value());
+  const auto due = queue.pop_due_steady(1020000000u);
+  ASSERT_TRUE(due.has_value());
+  EXPECT_DOUBLE_EQ(due->command.linear.x, 0.5);
+}
+
 TEST(CommandDelayQueue, RejectsOverflowWithoutDroppingQueuedCommands)
 {
   CommandDelayParameters parameters;
@@ -80,7 +105,7 @@ TEST(CommandDelayQueue, RejectsOverflowWithoutDroppingQueuedCommands)
   EXPECT_EQ(queue.next_sequence(), 2u);
 }
 
-TEST(CommandDelayQueue, DefaultDepthBoundsOneSecondSimulationClockStall)
+TEST(CommandDelayQueue, DefaultDepthBoundsOneSecondExecutorStall)
 {
   CommandDelayParameters parameters;
   parameters.min_delay_ms = 0.0;
@@ -91,8 +116,8 @@ TEST(CommandDelayQueue, DefaultDepthBoundsOneSecondSimulationClockStall)
   geometry_msgs::msg::Twist command;
   const rclcpp::Time now(0, 0, RCL_ROS_TIME);
 
-  // At 20 Hz, 24 entries cover the ordinary 80 ms delay plus more than one
-  // second of a bounded Gazebo /clock stall without dropping FIFO history.
+  // At 20 Hz, 24 entries cover the ordinary delay plus more than one second
+  // of a bounded executor stall without dropping FIFO history.
   for (std::size_t index = 0; index < 24u; ++index) {
     EXPECT_TRUE(queue.enqueue(command, now, index + 1u));
   }

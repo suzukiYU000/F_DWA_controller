@@ -112,12 +112,14 @@ private:
   std::deque<AxisResponseTarget> pending_linear_response_targets_;
   std::deque<AxisResponseTarget> pending_angular_response_targets_;
   int64_t publish_period_nanoseconds_{30000000};
-  rclcpp::Time last_robot_publish_time_{0, 0, RCL_ROS_TIME};
-  bool has_robot_publish_time_{false};
+  uint64_t last_robot_publish_steady_time_ns_{0};
+  bool has_robot_publish_steady_time_{false};
   rclcpp::Time last_observed_time_{0, 0, RCL_ROS_TIME};
   bool has_observed_time_{false};
   rclcpp::Time last_command_received_time_{0, 0, RCL_ROS_TIME};
   bool has_command_received_time_{false};
+  uint64_t last_command_received_steady_time_ns_{0};
+  bool has_command_received_steady_time_{false};
   std::atomic<int8_t> last_published_transport_stopped_{-1};
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr command_subscriber_;

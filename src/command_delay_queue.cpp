@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include "rclcpp/duration.hpp"
@@ -92,14 +93,21 @@ bool CommandDelayQueue::enqueue(
   }
 
   const double delay_ms = sample_delay_ms();
+  const auto delay_nanoseconds =
+    static_cast<uint64_t>(std::llround(delay_ms * 1.0e6));
   const auto delay = rclcpp::Duration::from_nanoseconds(
-    static_cast<int64_t>(std::llround(delay_ms * 1.0e6)));
+    static_cast<int64_t>(delay_nanoseconds));
+  const uint64_t maximum_steady_time = std::numeric_limits<uint64_t>::max();
+  const uint64_t eligible_steady_time_ns =
+    received_steady_time_ns > maximum_steady_time - delay_nanoseconds ?
+    maximum_steady_time : received_steady_time_ns + delay_nanoseconds;
   queue_.push_back(
     DelayedCommand{
       normalized_command(command, parameters_.zero_threshold),
       received_at,
       received_steady_time_ns,
       received_at + delay,
+      eligible_steady_time_ns,
       next_sequence_,
       delay_ms});
   ++next_sequence_;
@@ -109,6 +117,20 @@ bool CommandDelayQueue::enqueue(
 std::optional<DelayedCommand> CommandDelayQueue::pop_due(const rclcpp::Time & now)
 {
   if (queue_.empty() || queue_.front().eligible_at > now) {
+    return std::nullopt;
+  }
+
+  DelayedCommand command = queue_.front();
+  queue_.pop_front();
+  return command;
+}
+
+std::optional<DelayedCommand> CommandDelayQueue::pop_due_steady(
+  const uint64_t now_steady_time_ns)
+{
+  if (queue_.empty() ||
+    queue_.front().eligible_steady_time_ns > now_steady_time_ns)
+  {
     return std::nullopt;
   }
 

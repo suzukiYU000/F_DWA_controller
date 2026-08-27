@@ -112,9 +112,10 @@ sequence for fair method or parameter comparisons.
 The package also provides `command_delay_transport`, a simulation-only command
 transport. It receives Nav2 commands, samples an independent truncated-normal
 delay for every command, preserves FIFO order, and applies at most one queued
-command per 33.333 Hz ROS-clock timer tick. The default sampled distribution is
+command per 33.333 Hz steady-clock timer tick. The default sampled distribution is
 bounded to 5--35 ms with mean 20 ms and standard deviation 5 ms. Together with
-the Timer phase this reproduces the measured 11--71 ms real dispatch range.
+the Timer phase this reproduces the measured 11--71 ms real dispatch range
+independently of the Gazebo Real Time Factor.
 
 When `enable_velocity_response_model` is enabled, the transport then applies
 the identified axis-specific dead-time plus first-order WHILL response before

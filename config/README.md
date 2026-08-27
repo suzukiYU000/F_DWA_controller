@@ -98,6 +98,13 @@ robot-facing command and dispatch are published only by the Timer callback,
 which re-anchors its next period immediately after the robot-facing handoff.
 An early callback less than 30 ms after the previous handoff neither consumes
 the FIFO nor publishes.
+The transport Timer, sampled command delay, input-interval check, and pacing
+gate use the steady wall clock because they represent software/actuator
+latency and the upstream Controller Server also produces commands in wall
+time. ROS timestamps remain on dispatch evidence, and the simulated WHILL
+dead-time and first-order response continue to advance in Gazebo ROS time.
+This separation prevents a Real Time Factor below 1.0 from turning a healthy
+20 Hz producer into an artificial FIFO overflow.
 Upstream Controller Server arrival intervals are not used to certify this
 robot-facing boundary: an early producer callback is retained in the bounded
 FIFO, while queue overflow still invalidates the trial.
