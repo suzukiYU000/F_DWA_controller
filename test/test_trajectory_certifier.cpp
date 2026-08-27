@@ -758,6 +758,14 @@ TEST(TrajectoryCertifier, ExactBroadphasePreservesFallbackAndInflation)
   expect_same_certification(
     fallback_reference, fallback_broadphase);
   EXPECT_TRUE(fallback_broadphase.safe);
+  ASSERT_FALSE(workspace.pose_check_cache.empty());
+  const std::size_t cached_polygon_count =
+    workspace.pose_check_cache.size();
+  const CertificationResult repeated_broadphase =
+    certify_pose_sequence(
+    costmap, footprint, poses, 0.025, &workspace);
+  expect_same_certification(fallback_reference, repeated_broadphase);
+  EXPECT_EQ(workspace.pose_check_cache.size(), cached_polygon_count);
 }
 
 TEST(TrajectoryCertifier, ExactBroadphaseMatchesRandomCostmaps)

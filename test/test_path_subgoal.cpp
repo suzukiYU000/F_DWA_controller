@@ -133,7 +133,7 @@ TEST(PathSubgoal, MeaningfulProgressUsesPathArclengthAndLookaheadHeading)
       trajectory, path, heading_target, 0.20, 0.20));
 
   trajectory.poses[2u].theta = 0.25;
-  EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+  EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
       trajectory, path, heading_target, 0.20, 0.20));
   EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
       trajectory, path, heading_target, 0.0, 0.20));
@@ -208,6 +208,26 @@ TEST(PathSubgoal, ArclengthProgressRejectsGrowingSubgoalHeadingError)
   trajectory.poses[1u].x = 0.55;
   trajectory.poses[1u].theta = 0.1;
 
+  EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.025, 0.025));
+}
+
+TEST(PathSubgoal, InPlaceTurnCountsWhileTranslationProgressIsEnabled)
+{
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(2u);
+  path.poses[1u].x = 2.0;
+  geometry_msgs::msg::Pose2D heading_target;
+  heading_target.theta = 0.0;
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(2u);
+  trajectory.poses[0u].theta = 0.40;
+  trajectory.poses[1u].theta = 0.35;
+
+  EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.025, 0.025));
+
+  trajectory.poses[1u].theta = 0.45;
   EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
       trajectory, path, heading_target, 0.025, 0.025));
 }

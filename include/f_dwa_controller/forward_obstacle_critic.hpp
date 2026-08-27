@@ -47,6 +47,7 @@ protected:
   nav2_costmap_2d::Costmap2D * costmap_{nullptr};
   nav_2d_msgs::msg::Path2D global_plan_;
   PreparedPlanGeometry prepared_plan_geometry_;
+  RiskPathWorkspace risk_path_workspace_;
   double risk_distance_{2.5};
   double risk_seed_time_{1.4};
   double heading_relaxation_distance_{1.0};

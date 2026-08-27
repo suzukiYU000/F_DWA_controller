@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "dwb_core/exceptions.hpp"
 #include "f_dwa_controller/trajectory_certifier.hpp"
@@ -82,6 +83,7 @@ bool HorizonObstacleFootprintCritic::prepare(
   const geometry_msgs::msg::Pose2D & goal,
   const nav_2d_msgs::msg::Path2D & global_plan)
 {
+  certification_workspace_prepared_ = false;
   if (!dwb_critics::ObstacleFootprintCritic::prepare(
       pose, velocity, goal, global_plan))
   {
@@ -111,11 +113,28 @@ bool HorizonObstacleFootprintCritic::prepare(
     throw std::runtime_error{
             "Initial-overlap inset collapses the planning footprint"};
   }
-  if (costmap_) {
-    static_cast<void>(prepare_certification_broadphase(
-      *costmap_, certification_workspace_));
-  }
   return std::isfinite(footprint_radius_);
+}
+
+bool HorizonObstacleFootprintCritic::prepareCertificationBroadphaseIfNeeded()
+{
+  if (!certification_workspace_prepared_ && costmap_) {
+    certification_workspace_prepared_ = prepare_certification_broadphase(
+      *costmap_, certification_workspace_);
+  }
+  return certification_workspace_prepared_;
+}
+
+void HorizonObstacleFootprintCritic::setDetailedFailureDiagnostics(
+  const bool enabled) noexcept
+{
+  detailed_failure_diagnostics_ = enabled;
+}
+
+void HorizonObstacleFootprintCritic::setSharedCertificationWorkspace(
+  CertificationWorkspace * const workspace) noexcept
+{
+  shared_certification_workspace_ = workspace;
 }
 
 double HorizonObstacleFootprintCritic::scoreTrajectory(
@@ -131,19 +150,35 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
     const std::size_t pose_index,
     const std::size_t subdivision_index)
     {
+      // The planner prepared this broadphase under the same locked Costmap
+      // snapshot. Empty footprint bounds are a complete safety proof for this
+      // pose; an inconclusive query falls through to the unchanged Nav2 exact
+      // check, preserving legality and diagnostics at obstacle boundaries.
+      if (shared_certification_workspace_ && costmap_ &&
+        certification_footprint_bounds_are_hazard_free(
+          *costmap_, footprint_spec_, checked_pose,
+          *shared_certification_workspace_))
+      {
+        return;
+      }
       try {
         static_cast<void>(scorePose(checked_pose));
       } catch (const dwb_core::IllegalTrajectoryException & exception) {
         std::ostringstream detail;
         detail << std::setprecision(17) << exception.what() <<
           ";pose_index=" << pose_index <<
-          ";subdivision=" << subdivision_index <<
+          ";subdivision=" << subdivision_index;
+        if (!detailed_failure_diagnostics_) {
+          throw dwb_core::IllegalTrajectoryException(name_, detail.str());
+        }
+        detail <<
           ";pose_x=" << checked_pose.x <<
           ";pose_y=" << checked_pose.y <<
           ";pose_yaw=" << checked_pose.theta;
 
         CertificationResult result;
         if (costmap_ && footprint_spec_.size() >= 3u) {
+          static_cast<void>(prepareCertificationBroadphaseIfNeeded());
           const std::vector<geometry_msgs::msg::Pose2D> single_pose{
             checked_pose};
           result = certify_pose_sequence(
@@ -249,8 +284,15 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
         score_pose_with_diagnostics(intermediate, index, subdivision);
       }
     }
-  } catch (const dwb_core::IllegalTrajectoryException &) {
-    if (enable_initial_overlap_recovery_ && costmap_) {
+  } catch (const dwb_core::IllegalTrajectoryException & exception) {
+    const std::string_view failure_detail{exception.what()};
+    const bool failure_is_at_initial_pose =
+      failure_detail.find(";pose_index=0;subdivision=0") !=
+      std::string_view::npos;
+    if (enable_initial_overlap_recovery_ && costmap_ &&
+      failure_is_at_initial_pose)
+    {
+      static_cast<void>(prepareCertificationBroadphaseIfNeeded());
       double overlap_fraction = 0.0;
       if (certify_initial_overlap_margin_sequence(
           *costmap_, footprint_spec_, inset_core_footprint_, trajectory.poses,

@@ -112,7 +112,10 @@ protected:
     double * clearance_risk = nullptr,
     const std::vector<geometry_msgs::msg::Pose2D> *
     precomputed_stop_poses = nullptr,
-    bool * completed_weighted_score = nullptr);
+    bool * completed_weighted_score = nullptr,
+    double * path_deviation_cost = nullptr,
+    double * mean_path_distance_cost = nullptr,
+    bool * strict_physical_stop_safety_proven = nullptr);
   visualization_msgs::msg::MarkerArray build_candidate_markers(
     const dwb_msgs::msg::LocalPlanEvaluation & evaluation) const;
   static bool coalesce_stale_marker_publication(
@@ -129,6 +132,14 @@ protected:
     std::optional<double> precomputed_clearance_risk,
     std::optional<double> precomputed_clearance_trigger_risk,
     std::optional<double> precomputed_clearance_guard_risk);
+  static bool should_score_terminal_stop(
+    bool certification_enabled,
+    bool stop_admissibility_enabled,
+    double goal_distance_scale,
+    bool target_pose_valid);
+  static std::optional<double> fused_clearance_risk(
+    std::optional<double> primary_risk,
+    std::optional<double> guard_risk);
   static bool trajectory_has_meaningful_subgoal_progress(
     const dwb_msgs::msg::Trajectory2D & trajectory,
     const nav_2d_msgs::msg::Path2D & path,
@@ -141,6 +152,12 @@ protected:
     const geometry_msgs::msg::Pose2D & pose,
     const geometry_msgs::msg::Pose2D & terminal_pose,
     double capture_distance);
+  static bool terminal_goal_hold_is_applicable(
+    const geometry_msgs::msg::Pose2D & pose,
+    const geometry_msgs::msg::Pose2D & goal_pose,
+    double capture_distance,
+    const nav_2d_msgs::msg::Twist2D & velocity,
+    double stop_velocity_threshold);
   static bool clearance_constraint_prefers_candidate(
     bool candidate_has_meaningful_progress,
     bool best_has_meaningful_progress,
@@ -171,6 +188,27 @@ protected:
     double best_total,
     std::size_t candidate_canonical_index,
     std::size_t best_canonical_index);
+  static bool receding_horizon_recovery_prefers_candidate(
+    double candidate_collision_time,
+    double best_collision_time,
+    double candidate_clearance_risk,
+    double best_clearance_risk,
+    double candidate_path_departure_cost,
+    double best_path_departure_cost,
+    std::size_t candidate_canonical_index,
+    std::size_t best_canonical_index);
+  static double predicted_collision_time(
+    const CertificationResult & result,
+    const std::vector<geometry_msgs::msg::Pose2D> & poses,
+    const std::vector<geometry_msgs::msg::Point> & footprint,
+    double maximum_swept_distance,
+    double control_period);
+  static double predicted_collision_time_from_obstacle_rejection(
+    const std::string & rejection_detail,
+    const std::vector<geometry_msgs::msg::Pose2D> & poses,
+    const std::vector<geometry_msgs::msg::Point> & footprint,
+    double maximum_swept_distance,
+    double control_period);
   static bool has_full_evaluation_capacity(
     std::size_t pending_full_evaluation_count);
 
@@ -294,7 +332,9 @@ private:
   double clearance_constraint_footprint_approach_trigger_risk_{0.1};
   std::shared_ptr<FootprintClearanceCritic> clearance_constraint_critic_;
   dwb_core::TrajectoryCritic::Ptr clearance_constraint_trigger_critic_;
-  std::shared_ptr<FootprintClearanceCritic> clearance_constraint_guard_critic_;
+  dwb_core::TrajectoryCritic::Ptr clearance_constraint_guard_critic_;
+  std::shared_ptr<FootprintClearanceCritic>
+  clearance_constraint_guard_footprint_critic_;
   bool no_valid_control_deceleration_fallback_enabled_{false};
   bool stop_admissibility_enabled_{false};
   bool nominal_delay_preview_enabled_{true};
@@ -358,6 +398,7 @@ private:
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
   retained_backup_states_;
   bool terminal_stop_goal_capture_active_{false};
+  bool terminal_stop_goal_capture_committed_{false};
   std::vector<geometry_msgs::msg::Point> certified_footprint_;
   std::vector<geometry_msgs::msg::Point> initial_overlap_core_footprint_;
   mutable CertificationWorkspace certification_workspace_;

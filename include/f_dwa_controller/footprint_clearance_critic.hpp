@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "dwb_core/trajectory_critic.hpp"
@@ -70,6 +71,20 @@ public:
     const dwb_msgs::msg::Trajectory2D & trajectory,
     double * approach_risk);
 
+  /**
+   * @brief Score a uniformly timed, executable pose sequence.
+   *
+   * This uses the same bounded footprint-clearance penalty as the ordinary
+   * trajectory score, but it does not append a soft Path continuation.  It is
+   * intended for complete method-native stop sequences sampled at the
+   * Controller certification period, so angular and braking inertia are part
+   * of the clearance ranking.  The result blends peak exposure with the
+   * time-sample mean and remains in [0, 1].
+   */
+  double scoreUniformPoseSequenceWithApproachRisk(
+    const std::vector<geometry_msgs::msg::Pose2D> & poses,
+    double * approach_risk);
+
 protected:
   bool excludedByStaticLayer(double world_x, double world_y) const;
 
@@ -89,6 +104,9 @@ protected:
   double scorePoseClearance(
     const geometry_msgs::msg::Pose2D & pose) const;
 
+  double scorePoseClearanceWithPreparedPoseCache(
+    const geometry_msgs::msg::Pose2D & pose) const;
+
   nav2_costmap_2d::Costmap2D * costmap_{nullptr};
   nav2_costmap_2d::Costmap2D * exclusion_costmap_{nullptr};
   nav2_costmap_2d::CostmapLayer * exclusion_costmap_layer_{nullptr};
@@ -96,6 +114,7 @@ protected:
   bool project_exclusion_costmap_{false};
   nav_2d_msgs::msg::Path2D global_plan_;
   PreparedPlanGeometry prepared_plan_geometry_;
+  RiskPathWorkspace risk_path_workspace_;
   std::string source_layer_;
   std::string exclude_layer_;
   nav2_costmap_2d::Footprint physical_footprint_;
@@ -103,6 +122,15 @@ protected:
   nav2_costmap_2d::Footprint footprint_boundary_samples_;
   std::vector<unsigned char> penalized_cell_mask_;
   std::vector<unsigned char> penalized_cell_mask_scratch_;
+  // Exact integer-cell disk used by bounded static-layer exclusion. Reusing
+  // it avoids rebuilding the same tolerance geometry for every live lethal
+  // cell in every Controller cycle.
+  std::vector<std::pair<int, int>> exclusion_tolerance_offsets_;
+  double exclusion_offsets_resolution_{
+    std::numeric_limits<double>::quiet_NaN()};
+  double exclusion_offsets_tolerance_{
+    std::numeric_limits<double>::quiet_NaN()};
+  bool exclusion_tolerance_active_{false};
   std::vector<float> obstacle_distance_field_;
   // Reused by the separable Euclidean distance transform.  These buffers are
   // scratch only: their logical sizes are reset for every rebuild and no
@@ -118,6 +146,9 @@ protected:
     std::numeric_limits<double>::quiet_NaN()};
   double maximum_footprint_probe_gap_{0.0};
   bool prepared_{false};
+  geometry_msgs::msg::Pose2D prepared_pose_;
+  double prepared_pose_penalty_{1.0};
+  bool prepared_pose_penalty_valid_{false};
   double clearance_margin_{0.25};
   double exclude_layer_tolerance_{0.0};
   bool apply_exclude_tolerance_on_aligned_grids_{false};

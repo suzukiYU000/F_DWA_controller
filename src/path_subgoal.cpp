@@ -111,7 +111,19 @@ bool trajectory_has_meaningful_path_progress(
   const double minimum_arclength_progress,
   const double minimum_heading_progress)
 {
-  if (trajectory.poses.empty() ||
+  return pose_sequence_has_meaningful_path_progress(
+    trajectory.poses, path, heading_target, minimum_arclength_progress,
+    minimum_heading_progress);
+}
+
+bool pose_sequence_has_meaningful_path_progress(
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  const nav_2d_msgs::msg::Path2D & path,
+  const geometry_msgs::msg::Pose2D & heading_target,
+  const double minimum_arclength_progress,
+  const double minimum_heading_progress)
+{
+  if (poses.empty() ||
     (minimum_arclength_progress <= 0.0 &&
     minimum_heading_progress <= 0.0))
   {
@@ -119,7 +131,7 @@ bool trajectory_has_meaningful_path_progress(
   }
   PathProjection initial_projection;
   if (!project_pose_onto_path(
-      path, trajectory.poses.front(), initial_projection))
+      path, poses.front(), initial_projection))
   {
     return false;
   }
@@ -130,7 +142,7 @@ bool trajectory_has_meaningful_path_progress(
         target_heading - pose.theta, 2.0 * M_PI));
     };
   const double initial_heading_error =
-    heading_error(trajectory.poses.front());
+    heading_error(poses.front());
   // Nearest-path arclength can increase during the first few samples even
   // when the remainder of a trajectory misses a turn. Classify progress from
   // the executable endpoint, so an early 2.5 cm projection cannot hide a
@@ -140,7 +152,7 @@ bool trajectory_has_meaningful_path_progress(
   const double maximum_heading_error_growth =
     minimum_heading_progress > 0.0 ?
     minimum_heading_progress : std::numeric_limits<double>::infinity();
-  const auto & terminal_pose = trajectory.poses.back();
+  const auto & terminal_pose = poses.back();
   PathProjection terminal_projection;
   if (!project_pose_onto_path(path, terminal_pose, terminal_projection)) {
     return false;
@@ -155,11 +167,11 @@ bool trajectory_has_meaningful_path_progress(
   {
     return true;
   }
-  // Heading-only motion remains available for configurations that explicitly
-  // disable translational progress. With both enabled, continuous weighted
-  // path and heading critics decide between turning and translating.
-  if (minimum_arclength_progress <= 0.0 &&
-    minimum_heading_progress > 0.0 &&
+  // A stop-admissible in-place turn toward the observable subgoal is also
+  // progress. This remains available when translational progress is enabled:
+  // requiring translation first can make a nonholonomic robot keep selecting
+  // a stationary candidate when it must turn before a safe detour exists.
+  if (minimum_heading_progress > 0.0 &&
     initial_heading_error - heading_error(terminal_pose) >=
     minimum_heading_progress - 1.0e-12)
   {

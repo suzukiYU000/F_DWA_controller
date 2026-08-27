@@ -163,3 +163,19 @@ TEST(HorizonObstacleFootprintCritic, RejectsCollisionAtGeneratedPose)
     EXPECT_NE(detail.find("pose_x=-1"), std::string::npos);
   }
 }
+
+TEST(HorizonObstacleFootprintCritic, ConciseFailureRetainsRecoveryIndices)
+{
+  StubHorizonObstacleFootprintCritic critic;
+  critic.setDetailedFailureDiagnostics(false);
+  try {
+    static_cast<void>(
+      critic.scoreTrajectory(make_trajectory({2.0, -1.0, 100.0})));
+    FAIL() << "Expected a collision rejection";
+  } catch (const dwb_core::IllegalTrajectoryException & exception) {
+    const std::string detail = exception.what();
+    EXPECT_NE(detail.find("pose_index=1"), std::string::npos);
+    EXPECT_NE(detail.find("subdivision=0"), std::string::npos);
+    EXPECT_EQ(detail.find("pose_x="), std::string::npos);
+  }
+}

@@ -8,7 +8,7 @@
 #ifndef F_DWA_CONTROLLER__MEAN_PATH_DIST_CRITIC_HPP_
 #define F_DWA_CONTROLLER__MEAN_PATH_DIST_CRITIC_HPP_
 
-#include "dwb_critics/path_dist.hpp"
+#include "f_dwa_controller/linear_map_grid_critics.hpp"
 
 namespace f_dwa_controller
 {
@@ -20,7 +20,7 @@ namespace f_dwa_controller
  * its trajectory aggregation changes from the endpoint default to a mean, so
  * the score is independent of trajectory sampling interval.
  */
-class MeanPathDistCritic : public dwb_critics::PathDistCritic
+class MeanPathDistCritic : public LinearPathDistCritic
 {
 public:
   double scoreTrajectory(

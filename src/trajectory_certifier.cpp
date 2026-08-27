@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "nav2_costmap_2d/cost_values.hpp"
@@ -86,13 +87,50 @@ bool query_hazard_count(
   return true;
 }
 
+std::size_t hash_map_footprint(
+  const std::vector<nav2_costmap_2d::MapLocation> & map_footprint,
+  const bool allow_lethal)
+{
+  std::size_t hash = map_footprint.size();
+  const auto combine = [&hash](const std::size_t value) {
+      hash ^= value + static_cast<std::size_t>(0x9e3779b9u) +
+        (hash << 6u) + (hash >> 2u);
+    };
+  combine(allow_lethal ? 1u : 0u);
+  for (const auto & point : map_footprint) {
+    combine(point.x);
+    combine(point.y);
+  }
+  return hash;
+}
+
+bool cached_footprint_matches(
+  const PoseCheckCacheEntry & entry,
+  const std::vector<nav2_costmap_2d::MapLocation> & map_footprint,
+  const bool allow_lethal)
+{
+  if (entry.vertex_count != map_footprint.size() ||
+    entry.allow_lethal != allow_lethal)
+  {
+    return false;
+  }
+  for (std::size_t index = 0u; index < map_footprint.size(); ++index) {
+    if (entry.map_footprint[index].x != map_footprint[index].x ||
+      entry.map_footprint[index].y != map_footprint[index].y)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 CertificationResult check_pose(
   nav2_costmap_2d::Costmap2D & costmap,
   const std::vector<geometry_msgs::msg::Point> & footprint,
   const geometry_msgs::msg::Pose2D & pose,
   std::vector<nav2_costmap_2d::MapLocation> & map_footprint,
   std::vector<nav2_costmap_2d::MapLocation> & footprint_cells,
-  const CertificationWorkspace & workspace,
+  CertificationWorkspace & workspace,
   const bool allow_lethal = false,
   bool * lethal_overlap = nullptr)
 {
@@ -139,8 +177,55 @@ CertificationResult check_pose(
     return result;
   }
 
+  const bool cacheable =
+    map_footprint.size() <= kMaximumCachedFootprintVertices &&
+    workspace.hazard_prefix_valid;
+  std::size_t cache_hash = 0u;
+  if (cacheable) {
+    cache_hash = hash_map_footprint(map_footprint, allow_lethal);
+    const auto cached_range =
+      workspace.pose_check_cache_index.equal_range(cache_hash);
+    for (auto cached = cached_range.first;
+      cached != cached_range.second; ++cached)
+    {
+      if (cached->second >= workspace.pose_check_cache.size()) {
+        continue;
+      }
+      const PoseCheckCacheEntry & entry =
+        workspace.pose_check_cache[cached->second];
+      if (!cached_footprint_matches(entry, map_footprint, allow_lethal)) {
+        continue;
+      }
+      if (lethal_overlap) {
+        *lethal_overlap = entry.lethal_overlap;
+      }
+      return entry.result;
+    }
+  }
+  const auto cache_result =
+    [&workspace, &map_footprint, cacheable, cache_hash, allow_lethal](
+    const CertificationResult & completed,
+    const bool completed_lethal_overlap)
+    {
+      if (cacheable) {
+        PoseCheckCacheEntry entry;
+        entry.vertex_count = map_footprint.size();
+        entry.allow_lethal = allow_lethal;
+        entry.lethal_overlap = completed_lethal_overlap;
+        entry.result = completed;
+        std::copy(
+          map_footprint.begin(), map_footprint.end(),
+          entry.map_footprint.begin());
+        const std::size_t index = workspace.pose_check_cache.size();
+        workspace.pose_check_cache.push_back(std::move(entry));
+        workspace.pose_check_cache_index.emplace(cache_hash, index);
+      }
+      return completed;
+    };
+
   footprint_cells.clear();
   costmap.convexFillCells(map_footprint, footprint_cells);
+  bool observed_lethal_overlap = false;
   for (const nav2_costmap_2d::MapLocation & cell : footprint_cells) {
     const unsigned char cost = costmap.getCost(cell.x, cell.y);
     if (cost == nav2_costmap_2d::NO_INFORMATION) {
@@ -152,9 +237,10 @@ CertificationResult check_pose(
       costmap.mapToWorld(
         cell.x, cell.y, result.failure_cell_world_x,
         result.failure_cell_world_y);
-      return result;
+      return cache_result(result, observed_lethal_overlap);
     }
     if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
+      observed_lethal_overlap = true;
       if (lethal_overlap) {
         *lethal_overlap = true;
       }
@@ -169,12 +255,12 @@ CertificationResult check_pose(
       costmap.mapToWorld(
         cell.x, cell.y, result.failure_cell_world_x,
         result.failure_cell_world_y);
-      return result;
+      return cache_result(result, observed_lethal_overlap);
     }
   }
   result.safe = true;
   result.failure = CertificationFailure::kNone;
-  return result;
+  return cache_result(result, observed_lethal_overlap);
 }
 
 double normalized_angle_difference(
@@ -261,6 +347,59 @@ bool certify_hazard_free_sequence_bounds(
   return true;
 }
 
+bool certify_hazard_free_segment_bounds(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  const geometry_msgs::msg::Pose2D & first,
+  const geometry_msgs::msg::Pose2D & second,
+  const double maximum_footprint_radius,
+  const CertificationWorkspace & workspace)
+{
+  if (!std::isfinite(first.x) || !std::isfinite(first.y) ||
+    !std::isfinite(first.theta) || !std::isfinite(second.x) ||
+    !std::isfinite(second.y) || !std::isfinite(second.theta) ||
+    !std::isfinite(maximum_footprint_radius) ||
+    maximum_footprint_radius < 0.0)
+  {
+    return false;
+  }
+
+  // During the linear pose interpolation below, every footprint point stays
+  // inside a circle of maximum_footprint_radius around the interpolated robot
+  // centre.  The centre remains on the segment joining first and second, so
+  // this AABB contains the complete continuously swept footprint regardless
+  // of its intermediate orientation.  An empty hazard-prefix query therefore
+  // proves this segment without changing the exact fallback for nearby cells.
+  const double minimum_x = std::min(first.x, second.x);
+  const double minimum_y = std::min(first.y, second.y);
+  const double maximum_x = std::max(first.x, second.x);
+  const double maximum_y = std::max(first.y, second.y);
+  const double coordinate_scale = std::max(
+    {1.0, std::abs(minimum_x), std::abs(minimum_y),
+      std::abs(maximum_x), std::abs(maximum_y),
+      maximum_footprint_radius});
+  const double outward_rounding_margin = 1.0e-12 * coordinate_scale;
+  unsigned int minimum_map_x = 0u;
+  unsigned int minimum_map_y = 0u;
+  unsigned int maximum_map_x = 0u;
+  unsigned int maximum_map_y = 0u;
+  if (!costmap.worldToMap(
+      minimum_x - maximum_footprint_radius - outward_rounding_margin,
+      minimum_y - maximum_footprint_radius - outward_rounding_margin,
+      minimum_map_x, minimum_map_y) ||
+    !costmap.worldToMap(
+      maximum_x + maximum_footprint_radius + outward_rounding_margin,
+      maximum_y + maximum_footprint_radius + outward_rounding_margin,
+      maximum_map_x, maximum_map_y))
+  {
+    return false;
+  }
+
+  std::size_t hazard_count = 0u;
+  return query_hazard_count(
+    costmap, workspace, minimum_map_x, minimum_map_y,
+    maximum_map_x, maximum_map_y, hazard_count) && hazard_count == 0u;
+}
+
 }  // namespace
 
 bool prepare_certification_broadphase(
@@ -332,6 +471,47 @@ void invalidate_certification_broadphase(
   workspace.hazard_origin_y = 0.0;
   workspace.hazard_resolution = 0.0;
   workspace.hazard_prefix_valid = false;
+  workspace.pose_check_cache.clear();
+  workspace.pose_check_cache_index.clear();
+}
+
+bool certification_footprint_bounds_are_hazard_free(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & footprint,
+  const geometry_msgs::msg::Pose2D & pose,
+  const CertificationWorkspace & workspace)
+{
+  if (footprint.size() < 3u || !std::isfinite(pose.x) ||
+    !std::isfinite(pose.y) || !std::isfinite(pose.theta))
+  {
+    return false;
+  }
+  unsigned int minimum_x = std::numeric_limits<unsigned int>::max();
+  unsigned int minimum_y = std::numeric_limits<unsigned int>::max();
+  unsigned int maximum_x = 0u;
+  unsigned int maximum_y = 0u;
+  const double cosine = std::cos(pose.theta);
+  const double sine = std::sin(pose.theta);
+  for (const auto & point : footprint) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
+      return false;
+    }
+    const double world_x = pose.x + point.x * cosine - point.y * sine;
+    const double world_y = pose.y + point.x * sine + point.y * cosine;
+    unsigned int map_x = 0u;
+    unsigned int map_y = 0u;
+    if (!costmap.worldToMap(world_x, world_y, map_x, map_y)) {
+      return false;
+    }
+    minimum_x = std::min(minimum_x, map_x);
+    minimum_y = std::min(minimum_y, map_y);
+    maximum_x = std::max(maximum_x, map_x);
+    maximum_y = std::max(maximum_y, map_y);
+  }
+  std::size_t hazard_count = 0u;
+  return query_hazard_count(
+    costmap, workspace, minimum_x, minimum_y, maximum_x, maximum_y,
+    hazard_count) && hazard_count == 0u;
 }
 
 CertificationResult certify_pose_sequence(
@@ -410,6 +590,14 @@ CertificationResult certify_pose_sequence(
       std::max(
       1, static_cast<int>(
         std::ceil(swept_distance / maximum_swept_distance)));
+    if (certify_hazard_free_segment_bounds(
+        costmap, previous, next, maximum_footprint_radius,
+        active_workspace))
+    {
+      result.checked_pose_count +=
+        static_cast<std::size_t>(interpolation_count);
+      continue;
+    }
     for (int interpolation_index = 1;
       interpolation_index <= interpolation_count; ++interpolation_index)
     {

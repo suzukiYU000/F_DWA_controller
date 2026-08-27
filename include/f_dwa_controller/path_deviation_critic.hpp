@@ -8,17 +8,20 @@
 #ifndef F_DWA_CONTROLLER__PATH_DEVIATION_CRITIC_HPP_
 #define F_DWA_CONTROLLER__PATH_DEVIATION_CRITIC_HPP_
 
+#include <vector>
+
 #include "dwb_core/trajectory_critic.hpp"
 
 namespace f_dwa_controller
 {
 
 /**
- * @brief Penalize motion away from the Path and departure from a soft corridor.
+ * @brief Apply one fixed soft cost outside a Path corridor.
  *
- * The critic continuously penalizes terminal path-distance growth. Crossing
- * the corridor adds a finite penalty plus costs proportional to the maximum
- * and terminal excess. It never rejects a trajectory.
+ * If any predicted pose is farther than the configured distance, the critic
+ * returns one finite penalty. Otherwise it returns zero. It never rejects a
+ * trajectory, so an outside candidate remains selectable when every candidate
+ * is outside. MeanPathDistCritic independently retains continuous path ranking.
  */
 class PathDeviationCritic : public dwb_core::TrajectoryCritic
 {
@@ -35,13 +38,28 @@ public:
     const dwb_msgs::msg::Trajectory2D & trajectory) override;
 
 protected:
+  struct PathSegment
+  {
+    double start_x{0.0};
+    double start_y{0.0};
+    double delta_x{0.0};
+    double delta_y{0.0};
+    double inverse_squared_length{0.0};
+    double minimum_x{0.0};
+    double maximum_x{0.0};
+    double minimum_y{0.0};
+    double maximum_y{0.0};
+  };
+
   void validateParameters() const;
+  bool poseIsInsideCorridor(
+    const geometry_msgs::msg::Pose2D & pose,
+    std::size_t & segment_hint) const;
 
   nav_2d_msgs::msg::Path2D reference_path_;
-  double maximum_path_distance_{1.0};
+  std::vector<PathSegment> path_segments_;
+  double maximum_path_distance_{1.5};
   double deviation_penalty_{1000.0};
-  double departure_cost_per_meter_{120.0};
-  double current_path_distance_{0.0};
   bool reference_path_valid_{false};
 };
 

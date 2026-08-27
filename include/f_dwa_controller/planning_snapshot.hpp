@@ -21,6 +21,8 @@
 #ifndef F_DWA_CONTROLLER__PLANNING_SNAPSHOT_HPP_
 #define F_DWA_CONTROLLER__PLANNING_SNAPSHOT_HPP_
 
+#include <cmath>
+#include <optional>
 #include <vector>
 
 #include "geometry_msgs/msg/pose2_d.hpp"
@@ -29,6 +31,44 @@
 
 namespace f_dwa_controller
 {
+
+/**
+ * @brief Age of a robot-facing dispatch already observed by this process.
+ *
+ * Gazebo /clock and DDS callbacks can be delivered in opposite executor order,
+ * so an event observed in the current cycle may carry a header a few
+ * milliseconds ahead of the Controller's latest clock sample. Such bounded
+ * skew means zero elapsed plant-response time; it is not an unobserved future
+ * command. A stamp farther ahead than one configured control period remains
+ * invalid and cannot enter the planning state.
+ */
+inline std::optional<double> observed_dispatch_age_seconds(
+  const rclcpp::Time & measurement_time,
+  const rclcpp::Time & observed_dispatch_time,
+  const double maximum_future_skew_seconds)
+{
+  if (!std::isfinite(maximum_future_skew_seconds) ||
+    maximum_future_skew_seconds < 0.0)
+  {
+    return std::nullopt;
+  }
+  if (observed_dispatch_time > measurement_time) {
+    const double future_skew_seconds =
+      (observed_dispatch_time - measurement_time).seconds();
+    if (!std::isfinite(future_skew_seconds) ||
+      future_skew_seconds > maximum_future_skew_seconds + 1.0e-12)
+    {
+      return std::nullopt;
+    }
+    return 0.0;
+  }
+  const double age_seconds =
+    (measurement_time - observed_dispatch_time).seconds();
+  if (!std::isfinite(age_seconds) || age_seconds < 0.0) {
+    return std::nullopt;
+  }
+  return age_seconds;
+}
 
 struct ScheduledCommand
 {
@@ -41,20 +81,27 @@ struct ActivationState
 {
   geometry_msgs::msg::Pose2D pose;
   nav_2d_msgs::msg::Twist2D velocity;
+  // The identified plant-response preview above is a physical velocity.  A
+  // native A/J/F window must instead continue from the command state already
+  // accepted by the robot-facing FIFO, including commands that will dispatch
+  // before activation.  Keep both states explicit so response lag cannot be
+  // mistaken for additional native acceleration authority.
+  nav_2d_msgs::msg::Twist2D native_command_velocity;
   double linear_acceleration{0.0};
   double angular_acceleration{0.0};
   std::vector<double> linear_fir_history;
   std::vector<double> angular_fir_history;
   rclcpp::Time activation_time;
+  bool native_command_velocity_valid{false};
   bool native_state_valid{true};
 };
 
 // A PlanningSnapshot is assembled once at the start of a control cycle and is
 // then shared as const. current_state is the measured physical state;
 // activation_state is its transport replay or identified-response prediction.
-// Native acceleration and FIR fields remain command-state memory correlated
-// with robot-facing dispatches. Simulator ground truth and future jitter samples
-// are deliberately excluded.
+// Native command velocity, acceleration, and FIR fields remain command-state
+// memory correlated with robot-facing dispatches. Simulator ground truth and
+// unobserved future jitter samples are deliberately excluded.
 struct PlanningSnapshot
 {
   rclcpp::Time measurement_time;

@@ -61,7 +61,7 @@ The common dispatch-state parameters are:
 - `terminal_stop_maximum_time`: upper bound for constructing a certified stop,
   not a commanded stop duration; the common 12 s bound accommodates the F-8
   filter-history drain and each sequence ends as soon as capture is reached
-- `terminal_stop_goal_capture_distance`: 0.25 m common method-native terminal
+- `terminal_stop_goal_capture_distance`: 0.24 m common method-native terminal
   capture set; each cycle revalidates the retained deceleration suffix
 - `stop_capture_velocity`: planned-stop completion threshold
 - `planning_deadline_seconds`: 0.05 s deadline at the common 20 Hz control rate

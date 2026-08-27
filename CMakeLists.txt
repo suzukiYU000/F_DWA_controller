@@ -55,6 +55,7 @@ add_library(${library_name} SHARED
   src/horizon_obstacle_footprint_critic.cpp
   src/hysteresis_rotate_to_goal_critic.cpp
   src/issued_command_ledger.cpp
+  src/linear_map_grid_critics.cpp
   src/mean_path_dist_critic.cpp
   src/mean_speed_critic.cpp
   src/native_input_dynamics.cpp
@@ -300,6 +301,22 @@ if(BUILD_TESTING)
       builtin_interfaces
       dwb_core
       dwb_msgs
+      geometry_msgs
+      nav_2d_msgs
+      nav2_costmap_2d
+    )
+  endif()
+
+  ament_add_gtest(test_linear_map_grid_critics
+    test/test_linear_map_grid_critics.cpp
+  )
+  if(TARGET test_linear_map_grid_critics)
+    target_link_libraries(
+      test_linear_map_grid_critics ${library_name}
+    )
+    ament_target_dependencies(test_linear_map_grid_critics
+      dwb_core
+      dwb_critics
       geometry_msgs
       nav_2d_msgs
       nav2_costmap_2d

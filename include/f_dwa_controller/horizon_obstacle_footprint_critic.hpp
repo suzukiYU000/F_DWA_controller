@@ -39,8 +39,13 @@ public:
     const nav_2d_msgs::msg::Path2D & global_plan) override;
   double scoreTrajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory) override;
+  void setDetailedFailureDiagnostics(bool enabled) noexcept;
+  void setSharedCertificationWorkspace(
+    CertificationWorkspace * workspace) noexcept;
 
 protected:
+  bool prepareCertificationBroadphaseIfNeeded();
+
   // Deprecated compatibility parameter. It has no scoring or gating effect.
   double score_time_horizon_{1.25};
   double maximum_swept_distance_{0.025};
@@ -50,6 +55,9 @@ protected:
   double initial_overlap_recovery_penalty_{1000000.0};
   std::vector<geometry_msgs::msg::Point> inset_core_footprint_;
   CertificationWorkspace certification_workspace_;
+  CertificationWorkspace * shared_certification_workspace_{nullptr};
+  bool certification_workspace_prepared_{false};
+  bool detailed_failure_diagnostics_{true};
 };
 
 }  // namespace f_dwa_controller

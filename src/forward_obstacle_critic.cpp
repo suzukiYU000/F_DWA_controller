@@ -115,20 +115,23 @@ double ForwardObstacleCritic::normalizedCostAt(
 double ForwardObstacleCritic::scoreTrajectory(
   const dwb_msgs::msg::Trajectory2D & trajectory)
 {
-  const auto risk_path = [this, &trajectory]() {
+  const auto & risk_path = [this, &trajectory]()
+    -> const std::vector<RiskPathSample> &
+    {
       try {
         if (!prepared_plan_geometry_.empty()) {
           return build_plan_continued_risk_path(
             trajectory, prepared_plan_geometry_, risk_distance_,
             sample_resolution_, risk_seed_time_,
-            heading_relaxation_distance_);
+            heading_relaxation_distance_, risk_path_workspace_);
         }
         // Protected global_plan_ predates the prepared cache and is used by
         // lightweight derived tests. Production prepare() always takes the
         // cache branch above.
         return build_plan_continued_risk_path(
           trajectory, global_plan_, risk_distance_, sample_resolution_,
-          risk_seed_time_, heading_relaxation_distance_);
+          risk_seed_time_, heading_relaxation_distance_,
+          risk_path_workspace_);
       } catch (const std::invalid_argument & exception) {
         throw dwb_core::IllegalTrajectoryException(name_, exception.what());
       }

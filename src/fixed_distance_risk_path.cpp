@@ -407,10 +407,16 @@ PreparedPlanGeometry prepare_plan_continuation_geometry(
   return geometry;
 }
 
-std::vector<RiskPathSample> build_fixed_distance_risk_path(
+namespace
+{
+
+void build_fixed_distance_risk_path_into(
   const dwb_msgs::msg::Trajectory2D & trajectory,
   const double risk_distance,
-  const double sample_resolution)
+  const double sample_resolution,
+  std::vector<double> & cumulative_distance,
+  std::vector<double> & target_distances,
+  std::vector<RiskPathSample> & samples)
 {
   if (!std::isfinite(risk_distance) || risk_distance <= 0.0 ||
     !std::isfinite(sample_resolution) || sample_resolution <= 0.0)
@@ -431,7 +437,7 @@ std::vector<RiskPathSample> build_fixed_distance_risk_path(
     }
   }
 
-  std::vector<double> cumulative_distance(trajectory.poses.size(), 0.0);
+  cumulative_distance.assign(trajectory.poses.size(), 0.0);
   for (std::size_t index = 1u; index < trajectory.poses.size(); ++index) {
     const auto & previous = trajectory.poses[index - 1u];
     const auto & current = trajectory.poses[index];
@@ -456,7 +462,7 @@ std::vector<RiskPathSample> build_fixed_distance_risk_path(
     estimate_terminal_curvature(
     trajectory, cumulative_distance, sample_resolution) : 0.0;
 
-  std::vector<double> target_distances;
+  target_distances.clear();
   const double complete_steps_value =
     std::floor(risk_distance / sample_resolution + kDistanceTolerance);
   if (!std::isfinite(complete_steps_value) || complete_steps_value < 0.0 ||
@@ -479,7 +485,7 @@ std::vector<RiskPathSample> build_fixed_distance_risk_path(
     target_distances.push_back(risk_distance);
   }
 
-  std::vector<RiskPathSample> samples;
+  samples.clear();
   samples.reserve(target_distances.size());
   std::size_t upper_index = 1u;
   for (const double target : target_distances) {
@@ -528,6 +534,21 @@ std::vector<RiskPathSample> build_fixed_distance_risk_path(
     }
     samples.push_back(std::move(sample));
   }
+}
+
+}  // namespace
+
+std::vector<RiskPathSample> build_fixed_distance_risk_path(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  const double risk_distance,
+  const double sample_resolution)
+{
+  std::vector<double> cumulative_distance;
+  std::vector<double> target_distances;
+  std::vector<RiskPathSample> samples;
+  build_fixed_distance_risk_path_into(
+    trajectory, risk_distance, sample_resolution,
+    cumulative_distance, target_distances, samples);
   return samples;
 }
 
@@ -568,6 +589,39 @@ std::vector<RiskPathSample> build_plan_continued_risk_path(
   const double risk_seed_time,
   const double heading_relaxation_distance)
 {
+  RiskPathWorkspace workspace;
+  const auto & samples = build_plan_continued_risk_path(
+    trajectory, plan_geometry, risk_distance, sample_resolution,
+    risk_seed_time, heading_relaxation_distance, workspace);
+  return samples;
+}
+
+const std::vector<RiskPathSample> & build_plan_continued_risk_path(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  const nav_2d_msgs::msg::Path2D & global_plan,
+  const double risk_distance,
+  const double sample_resolution,
+  const double risk_seed_time,
+  const double heading_relaxation_distance,
+  RiskPathWorkspace & workspace)
+{
+  validate_plan_continuation_distances(
+    risk_distance, sample_resolution, heading_relaxation_distance);
+  return build_plan_continued_risk_path(
+    trajectory, prepare_plan_continuation_geometry(global_plan),
+    risk_distance, sample_resolution, risk_seed_time,
+    heading_relaxation_distance, workspace);
+}
+
+const std::vector<RiskPathSample> & build_plan_continued_risk_path(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  const PreparedPlanGeometry & plan_geometry,
+  const double risk_distance,
+  const double sample_resolution,
+  const double risk_seed_time,
+  const double heading_relaxation_distance,
+  RiskPathWorkspace & workspace)
+{
   validate_plan_continuation_distances(
     risk_distance, sample_resolution, heading_relaxation_distance);
   if (plan_geometry.empty()) {
@@ -575,9 +629,9 @@ std::vector<RiskPathSample> build_plan_continued_risk_path(
             "plan-continuation risk path requires a global plan"};
   }
 
-  dwb_msgs::msg::Trajectory2D combined =
-    trajectory_prefix_at_time(
-    trajectory, risk_seed_time, plan_geometry.poses_.size());
+  auto & combined = workspace.combined_trajectory_;
+  trajectory_prefix_at_time(
+    trajectory, risk_seed_time, plan_geometry.poses_.size(), combined);
   const auto endpoint = combined.poses.back();
   double combined_distance = 0.0;
   for (std::size_t index = 1u; index < combined.poses.size(); ++index) {
@@ -591,8 +645,11 @@ std::vector<RiskPathSample> build_plan_continued_risk_path(
     }
   }
   if (combined_distance + kDistanceTolerance >= risk_distance) {
-    return build_fixed_distance_risk_path(
-      combined, risk_distance, sample_resolution);
+    build_fixed_distance_risk_path_into(
+      combined, risk_distance, sample_resolution,
+      workspace.cumulative_distance_, workspace.target_distances_,
+      workspace.samples_);
+    return workspace.samples_;
   }
 
   if (!plan_geometry.has_plan_motion_) {
@@ -601,8 +658,11 @@ std::vector<RiskPathSample> build_plan_continued_risk_path(
     terminal.x += risk_distance * std::cos(heading);
     terminal.y += risk_distance * std::sin(heading);
     append_if_spatially_distinct(combined, terminal);
-    return build_fixed_distance_risk_path(
-      combined, risk_distance, sample_resolution);
+    build_fixed_distance_risk_path_into(
+      combined, risk_distance, sample_resolution,
+      workspace.cumulative_distance_, workspace.target_distances_,
+      workspace.samples_);
+    return workspace.samples_;
   }
 
   double projection_progress = 0.0;
@@ -756,8 +816,11 @@ std::vector<RiskPathSample> build_plan_continued_risk_path(
               "plan continuation path length overflowed"};
     }
     if (combined_distance + kDistanceTolerance >= risk_distance) {
-      return build_fixed_distance_risk_path(
-        combined, risk_distance, sample_resolution);
+      build_fixed_distance_risk_path_into(
+        combined, risk_distance, sample_resolution,
+        workspace.cumulative_distance_, workspace.target_distances_,
+        workspace.samples_);
+      return workspace.samples_;
     }
   }
 

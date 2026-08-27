@@ -96,6 +96,12 @@ public:
   active_candidate_canonical_index() const;
   [[nodiscard]] std::optional<ActiveCandidateDiagnostics>
   active_candidate_diagnostics() const;
+  [[nodiscard]] std::size_t candidate_count() const noexcept;
+  bool materialize_candidate(
+    std::size_t canonical_index,
+    const geometry_msgs::msg::Pose2D & start_pose,
+    dwb_msgs::msg::Trajectory2D & trajectory,
+    NativeCommandState & first_command_state);
   void select_command_for_dispatch(
     const std::optional<NativeCommandState> & command_state);
   void commit_selected_command(
@@ -106,6 +112,8 @@ public:
     std::size_t skipped_unpublished_commands = 0u);
   [[nodiscard]] bool commit_observed_controller_stop_before_pending(
     const rclcpp::Time & issued_at);
+  [[nodiscard]] bool observe_terminal_controller_stop(
+    const f_dwa_controller::msg::CommandDispatch & dispatch);
   void startNewIteration(
     const nav_2d_msgs::msg::Twist2D & current_velocity) override;
   bool hasMoreTwists() override;
@@ -125,6 +133,13 @@ public:
     std::vector<geometry_msgs::msg::Pose2D> & poses,
     std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
     std::vector<NativeCommandState> * command_states = nullptr);
+  bool generate_direct_stop_trajectory(
+    const geometry_msgs::msg::Pose2D & start_pose,
+    int maximum_stop_steps,
+    double stop_velocity_threshold,
+    std::vector<geometry_msgs::msg::Pose2D> & poses,
+    std::vector<nav_2d_msgs::msg::Twist2D> & velocities,
+    std::vector<NativeCommandState> & command_states) const;
   bool generate_stop_trajectory_for_candidate(
     std::size_t canonical_index,
     const geometry_msgs::msg::Pose2D & start_pose,
@@ -246,6 +261,12 @@ private:
     std::vector<geometry_msgs::msg::Pose2D> & poses,
     std::vector<nav_2d_msgs::msg::Twist2D> * velocities,
     std::vector<NativeCommandState> * command_states);
+  void generate_candidate_trajectory_into(
+    const Candidate & candidate,
+    const geometry_msgs::msg::Pose2D & start_pose,
+    dwb_msgs::msg::Trajectory2D & trajectory);
+  NativeCommandState candidate_command_state(
+    const Candidate & candidate) const;
 
   NativeInputOrder input_order_;
   std::weak_ptr<rclcpp_lifecycle::LifecycleNode> node_;

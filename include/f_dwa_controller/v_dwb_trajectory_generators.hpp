@@ -21,21 +21,37 @@
 #ifndef F_DWA_CONTROLLER__V_DWB_TRAJECTORY_GENERATORS_HPP_
 #define F_DWA_CONTROLLER__V_DWB_TRAJECTORY_GENERATORS_HPP_
 
+#include <memory>
+
 #include "dwb_plugins/limited_accel_generator.hpp"
 #include "dwb_plugins/standard_traj_generator.hpp"
+#include "f_dwa_controller/planning_snapshot.hpp"
 
 namespace f_dwa_controller
 {
 
-// These adapters intentionally add no behavior. Exporting the Nav2 generators
-// from the same library as CertifiedDWBLocalPlanner avoids loading their
-// factories through a second class loader after this library has already linked
-// them as dependencies.
+// V-DWA samples velocity commands inside the acceleration-reachable window of
+// the command that will be active when the newly planned command reaches the
+// robot-facing transport.  That is distinct from the lagging physical velocity
+// used to predict the activation pose.  Keeping both states explicit prevents
+// response lag from granting a fictitious one-cycle acceleration reversal.
 class VLimitedAccelTrajectoryGenerator
   : public dwb_plugins::LimitedAccelGenerator
 {
+public:
+  void set_planning_snapshot(
+    std::shared_ptr<const PlanningSnapshot> snapshot);
+  void startNewIteration(
+    const nav_2d_msgs::msg::Twist2D & current_velocity) override;
+
+private:
+  std::shared_ptr<const PlanningSnapshot> planning_snapshot_;
 };
 
+// This adapter intentionally adds no behavior. Exporting the Nav2 generators
+// from the same library as CertifiedDWBLocalPlanner avoids loading their
+// factories through a second class loader after this library has already linked
+// them as dependencies.
 class VStandardTrajectoryGenerator
   : public dwb_plugins::StandardTrajectoryGenerator
 {

@@ -21,7 +21,9 @@
 #ifndef F_DWA_CONTROLLER__TRAJECTORY_CERTIFIER_HPP_
 #define F_DWA_CONTROLLER__TRAJECTORY_CERTIFIER_HPP_
 
+#include <array>
 #include <cstddef>
+#include <unordered_map>
 #include <vector>
 
 #include "geometry_msgs/msg/point.hpp"
@@ -57,6 +59,19 @@ struct CertificationResult
   double failure_cell_world_y{0.0};
 };
 
+constexpr std::size_t kMaximumCachedFootprintVertices = 16u;
+
+struct PoseCheckCacheEntry
+{
+  std::array<
+    nav2_costmap_2d::MapLocation,
+    kMaximumCachedFootprintVertices> map_footprint{};
+  std::size_t vertex_count{0u};
+  bool allow_lethal{false};
+  bool lethal_overlap{false};
+  CertificationResult result;
+};
+
 struct CertificationWorkspace
 {
   std::vector<nav2_costmap_2d::MapLocation> map_footprint;
@@ -68,6 +83,12 @@ struct CertificationWorkspace
   double hazard_origin_y{0.0};
   double hazard_resolution{0.0};
   bool hazard_prefix_valid{false};
+  // Costmap rasterization depends only on the ordered map-cell vertices and
+  // allow-lethal mode. F-DWA's long filtered stop tails often revisit that
+  // exact discrete polygon; retaining the exact result avoids refilling the
+  // same cells without changing any collision semantics.
+  std::vector<PoseCheckCacheEntry> pose_check_cache;
+  std::unordered_multimap<std::size_t, std::size_t> pose_check_cache_index;
 };
 
 // The prefix is valid only while the caller keeps the costmap snapshot
@@ -79,6 +100,15 @@ bool prepare_certification_broadphase(
 
 void invalidate_certification_broadphase(
   CertificationWorkspace & workspace);
+
+// Return true only when the transformed footprint's complete axis-aligned
+// bounds contain no lethal or unknown Costmap cell. False is inconclusive and
+// requires the caller's exact footprint check.
+bool certification_footprint_bounds_are_hazard_free(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & footprint,
+  const geometry_msgs::msg::Pose2D & pose,
+  const CertificationWorkspace & workspace);
 
 CertificationResult certify_pose_sequence(
   nav2_costmap_2d::Costmap2D & costmap,

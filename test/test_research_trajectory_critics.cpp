@@ -657,37 +657,19 @@ TEST(PathDeviationCritic, IsNeutralAtOrInsideMaximumDistance)
 {
   f_dwa_controller::PathDeviationCritic critic;
   geometry_msgs::msg::Pose2D current_pose;
-  current_pose.y = 1.0;
+  current_pose.y = 1.5;
   geometry_msgs::msg::Pose2D goal;
   nav_2d_msgs::msg::Twist2D velocity;
   ASSERT_TRUE(critic.prepare(
       current_pose, velocity, goal, straight_path(10.0)));
 
   auto trajectory = trajectory_to(1.0, 1.0);
-  trajectory.poses.front().y = 1.0;
-  trajectory.poses.back().y = -1.0;
+  trajectory.poses.front().y = 1.5;
+  trajectory.poses.back().y = -1.5;
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(trajectory), 0.0);
 }
 
-TEST(PathDeviationCritic, ContinuouslyPenalizesDepartureInsideCorridor)
-{
-  f_dwa_controller::PathDeviationCritic critic;
-  geometry_msgs::msg::Pose2D current_pose;
-  geometry_msgs::msg::Pose2D goal;
-  nav_2d_msgs::msg::Twist2D velocity;
-  ASSERT_TRUE(critic.prepare(
-      current_pose, velocity, goal, straight_path(10.0)));
-
-  auto near_departure = trajectory_to(1.0, 1.0);
-  near_departure.poses.back().y = 0.25;
-  auto far_departure = trajectory_to(1.0, 1.0);
-  far_departure.poses.back().y = 0.50;
-
-  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(near_departure), 30.0);
-  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(far_departure), 60.0);
-}
-
-TEST(PathDeviationCritic, PreservesOrderingOutsideCorridor)
+TEST(PathDeviationCritic, AnyPointBeyondCorridorGetsFixedPenalty)
 {
   f_dwa_controller::PathDeviationCritic critic;
   geometry_msgs::msg::Pose2D current_pose;
@@ -697,7 +679,25 @@ TEST(PathDeviationCritic, PreservesOrderingOutsideCorridor)
       current_pose, velocity, goal, straight_path(10.0)));
 
   auto slightly_outside = trajectory_to(1.0, 1.0);
-  slightly_outside.poses.front().y = 1.000001;
+  slightly_outside.poses.front().y = 1.500001;
+  auto far_outside = trajectory_to(1.0, 1.0);
+  far_outside.poses.back().y = -3.0;
+
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(slightly_outside), 1000.0);
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(far_outside), 1000.0);
+}
+
+TEST(PathDeviationCritic, OutsideCostRemainsFiniteAndDoesNotReject)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  geometry_msgs::msg::Pose2D current_pose;
+  geometry_msgs::msg::Pose2D goal;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(
+      current_pose, velocity, goal, straight_path(10.0)));
+
+  auto slightly_outside = trajectory_to(1.0, 1.0);
+  slightly_outside.poses.front().y = 1.500001;
   auto far_outside = trajectory_to(1.0, 1.0);
   far_outside.poses.back().y = -3.0;
 
@@ -706,29 +706,8 @@ TEST(PathDeviationCritic, PreservesOrderingOutsideCorridor)
   const double far_outside_score = critic.scoreTrajectory(far_outside);
 
   EXPECT_TRUE(std::isfinite(slightly_outside_score));
-  EXPECT_GT(slightly_outside_score, 1000.0);
-  EXPECT_GT(far_outside_score, slightly_outside_score);
-}
-
-TEST(PathDeviationCritic, PrefersRecoveryWhenRobotStartsOutsideCorridor)
-{
-  f_dwa_controller::PathDeviationCritic critic;
-  geometry_msgs::msg::Pose2D current_pose;
-  current_pose.y = 1.2;
-  geometry_msgs::msg::Pose2D goal;
-  nav_2d_msgs::msg::Twist2D velocity;
-  ASSERT_TRUE(critic.prepare(
-      current_pose, velocity, goal, straight_path(10.0)));
-
-  auto recovering = trajectory_to(1.0, 1.0);
-  recovering.poses.front().y = 1.2;
-  recovering.poses.back().y = 0.8;
-  auto departing = recovering;
-  departing.poses.back().y = 1.4;
-
-  EXPECT_LT(
-    critic.scoreTrajectory(recovering),
-    critic.scoreTrajectory(departing));
+  EXPECT_DOUBLE_EQ(slightly_outside_score, 1000.0);
+  EXPECT_DOUBLE_EQ(far_outside_score, slightly_outside_score);
 }
 
 TEST(ForwardObstacleCritic, PenalizesBlockedNominalPath)
@@ -903,6 +882,33 @@ TEST(FootprintClearanceCritic, PlanContinuationCannotActivateApproach)
       executable_prefix_stays_clear, &approach_risk),
     0.5625, 1.0e-12);
   EXPECT_DOUBLE_EQ(approach_risk, 0.0);
+}
+
+TEST(FootprintClearanceCritic, ScoresCompleteUniformStopSequence)
+{
+  StubFootprintClearanceCritic critic;
+  critic.setFirstCollidingBand(0);
+  critic.setMinimumCollisionX(0.75);
+
+  geometry_msgs::msg::Pose2D start;
+  geometry_msgs::msg::Pose2D middle = start;
+  middle.x = 0.5;
+  geometry_msgs::msg::Pose2D stop = middle;
+  stop.x = 1.0;
+  double approach_risk = -1.0;
+  EXPECT_NEAR(
+    critic.scoreUniformPoseSequenceWithApproachRisk(
+      {start, middle, stop}, &approach_risk),
+    0.5625, 1.0e-12);
+  EXPECT_NEAR(approach_risk, 0.9, 1.0e-12);
+
+  EXPECT_DOUBLE_EQ(
+    critic.scoreUniformPoseSequenceWithApproachRisk(
+      {start, middle, middle}, nullptr),
+    0.0);
+  EXPECT_THROW(
+    critic.scoreUniformPoseSequenceWithApproachRisk({}, nullptr),
+    dwb_core::IllegalTrajectoryException);
 }
 
 TEST(FootprintClearanceCritic, WeightsShortFinalDistanceInterval)
@@ -1820,6 +1826,41 @@ TEST(FixedDistanceRiskPath, PreparedPlanGeometryMatchesCompatibilityPath)
       prepared_path[index].pose.theta,
       compatibility_path[index].pose.theta);
   }
+}
+
+TEST(FixedDistanceRiskPath, WorkspaceMatchesValueApiAcrossRepeatedCalls)
+{
+  nav_2d_msgs::msg::Path2D plan;
+  plan.poses.resize(4u);
+  plan.poses[1].x = 1.3;
+  plan.poses[1].y = 0.25;
+  plan.poses[2].x = 2.8;
+  plan.poses[2].y = 0.40;
+  plan.poses[3].x = 4.0;
+  const auto prepared =
+    f_dwa_controller::prepare_plan_continuation_geometry(plan);
+  f_dwa_controller::RiskPathWorkspace workspace;
+
+  const auto compare_call = [&prepared, &workspace](
+    const dwb_msgs::msg::Trajectory2D & candidate)
+    {
+      const auto expected =
+        f_dwa_controller::build_plan_continued_risk_path(
+        candidate, prepared, 2.5, 0.10, 1.4);
+      const auto & actual =
+        f_dwa_controller::build_plan_continued_risk_path(
+        candidate, prepared, 2.5, 0.10, 1.4, 1.0, workspace);
+      ASSERT_EQ(actual.size(), expected.size());
+      for (std::size_t index = 0u; index < expected.size(); ++index) {
+        EXPECT_DOUBLE_EQ(actual[index].arc_length, expected[index].arc_length);
+        EXPECT_DOUBLE_EQ(actual[index].pose.x, expected[index].pose.x);
+        EXPECT_DOUBLE_EQ(actual[index].pose.y, expected[index].pose.y);
+        EXPECT_DOUBLE_EQ(actual[index].pose.theta, expected[index].pose.theta);
+      }
+    };
+
+  compare_call(timed_curvature_suffix_trajectory(1.8, 1.1));
+  compare_call(timed_curvature_suffix_trajectory(1.4, -0.8));
 }
 
 TEST(FixedDistanceRiskPath, PreparedPlanGeometryRebuildsAfterPlanChange)

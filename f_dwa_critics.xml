@@ -63,6 +63,27 @@
     </description>
   </class>
   <class
+    type="f_dwa_controller::LinearPathAlignCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Exact Nav2 PathAlign Manhattan field computed with a linear two-pass transform.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::LinearGoalAlignCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Exact Nav2 GoalAlign Manhattan field computed with a linear two-pass transform.
+    </description>
+  </class>
+  <class
+    type="f_dwa_controller::LinearGoalDistCritic"
+    base_class_type="dwb_core::TrajectoryCritic">
+    <description>
+      Exact Nav2 GoalDist Manhattan field computed with a linear two-pass transform.
+    </description>
+  </class>
+  <class
     type="f_dwa_controller::MeanPathDistCritic"
     base_class_type="dwb_core::TrajectoryCritic">
     <description>

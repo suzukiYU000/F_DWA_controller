@@ -29,18 +29,13 @@ void PathDeviationCritic::onInit()
   const std::string prefix = dwb_plugin_name_ + "." + name_ + ".";
   nav2_util::declare_parameter_if_not_declared(
     node, prefix + "maximum_path_distance",
-    rclcpp::ParameterValue(1.0));
+    rclcpp::ParameterValue(1.5));
   nav2_util::declare_parameter_if_not_declared(
     node, prefix + "deviation_penalty",
     rclcpp::ParameterValue(1000.0));
-  nav2_util::declare_parameter_if_not_declared(
-    node, prefix + "departure_cost_per_meter",
-    rclcpp::ParameterValue(120.0));
   node->get_parameter(
     prefix + "maximum_path_distance", maximum_path_distance_);
   node->get_parameter(prefix + "deviation_penalty", deviation_penalty_);
-  node->get_parameter(
-    prefix + "departure_cost_per_meter", departure_cost_per_meter_);
 
   validateParameters();
 }
@@ -49,9 +44,7 @@ void PathDeviationCritic::validateParameters() const
 {
   if (!std::isfinite(maximum_path_distance_) ||
     maximum_path_distance_ < 0.0 ||
-    !std::isfinite(deviation_penalty_) || deviation_penalty_ < 0.0 ||
-    !std::isfinite(departure_cost_per_meter_) ||
-    departure_cost_per_meter_ < 0.0)
+    !std::isfinite(deviation_penalty_) || deviation_penalty_ < 0.0)
   {
     throw std::invalid_argument(
             dwb_plugin_name_ + "." + name_ +
@@ -69,8 +62,84 @@ bool PathDeviationCritic::prepare(
   PathProjection projection;
   reference_path_valid_ = project_pose_onto_path(
     reference_path_, pose, projection);
-  current_path_distance_ = reference_path_valid_ ? projection.distance : 0.0;
+  path_segments_.clear();
+  if (!reference_path_valid_) {
+    return false;
+  }
+  path_segments_.reserve(reference_path_.poses.size());
+  for (std::size_t index = 1u; index < reference_path_.poses.size(); ++index) {
+    const auto & start = reference_path_.poses[index - 1u];
+    const auto & end = reference_path_.poses[index];
+    const double delta_x = end.x - start.x;
+    const double delta_y = end.y - start.y;
+    const double squared_length =
+      delta_x * delta_x + delta_y * delta_y;
+    if (squared_length <= 1.0e-12) {
+      continue;
+    }
+    path_segments_.push_back(PathSegment{
+        start.x, start.y, delta_x, delta_y, 1.0 / squared_length,
+        std::min(start.x, end.x), std::max(start.x, end.x),
+        std::min(start.y, end.y), std::max(start.y, end.y)});
+  }
+  if (path_segments_.empty()) {
+    const auto & point = reference_path_.poses.back();
+    path_segments_.push_back(PathSegment{
+        point.x, point.y, 0.0, 0.0, 0.0,
+        point.x, point.x, point.y, point.y});
+  }
   return reference_path_valid_;
+}
+
+bool PathDeviationCritic::poseIsInsideCorridor(
+  const geometry_msgs::msg::Pose2D & pose,
+  std::size_t & segment_hint) const
+{
+  if (!std::isfinite(pose.x) || !std::isfinite(pose.y) ||
+    path_segments_.empty())
+  {
+    return false;
+  }
+  const double maximum_squared_distance =
+    maximum_path_distance_ * maximum_path_distance_;
+  const auto segment_is_within =
+    [this, &pose, maximum_squared_distance](const PathSegment & segment) {
+      if (pose.x < segment.minimum_x - maximum_path_distance_ ||
+        pose.x > segment.maximum_x + maximum_path_distance_ ||
+        pose.y < segment.minimum_y - maximum_path_distance_ ||
+        pose.y > segment.maximum_y + maximum_path_distance_)
+      {
+        return false;
+      }
+      const double along = segment.inverse_squared_length > 0.0 ?
+        std::clamp(
+        ((pose.x - segment.start_x) * segment.delta_x +
+        (pose.y - segment.start_y) * segment.delta_y) *
+        segment.inverse_squared_length, 0.0, 1.0) : 0.0;
+      const double offset_x =
+        pose.x - (segment.start_x + along * segment.delta_x);
+      const double offset_y =
+        pose.y - (segment.start_y + along * segment.delta_y);
+      return offset_x * offset_x + offset_y * offset_y <=
+             maximum_squared_distance;
+    };
+
+  segment_hint = std::min(segment_hint, path_segments_.size() - 1u);
+  for (std::size_t index = segment_hint;
+    index < path_segments_.size(); ++index)
+  {
+    if (segment_is_within(path_segments_[index])) {
+      segment_hint = index;
+      return true;
+    }
+  }
+  for (std::size_t index = 0u; index < segment_hint; ++index) {
+    if (segment_is_within(path_segments_[index])) {
+      segment_hint = index;
+      return true;
+    }
+  }
+  return false;
 }
 
 double PathDeviationCritic::scoreTrajectory(
@@ -80,33 +149,13 @@ double PathDeviationCritic::scoreTrajectory(
     return 0.0;
   }
 
-  double maximum_distance = 0.0;
-  double terminal_distance = 0.0;
+  std::size_t segment_hint = 0u;
   for (const auto & pose : trajectory.poses) {
-    PathProjection projection;
-    if (!project_pose_onto_path(reference_path_, pose, projection)) {
+    if (!poseIsInsideCorridor(pose, segment_hint)) {
       return deviation_penalty_;
     }
-    maximum_distance = std::max(maximum_distance, projection.distance);
-    terminal_distance = projection.distance;
   }
-
-  // A safe obstacle detour remains legal, but a candidate that finishes
-  // farther from the Path than the robot starts is no longer free inside the
-  // corridor. Candidates returning toward the Path do not pay this term.
-  double score = departure_cost_per_meter_ * std::max(
-    0.0, terminal_distance - current_path_distance_);
-
-  if (maximum_distance > maximum_path_distance_) {
-    const double maximum_excess =
-      maximum_distance - maximum_path_distance_;
-    const double terminal_excess = std::max(
-      0.0, terminal_distance - maximum_path_distance_);
-    score += deviation_penalty_;
-    score += departure_cost_per_meter_ *
-      (maximum_excess + terminal_excess);
-  }
-  return score;
+  return 0.0;
 }
 
 }  // namespace f_dwa_controller

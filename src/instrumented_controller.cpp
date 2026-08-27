@@ -51,7 +51,7 @@ void InstrumentedController::configure(
     reset_trial_service_ = node->create_service<std_srvs::srv::Trigger>(
       "~/" + name_ + "/reset_trial_state",
       [this](
-        const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+        const std::shared_ptr<std_srvs::srv::Trigger::Request>/*request*/,
         std::shared_ptr<std_srvs::srv::Trigger::Response> response)
       {
         std::lock_guard<std::mutex> lock(primary_controller_mutex_);

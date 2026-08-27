@@ -20,8 +20,34 @@
 
 #include "f_dwa_controller/v_dwb_trajectory_generators.hpp"
 
+#include <utility>
+
 #include "dwb_core/trajectory_generator.hpp"
 #include "pluginlib/class_list_macros.hpp"
+
+namespace f_dwa_controller
+{
+
+void VLimitedAccelTrajectoryGenerator::set_planning_snapshot(
+  std::shared_ptr<const PlanningSnapshot> snapshot)
+{
+  planning_snapshot_ = std::move(snapshot);
+}
+
+void VLimitedAccelTrajectoryGenerator::startNewIteration(
+  const nav_2d_msgs::msg::Twist2D & current_velocity)
+{
+  if (planning_snapshot_ && planning_snapshot_->valid &&
+    planning_snapshot_->activation_state.native_command_velocity_valid)
+  {
+    dwb_plugins::LimitedAccelGenerator::startNewIteration(
+      planning_snapshot_->activation_state.native_command_velocity);
+    return;
+  }
+  dwb_plugins::LimitedAccelGenerator::startNewIteration(current_velocity);
+}
+
+}  // namespace f_dwa_controller
 
 PLUGINLIB_EXPORT_CLASS(
   f_dwa_controller::VLimitedAccelTrajectoryGenerator,
