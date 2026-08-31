@@ -23,17 +23,55 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <utility>
 #include <vector>
 
 #include "nav2_costmap_2d/cost_values.hpp"
+#include "nav2_costmap_2d/obstacle_layer.hpp"
 
 namespace f_dwa_controller
 {
 
 namespace
 {
+
+bool broadphase_matches_costmap(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  const CertificationWorkspace & workspace)
+{
+  const std::size_t size_x = costmap.getSizeInCellsX();
+  const std::size_t size_y = costmap.getSizeInCellsY();
+  if (size_x == 0u || size_y == 0u ||
+    size_x == std::numeric_limits<std::size_t>::max())
+  {
+    return false;
+  }
+  const std::size_t stride = size_x + 1u;
+  if (size_y + 1u > std::numeric_limits<std::size_t>::max() / stride) {
+    return false;
+  }
+  return workspace.hazard_prefix_valid &&
+         workspace.hazard_size_x == costmap.getSizeInCellsX() &&
+         workspace.hazard_size_y == costmap.getSizeInCellsY() &&
+         workspace.hazard_origin_x == costmap.getOriginX() &&
+         workspace.hazard_origin_y == costmap.getOriginY() &&
+         workspace.hazard_resolution == costmap.getResolution() &&
+         workspace.hazard_prefix_sum.size() == stride * (size_y + 1u) &&
+         workspace.hazard_row_offsets.size() == size_y + 1u &&
+         workspace.hazard_row_offsets.back() == workspace.hazard_cells.size();
+}
+
+bool broadphase_matches_policy(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  const CertificationWorkspace & workspace,
+  const bool allow_unknown_space)
+{
+  return broadphase_matches_costmap(costmap, workspace) &&
+         workspace.hazard_unknown_space_is_hazard == !allow_unknown_space;
+}
 
 bool query_hazard_count(
   const nav2_costmap_2d::Costmap2D & costmap,
@@ -42,7 +80,8 @@ bool query_hazard_count(
   const unsigned int minimum_y,
   const unsigned int maximum_x,
   const unsigned int maximum_y,
-  std::size_t & hazard_count)
+  std::size_t & hazard_count,
+  const bool allow_unknown_space = false)
 {
   const std::size_t size_x = costmap.getSizeInCellsX();
   const std::size_t size_y = costmap.getSizeInCellsY();
@@ -59,12 +98,8 @@ bool query_hazard_count(
   }
   const std::size_t expected_prefix_size = stride * (size_y + 1u);
   const bool matching_broadphase =
-    workspace.hazard_prefix_valid &&
-    workspace.hazard_size_x == costmap.getSizeInCellsX() &&
-    workspace.hazard_size_y == costmap.getSizeInCellsY() &&
-    workspace.hazard_origin_x == costmap.getOriginX() &&
-    workspace.hazard_origin_y == costmap.getOriginY() &&
-    workspace.hazard_resolution == costmap.getResolution() &&
+    broadphase_matches_policy(
+    costmap, workspace, allow_unknown_space) &&
     workspace.hazard_prefix_sum.size() == expected_prefix_size;
   if (!matching_broadphase) {
     return false;
@@ -87,39 +122,133 @@ bool query_hazard_count(
   return true;
 }
 
-std::size_t hash_map_footprint(
-  const std::vector<nav2_costmap_2d::MapLocation> & map_footprint,
-  const bool allow_lethal)
+std::size_t hash_world_footprint(
+  const std::vector<geometry_msgs::msg::Point> & world_footprint,
+  const bool allow_lethal,
+  const bool allow_unknown_space)
 {
-  std::size_t hash = map_footprint.size();
+  std::size_t hash = world_footprint.size();
   const auto combine = [&hash](const std::size_t value) {
       hash ^= value + static_cast<std::size_t>(0x9e3779b9u) +
         (hash << 6u) + (hash >> 2u);
     };
   combine(allow_lethal ? 1u : 0u);
-  for (const auto & point : map_footprint) {
-    combine(point.x);
-    combine(point.y);
+  combine(allow_unknown_space ? 1u : 0u);
+  const std::hash<double> hash_double;
+  for (const auto & point : world_footprint) {
+    combine(hash_double(point.x));
+    combine(hash_double(point.y));
   }
   return hash;
 }
 
 bool cached_footprint_matches(
   const PoseCheckCacheEntry & entry,
-  const std::vector<nav2_costmap_2d::MapLocation> & map_footprint,
-  const bool allow_lethal)
+  const std::vector<geometry_msgs::msg::Point> & world_footprint,
+  const bool allow_lethal,
+  const bool allow_unknown_space)
 {
-  if (entry.vertex_count != map_footprint.size() ||
-    entry.allow_lethal != allow_lethal)
+  if (entry.vertex_count != world_footprint.size() ||
+    entry.allow_lethal != allow_lethal ||
+    entry.allow_unknown_space != allow_unknown_space)
   {
     return false;
   }
-  for (std::size_t index = 0u; index < map_footprint.size(); ++index) {
-    if (entry.map_footprint[index].x != map_footprint[index].x ||
-      entry.map_footprint[index].y != map_footprint[index].y)
+  for (std::size_t index = 0u; index < world_footprint.size(); ++index) {
+    if (entry.world_footprint[index].x != world_footprint[index].x ||
+      entry.world_footprint[index].y != world_footprint[index].y)
     {
       return false;
     }
+  }
+  return true;
+}
+
+void expand_map_bounds_by_one_cell(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  unsigned int & minimum_x,
+  unsigned int & minimum_y,
+  unsigned int & maximum_x,
+  unsigned int & maximum_y)
+{
+  minimum_x = minimum_x > 0u ? minimum_x - 1u : 0u;
+  minimum_y = minimum_y > 0u ? minimum_y - 1u : 0u;
+  const unsigned int size_x = costmap.getSizeInCellsX();
+  const unsigned int size_y = costmap.getSizeInCellsY();
+  if (size_x > 0u && maximum_x < size_x - 1u) {
+    ++maximum_x;
+  }
+  if (size_y > 0u && maximum_y < size_y - 1u) {
+    ++maximum_y;
+  }
+}
+
+bool convex_footprint_intersects_cell(
+  const std::vector<PreparedFootprintAxis> & footprint_axes,
+  const double footprint_minimum_x,
+  const double footprint_minimum_y,
+  const double footprint_maximum_x,
+  const double footprint_maximum_y,
+  const double cell_minimum_x,
+  const double cell_minimum_y,
+  const double cell_maximum_x,
+  const double cell_maximum_y,
+  double * overlap_depth)
+{
+  double minimum_overlap_depth = std::numeric_limits<double>::infinity();
+  const auto intervals_overlap =
+    [&minimum_overlap_depth](
+    const double footprint_minimum,
+    const double footprint_maximum,
+    const double cell_minimum,
+    const double cell_maximum,
+    const double axis_length)
+    {
+      if (footprint_maximum < cell_minimum ||
+        cell_maximum < footprint_minimum)
+      {
+        return false;
+      }
+      minimum_overlap_depth = std::min(
+        minimum_overlap_depth,
+        std::min(
+          footprint_maximum - cell_minimum,
+          cell_maximum - footprint_minimum) / axis_length);
+      return true;
+    };
+
+  if (!intervals_overlap(
+      footprint_minimum_x, footprint_maximum_x,
+      cell_minimum_x, cell_maximum_x, 1.0) ||
+    !intervals_overlap(
+      footprint_minimum_y, footprint_maximum_y,
+      cell_minimum_y, cell_maximum_y, 1.0))
+  {
+    return false;
+  }
+
+  const double cell_centre_x = 0.5 * (cell_minimum_x + cell_maximum_x);
+  const double cell_centre_y = 0.5 * (cell_minimum_y + cell_maximum_y);
+  const double cell_half_width = 0.5 * (cell_maximum_x - cell_minimum_x);
+  const double cell_half_height = 0.5 * (cell_maximum_y - cell_minimum_y);
+  for (const auto & axis : footprint_axes) {
+    const double cell_projection_centre =
+      axis.x * cell_centre_x + axis.y * cell_centre_y;
+    const double cell_projection_radius =
+      std::abs(axis.x) * cell_half_width +
+      std::abs(axis.y) * cell_half_height;
+    if (!intervals_overlap(
+        axis.projection_minimum, axis.projection_maximum,
+        cell_projection_centre - cell_projection_radius,
+        cell_projection_centre + cell_projection_radius,
+        axis.length))
+    {
+      return false;
+    }
+  }
+
+  if (overlap_depth) {
+    *overlap_depth = std::max(0.0, minimum_overlap_depth);
   }
   return true;
 }
@@ -132,19 +261,32 @@ CertificationResult check_pose(
   std::vector<nav2_costmap_2d::MapLocation> & footprint_cells,
   CertificationWorkspace & workspace,
   const bool allow_lethal = false,
-  bool * lethal_overlap = nullptr)
+  bool * lethal_overlap = nullptr,
+  double * lethal_overlap_depth = nullptr,
+  const bool allow_unknown_space = false)
 {
   CertificationResult result;
   if (lethal_overlap) {
     *lethal_overlap = false;
   }
+  if (lethal_overlap_depth) {
+    *lethal_overlap_depth = 0.0;
+  }
   result.checked_pose_count = 1;
+  std::vector<geometry_msgs::msg::Point> & world_footprint =
+    workspace.world_footprint;
+  world_footprint.clear();
+  world_footprint.reserve(footprint.size());
   map_footprint.clear();
   map_footprint.reserve(footprint.size());
   unsigned int minimum_x = std::numeric_limits<unsigned int>::max();
   unsigned int minimum_y = std::numeric_limits<unsigned int>::max();
   unsigned int maximum_x = 0;
   unsigned int maximum_y = 0;
+  double footprint_minimum_x = std::numeric_limits<double>::infinity();
+  double footprint_minimum_y = std::numeric_limits<double>::infinity();
+  double footprint_maximum_x = -std::numeric_limits<double>::infinity();
+  double footprint_maximum_y = -std::numeric_limits<double>::infinity();
   const double cosine = std::cos(pose.theta);
   const double sine = std::sin(pose.theta);
   for (const geometry_msgs::msg::Point & point : footprint) {
@@ -159,17 +301,28 @@ CertificationResult check_pose(
       result.failure = CertificationFailure::kOffCostmap;
       return result;
     }
+    geometry_msgs::msg::Point world_point;
+    world_point.x = world_x;
+    world_point.y = world_y;
+    world_footprint.push_back(world_point);
     map_footprint.push_back(map_point);
     minimum_x = std::min(minimum_x, map_point.x);
     minimum_y = std::min(minimum_y, map_point.y);
     maximum_x = std::max(maximum_x, map_point.x);
     maximum_y = std::max(maximum_y, map_point.y);
+    footprint_minimum_x = std::min(footprint_minimum_x, world_x);
+    footprint_minimum_y = std::min(footprint_minimum_y, world_y);
+    footprint_maximum_x = std::max(footprint_maximum_x, world_x);
+    footprint_maximum_y = std::max(footprint_maximum_y, world_y);
   }
+
+  expand_map_bounds_by_one_cell(
+    costmap, minimum_x, minimum_y, maximum_x, maximum_y);
 
   std::size_t hazard_count = 0u;
   if (query_hazard_count(
       costmap, workspace, minimum_x, minimum_y, maximum_x, maximum_y,
-      hazard_count) &&
+      hazard_count, allow_unknown_space) &&
     hazard_count == 0u)
   {
     result.safe = true;
@@ -178,11 +331,12 @@ CertificationResult check_pose(
   }
 
   const bool cacheable =
-    map_footprint.size() <= kMaximumCachedFootprintVertices &&
-    workspace.hazard_prefix_valid;
+    world_footprint.size() <= kMaximumCachedFootprintVertices &&
+    workspace.hazard_prefix_valid && !lethal_overlap_depth;
   std::size_t cache_hash = 0u;
   if (cacheable) {
-    cache_hash = hash_map_footprint(map_footprint, allow_lethal);
+    cache_hash = hash_world_footprint(
+      world_footprint, allow_lethal, allow_unknown_space);
     const auto cached_range =
       workspace.pose_check_cache_index.equal_range(cache_hash);
     for (auto cached = cached_range.first;
@@ -193,7 +347,9 @@ CertificationResult check_pose(
       }
       const PoseCheckCacheEntry & entry =
         workspace.pose_check_cache[cached->second];
-      if (!cached_footprint_matches(entry, map_footprint, allow_lethal)) {
+      if (!cached_footprint_matches(
+          entry, world_footprint, allow_lethal, allow_unknown_space))
+      {
         continue;
       }
       if (lethal_overlap) {
@@ -203,19 +359,24 @@ CertificationResult check_pose(
     }
   }
   const auto cache_result =
-    [&workspace, &map_footprint, cacheable, cache_hash, allow_lethal](
+    [&workspace, &world_footprint, cacheable, cache_hash, allow_lethal,
+      allow_unknown_space](
     const CertificationResult & completed,
     const bool completed_lethal_overlap)
     {
       if (cacheable) {
         PoseCheckCacheEntry entry;
-        entry.vertex_count = map_footprint.size();
+        entry.vertex_count = world_footprint.size();
         entry.allow_lethal = allow_lethal;
+        entry.allow_unknown_space = allow_unknown_space;
         entry.lethal_overlap = completed_lethal_overlap;
         entry.result = completed;
-        std::copy(
-          map_footprint.begin(), map_footprint.end(),
-          entry.map_footprint.begin());
+        for (std::size_t index = 0u;
+          index < world_footprint.size(); ++index)
+        {
+          entry.world_footprint[index].x = world_footprint[index].x;
+          entry.world_footprint[index].y = world_footprint[index].y;
+        }
         const std::size_t index = workspace.pose_check_cache.size();
         workspace.pose_check_cache.push_back(std::move(entry));
         workspace.pose_check_cache_index.emplace(cache_hash, index);
@@ -223,39 +384,142 @@ CertificationResult check_pose(
       return completed;
     };
 
-  footprint_cells.clear();
-  costmap.convexFillCells(map_footprint, footprint_cells);
-  bool observed_lethal_overlap = false;
-  for (const nav2_costmap_2d::MapLocation & cell : footprint_cells) {
-    const unsigned char cost = costmap.getCost(cell.x, cell.y);
-    if (cost == nav2_costmap_2d::NO_INFORMATION) {
-      result.failure = CertificationFailure::kUnknownSpace;
-      result.has_failure_cell = true;
-      result.failure_cell_x = cell.x;
-      result.failure_cell_y = cell.y;
-      result.failure_cell_cost = cost;
-      costmap.mapToWorld(
-        cell.x, cell.y, result.failure_cell_world_x,
-        result.failure_cell_world_y);
-      return cache_result(result, observed_lethal_overlap);
+  std::vector<PreparedFootprintAxis> & footprint_axes =
+    workspace.footprint_axes;
+  footprint_axes.clear();
+  footprint_axes.reserve(world_footprint.size());
+  for (std::size_t index = 0u; index < world_footprint.size(); ++index) {
+    const auto & first = world_footprint[index];
+    const auto & second =
+      world_footprint[(index + 1u) % world_footprint.size()];
+    PreparedFootprintAxis axis;
+    axis.x = first.y - second.y;
+    axis.y = second.x - first.x;
+    axis.length = std::hypot(axis.x, axis.y);
+    if (axis.length <= std::numeric_limits<double>::epsilon()) {
+      continue;
     }
-    if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
-      observed_lethal_overlap = true;
-      if (lethal_overlap) {
-        *lethal_overlap = true;
+    axis.projection_minimum =
+      axis.x * world_footprint.front().x +
+      axis.y * world_footprint.front().y;
+    axis.projection_maximum = axis.projection_minimum;
+    for (std::size_t point_index = 1u;
+      point_index < world_footprint.size(); ++point_index)
+    {
+      const double projection =
+        axis.x * world_footprint[point_index].x +
+        axis.y * world_footprint[point_index].y;
+      axis.projection_minimum =
+        std::min(axis.projection_minimum, projection);
+      axis.projection_maximum =
+        std::max(axis.projection_maximum, projection);
+    }
+    footprint_axes.push_back(axis);
+  }
+
+  footprint_cells.clear();
+  bool observed_lethal_overlap = false;
+  const double resolution = costmap.getResolution();
+  const double origin_x = costmap.getOriginX();
+  const double origin_y = costmap.getOriginY();
+  const auto check_hazard_cell =
+    [&](const unsigned int cell_x, const unsigned int cell_y)
+    {
+      const unsigned char cost = costmap.getCost(cell_x, cell_y);
+      const double cell_minimum_x =
+        origin_x + static_cast<double>(cell_x) * resolution;
+      const double cell_minimum_y =
+        origin_y + static_cast<double>(cell_y) * resolution;
+      double cell_overlap_depth = 0.0;
+      if (!convex_footprint_intersects_cell(
+          footprint_axes,
+          footprint_minimum_x, footprint_minimum_y,
+          footprint_maximum_x, footprint_maximum_y,
+          cell_minimum_x, cell_minimum_y,
+          cell_minimum_x + resolution, cell_minimum_y + resolution,
+          lethal_overlap_depth ? &cell_overlap_depth : nullptr))
+      {
+        return false;
       }
-      if (allow_lethal) {
-        continue;
+      nav2_costmap_2d::MapLocation cell;
+      cell.x = cell_x;
+      cell.y = cell_y;
+      footprint_cells.push_back(cell);
+      if (cost == nav2_costmap_2d::NO_INFORMATION) {
+        if (allow_unknown_space) {
+          return false;
+        }
+        result.failure = CertificationFailure::kUnknownSpace;
+        result.has_failure_cell = true;
+        result.failure_cell_x = cell.x;
+        result.failure_cell_y = cell.y;
+        result.failure_cell_cost = cost;
+        costmap.mapToWorld(
+          cell.x, cell.y, result.failure_cell_world_x,
+          result.failure_cell_world_y);
+        return true;
       }
-      result.failure = CertificationFailure::kLethalObstacle;
-      result.has_failure_cell = true;
-      result.failure_cell_x = cell.x;
-      result.failure_cell_y = cell.y;
-      result.failure_cell_cost = cost;
-      costmap.mapToWorld(
-        cell.x, cell.y, result.failure_cell_world_x,
-        result.failure_cell_world_y);
-      return cache_result(result, observed_lethal_overlap);
+      if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
+        observed_lethal_overlap = true;
+        if (lethal_overlap) {
+          *lethal_overlap = true;
+        }
+        if (lethal_overlap_depth) {
+          *lethal_overlap_depth = std::max(
+            *lethal_overlap_depth, cell_overlap_depth);
+        }
+        if (allow_lethal) {
+          return false;
+        }
+        result.failure = CertificationFailure::kLethalObstacle;
+        result.has_failure_cell = true;
+        result.failure_cell_x = cell.x;
+        result.failure_cell_y = cell.y;
+        result.failure_cell_cost = cost;
+        costmap.mapToWorld(
+          cell.x, cell.y, result.failure_cell_world_x,
+          result.failure_cell_world_y);
+        return true;
+      }
+      return false;
+    };
+
+  if (broadphase_matches_policy(
+      costmap, workspace, allow_unknown_space))
+  {
+    for (unsigned int cell_y = minimum_y; cell_y <= maximum_y; ++cell_y) {
+      const std::size_t row_begin = workspace.hazard_row_offsets[cell_y];
+      const std::size_t row_end = workspace.hazard_row_offsets[cell_y + 1u];
+      const auto begin = workspace.hazard_cells.begin() +
+        static_cast<std::ptrdiff_t>(row_begin);
+      const auto end = workspace.hazard_cells.begin() +
+        static_cast<std::ptrdiff_t>(row_end);
+      const auto first = std::lower_bound(
+        begin, end, minimum_x,
+        [](const nav2_costmap_2d::MapLocation & cell, const unsigned int x) {
+          return cell.x < x;
+        });
+      for (auto cell = first; cell != end && cell->x <= maximum_x; ++cell) {
+        if (check_hazard_cell(cell->x, cell->y)) {
+          return cache_result(result, observed_lethal_overlap);
+        }
+      }
+    }
+  } else {
+    for (unsigned int cell_y = minimum_y; cell_y <= maximum_y; ++cell_y) {
+      for (unsigned int cell_x = minimum_x; cell_x <= maximum_x; ++cell_x) {
+        const unsigned char cost = costmap.getCost(cell_x, cell_y);
+        if ((cost == nav2_costmap_2d::NO_INFORMATION &&
+          allow_unknown_space) ||
+          (cost != nav2_costmap_2d::NO_INFORMATION &&
+          cost < nav2_costmap_2d::LETHAL_OBSTACLE))
+        {
+          continue;
+        }
+        if (check_hazard_cell(cell_x, cell_y)) {
+          return cache_result(result, observed_lethal_overlap);
+        }
+      }
     }
   }
   result.safe = true;
@@ -276,7 +540,8 @@ bool certify_hazard_free_sequence_bounds(
   const double maximum_footprint_radius,
   const double maximum_swept_distance,
   const CertificationWorkspace & workspace,
-  std::size_t & checked_pose_count)
+  std::size_t & checked_pose_count,
+  const bool allow_unknown_space)
 {
   double minimum_x = std::numeric_limits<double>::infinity();
   double minimum_y = std::numeric_limits<double>::infinity();
@@ -318,11 +583,15 @@ bool certify_hazard_free_sequence_bounds(
   {
     return false;
   }
+  expand_map_bounds_by_one_cell(
+    costmap, minimum_map_x, minimum_map_y,
+    maximum_map_x, maximum_map_y);
 
   std::size_t hazard_count = 0u;
   if (!query_hazard_count(
       costmap, workspace, minimum_map_x, minimum_map_y,
-      maximum_map_x, maximum_map_y, hazard_count) ||
+      maximum_map_x, maximum_map_y, hazard_count,
+      allow_unknown_space) ||
     hazard_count != 0u)
   {
     return false;
@@ -352,7 +621,8 @@ bool certify_hazard_free_segment_bounds(
   const geometry_msgs::msg::Pose2D & first,
   const geometry_msgs::msg::Pose2D & second,
   const double maximum_footprint_radius,
-  const CertificationWorkspace & workspace)
+  const CertificationWorkspace & workspace,
+  const bool allow_unknown_space)
 {
   if (!std::isfinite(first.x) || !std::isfinite(first.y) ||
     !std::isfinite(first.theta) || !std::isfinite(second.x) ||
@@ -393,18 +663,23 @@ bool certify_hazard_free_segment_bounds(
   {
     return false;
   }
+  expand_map_bounds_by_one_cell(
+    costmap, minimum_map_x, minimum_map_y,
+    maximum_map_x, maximum_map_y);
 
   std::size_t hazard_count = 0u;
   return query_hazard_count(
     costmap, workspace, minimum_map_x, minimum_map_y,
-    maximum_map_x, maximum_map_y, hazard_count) && hazard_count == 0u;
+    maximum_map_x, maximum_map_y, hazard_count,
+    allow_unknown_space) && hazard_count == 0u;
 }
 
 }  // namespace
 
 bool prepare_certification_broadphase(
   const nav2_costmap_2d::Costmap2D & costmap,
-  CertificationWorkspace & workspace)
+  CertificationWorkspace & workspace,
+  const bool unknown_space_is_hazard)
 {
   invalidate_certification_broadphase(workspace);
   const unsigned int size_x = costmap.getSizeInCellsX();
@@ -436,14 +711,24 @@ bool prepare_certification_broadphase(
       workspace.hazard_prefix_sum[y * stride] = 0u;
     }
   }
+  workspace.hazard_cells.clear();
+  workspace.hazard_row_offsets.resize(
+    static_cast<std::size_t>(size_y) + 1u);
   for (unsigned int y = 0; y < size_y; ++y) {
+    workspace.hazard_row_offsets[y] = workspace.hazard_cells.size();
     std::size_t row_hazard_count = 0u;
     for (unsigned int x = 0; x < size_x; ++x) {
       const unsigned char cost = costmap.getCost(x, y);
-      if (cost == nav2_costmap_2d::NO_INFORMATION ||
-        cost >= nav2_costmap_2d::LETHAL_OBSTACLE)
-      {
+      const bool cell_is_hazard =
+        cost == nav2_costmap_2d::NO_INFORMATION ?
+        unknown_space_is_hazard :
+        cost >= nav2_costmap_2d::LETHAL_OBSTACLE;
+      if (cell_is_hazard) {
         ++row_hazard_count;
+        nav2_costmap_2d::MapLocation cell;
+        cell.x = x;
+        cell.y = y;
+        workspace.hazard_cells.push_back(cell);
       }
       const std::size_t index =
         (static_cast<std::size_t>(y) + 1u) * stride +
@@ -453,11 +738,13 @@ bool prepare_certification_broadphase(
         row_hazard_count;
     }
   }
+  workspace.hazard_row_offsets[size_y] = workspace.hazard_cells.size();
   workspace.hazard_size_x = size_x;
   workspace.hazard_size_y = size_y;
   workspace.hazard_origin_x = costmap.getOriginX();
   workspace.hazard_origin_y = costmap.getOriginY();
   workspace.hazard_resolution = costmap.getResolution();
+  workspace.hazard_unknown_space_is_hazard = unknown_space_is_hazard;
   workspace.hazard_prefix_valid = true;
   return true;
 }
@@ -470,9 +757,16 @@ void invalidate_certification_broadphase(
   workspace.hazard_origin_x = 0.0;
   workspace.hazard_origin_y = 0.0;
   workspace.hazard_resolution = 0.0;
+  workspace.hazard_unknown_space_is_hazard = true;
   workspace.hazard_prefix_valid = false;
   workspace.pose_check_cache.clear();
   workspace.pose_check_cache_index.clear();
+}
+
+void invalidate_observation_layer_certification_workspace(
+  ObservationLayerCertificationWorkspace & workspace)
+{
+  workspace.valid = false;
 }
 
 bool certification_footprint_bounds_are_hazard_free(
@@ -508,6 +802,8 @@ bool certification_footprint_bounds_are_hazard_free(
     maximum_x = std::max(maximum_x, map_x);
     maximum_y = std::max(maximum_y, map_y);
   }
+  expand_map_bounds_by_one_cell(
+    costmap, minimum_x, minimum_y, maximum_x, maximum_y);
   std::size_t hazard_count = 0u;
   return query_hazard_count(
     costmap, workspace, minimum_x, minimum_y, maximum_x, maximum_y,
@@ -519,7 +815,8 @@ CertificationResult certify_pose_sequence(
   const std::vector<geometry_msgs::msg::Point> & footprint,
   const std::vector<geometry_msgs::msg::Pose2D> & poses,
   const double maximum_swept_distance,
-  CertificationWorkspace * workspace)
+  CertificationWorkspace * workspace,
+  const bool allow_unknown_space)
 {
   CertificationResult result;
   if (footprint.size() < 3u || poses.empty() ||
@@ -544,7 +841,7 @@ CertificationResult certify_pose_sequence(
   if (certify_hazard_free_sequence_bounds(
       costmap, poses, maximum_footprint_radius,
       maximum_swept_distance, active_workspace,
-      result.checked_pose_count))
+      result.checked_pose_count, allow_unknown_space))
   {
     result.safe = true;
     result.failure = CertificationFailure::kNone;
@@ -554,7 +851,8 @@ CertificationResult certify_pose_sequence(
     check_pose(
     costmap, footprint, poses.front(),
     active_workspace.map_footprint,
-    active_workspace.footprint_cells, active_workspace);
+    active_workspace.footprint_cells, active_workspace,
+    false, nullptr, nullptr, allow_unknown_space);
   result.checked_pose_count += pose_result.checked_pose_count;
   if (!pose_result.safe) {
     result.failure = pose_result.failure;
@@ -592,7 +890,7 @@ CertificationResult certify_pose_sequence(
         std::ceil(swept_distance / maximum_swept_distance)));
     if (certify_hazard_free_segment_bounds(
         costmap, previous, next, maximum_footprint_radius,
-        active_workspace))
+        active_workspace, allow_unknown_space))
     {
       result.checked_pose_count +=
         static_cast<std::size_t>(interpolation_count);
@@ -611,7 +909,8 @@ CertificationResult certify_pose_sequence(
       pose_result = check_pose(
         costmap, footprint, interpolated,
         active_workspace.map_footprint,
-        active_workspace.footprint_cells, active_workspace);
+        active_workspace.footprint_cells, active_workspace,
+        false, nullptr, nullptr, allow_unknown_space);
       result.checked_pose_count += pose_result.checked_pose_count;
       if (!pose_result.safe) {
         result.failure = pose_result.failure;
@@ -633,6 +932,76 @@ CertificationResult certify_pose_sequence(
 
   result.safe = true;
   result.failure = CertificationFailure::kNone;
+  return result;
+}
+
+ObservationLayerCertificationResult certify_observation_layer_sequence(
+  nav2_costmap_2d::LayeredCostmap & layered_costmap,
+  const std::vector<geometry_msgs::msg::Point> & physical_footprint,
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  const double maximum_swept_distance,
+  ObservationLayerCertificationWorkspace * workspace)
+{
+  ObservationLayerCertificationResult result;
+  const auto plugins = layered_costmap.getPlugins();
+  if (!plugins) {
+    return result;
+  }
+
+  ObservationLayerCertificationWorkspace local_workspace;
+  ObservationLayerCertificationWorkspace & active_workspace =
+    workspace ? *workspace : local_workspace;
+  if (!active_workspace.valid) {
+    std::size_t observation_index = 0u;
+    for (const auto & plugin : *plugins) {
+      const auto observation_layer =
+        std::dynamic_pointer_cast<nav2_costmap_2d::ObstacleLayer>(plugin);
+      if (!observation_layer || !plugin->isEnabled()) {
+        continue;
+      }
+      if (active_workspace.layers.size() <= observation_index) {
+        active_workspace.layers.emplace_back();
+      }
+      auto & entry = active_workspace.layers[observation_index];
+      if (entry.layer != observation_layer.get()) {
+        entry = ObservationLayerCertificationWorkspaceEntry{};
+      }
+      entry.layer = observation_layer.get();
+      entry.layer_name = plugin->getName();
+      entry.broadphase_prepared = plugin->isCurrent() &&
+        prepare_certification_broadphase(
+        *observation_layer, entry.certification, false);
+      ++observation_index;
+    }
+    active_workspace.layers.resize(observation_index);
+    active_workspace.valid = true;
+  }
+
+  result.layers_current = true;
+  for (auto & entry : active_workspace.layers) {
+    result.layer_available = true;
+    if (!entry.layer || !entry.layer->isCurrent()) {
+      result.layers_current = false;
+      result.failure_layer_name = entry.layer_name;
+      return result;
+    }
+
+    if (!entry.broadphase_prepared) {
+      result.failure_layer_name = entry.layer_name;
+      result.failure.failure = CertificationFailure::kInvalidInput;
+      return result;
+    }
+    const CertificationResult layer_result = certify_pose_sequence(
+      *entry.layer, physical_footprint, poses,
+      maximum_swept_distance, &entry.certification, true);
+    if (!layer_result.safe) {
+      result.failure_layer_name = entry.layer_name;
+      result.failure = layer_result;
+      return result;
+    }
+  }
+
+  result.safe = result.layer_available && result.layers_current;
   return result;
 }
 
@@ -751,26 +1120,42 @@ bool certify_initial_overlap_recovery_sequence(
 
 bool certify_initial_overlap_margin_sequence(
   nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & planning_footprint,
   const std::vector<geometry_msgs::msg::Point> & physical_footprint,
-  const std::vector<geometry_msgs::msg::Point> & inset_core_footprint,
   const std::vector<geometry_msgs::msg::Pose2D> & poses,
   const double maximum_swept_distance,
   double * overlap_fraction,
   CertificationWorkspace * workspace,
-  const bool allow_committed_prefix_entry)
+  const bool allow_later_entry,
+  const bool require_planning_clearance,
+  const double maximum_overlap_fraction,
+  const double minimum_clear_suffix_fraction,
+  const bool require_nonincreasing_overlap_depth,
+  CertificationResult * const physical_certificate,
+  const bool allow_reentry_after_clearance)
 {
   if (overlap_fraction) {
     *overlap_fraction = 0.0;
   }
-  if (physical_footprint.size() < 3u || poses.empty() ||
+  if (physical_certificate) {
+    const CertificationResult empty_certificate;
+    *physical_certificate = empty_certificate;
+  }
+  if (planning_footprint.size() < 3u || physical_footprint.size() < 3u ||
+    poses.empty() ||
     !std::isfinite(maximum_swept_distance) ||
-    maximum_swept_distance <= 0.0)
+    maximum_swept_distance <= 0.0 ||
+    !std::isfinite(maximum_overlap_fraction) ||
+    maximum_overlap_fraction < 0.0 || maximum_overlap_fraction > 1.0 ||
+    !std::isfinite(minimum_clear_suffix_fraction) ||
+    minimum_clear_suffix_fraction < 0.0 ||
+    minimum_clear_suffix_fraction > 1.0)
   {
     return false;
   }
 
   double maximum_footprint_radius = 0.0;
-  for (const geometry_msgs::msg::Point & point : physical_footprint) {
+  for (const geometry_msgs::msg::Point & point : planning_footprint) {
     if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
       return false;
     }
@@ -782,10 +1167,12 @@ bool certify_initial_overlap_margin_sequence(
   CertificationWorkspace & active_workspace =
     workspace ? *workspace : local_workspace;
   bool initial_lethal_overlap = false;
+  double initial_overlap_depth = 0.0;
   const CertificationResult initial_result = check_pose(
-    costmap, physical_footprint, poses.front(),
+    costmap, planning_footprint, poses.front(),
     active_workspace.map_footprint, active_workspace.footprint_cells,
-    active_workspace, true, &initial_lethal_overlap);
+    active_workspace, true, &initial_lethal_overlap,
+    require_nonincreasing_overlap_depth ? &initial_overlap_depth : nullptr);
   if (!initial_result.safe) {
     return false;
   }
@@ -793,17 +1180,24 @@ bool certify_initial_overlap_margin_sequence(
   // This is the hard body certificate. Densification accounts for the rear
   // corner arc as well as translation, so turning away beside a wall cannot
   // sweep the tail through an obstacle.
-  if (!certify_pose_sequence(
-      costmap, inset_core_footprint, poses,
-      maximum_swept_distance, &active_workspace).safe)
-  {
+  const CertificationResult physical_result = certify_pose_sequence(
+    costmap, physical_footprint, poses,
+    maximum_swept_distance, &active_workspace);
+  if (physical_certificate) {
+    *physical_certificate = physical_result;
+  }
+  if (!physical_result.safe) {
     return false;
   }
 
   std::size_t checked_pose_count = 1u;
   std::size_t overlap_pose_count = initial_lethal_overlap ? 1u : 0u;
   bool margin_started = initial_lethal_overlap;
-  bool physical_clear_observed = false;
+  bool planning_clear_observed = false;
+  std::size_t clear_suffix_pose_count = 0u;
+  double maximum_permitted_overlap_depth = initial_overlap_depth;
+  const double overlap_depth_tolerance = std::max(
+    1.0e-6, 0.05 * costmap.getResolution());
   for (std::size_t pose_index = 1u; pose_index < poses.size(); ++pose_index) {
     const geometry_msgs::msg::Pose2D & previous = poses[pose_index - 1u];
     const geometry_msgs::msg::Pose2D & next = poses[pose_index];
@@ -832,10 +1226,13 @@ bool certify_initial_overlap_margin_sequence(
       interpolated.y = previous.y + ratio * (next.y - previous.y);
       interpolated.theta = previous.theta + ratio * angle_difference;
       bool lethal_overlap = false;
+      double lethal_overlap_depth = 0.0;
       const CertificationResult pose_result = check_pose(
-        costmap, physical_footprint, interpolated,
+        costmap, planning_footprint, interpolated,
         active_workspace.map_footprint, active_workspace.footprint_cells,
-        active_workspace, true, &lethal_overlap);
+        active_workspace, true, &lethal_overlap,
+        require_nonincreasing_overlap_depth ?
+        &lethal_overlap_depth : nullptr);
       if (!pose_result.safe) {
         return false;
       }
@@ -846,17 +1243,32 @@ bool certify_initial_overlap_margin_sequence(
           // response. An already-issued delay prefix is no longer alterable,
           // so let its boundary strip reach the predicted activation pose and
           // require the candidate beginning there to clear it.
-          if (pose_index != 1u && !allow_committed_prefix_entry) {
+          if (pose_index != 1u && !allow_later_entry) {
             return false;
           }
           margin_started = true;
+          maximum_permitted_overlap_depth = lethal_overlap_depth;
         }
-        if (physical_clear_observed) {
+        if (planning_clear_observed && !allow_reentry_after_clearance) {
+          return false;
+        }
+        if (planning_clear_observed) {
+          // Only bounded receding-horizon localization recovery enables this.
+          // Its inward body core and every current observation layer are
+          // certified independently by the caller for the complete prefix.
+          planning_clear_observed = false;
+          clear_suffix_pose_count = 0u;
+        }
+        if (require_nonincreasing_overlap_depth &&
+          lethal_overlap_depth >
+          maximum_permitted_overlap_depth + overlap_depth_tolerance)
+        {
           return false;
         }
         ++overlap_pose_count;
       } else if (margin_started) {
-        physical_clear_observed = true;
+        planning_clear_observed = true;
+        ++clear_suffix_pose_count;
       }
     }
   }
@@ -864,9 +1276,22 @@ bool certify_initial_overlap_margin_sequence(
   if (!margin_started) {
     return false;
   }
+  if (require_planning_clearance && !planning_clear_observed) {
+    return false;
+  }
+  const double measured_overlap_fraction =
+    static_cast<double>(overlap_pose_count) /
+    static_cast<double>(checked_pose_count);
+  const double measured_clear_suffix_fraction =
+    static_cast<double>(clear_suffix_pose_count) /
+    static_cast<double>(checked_pose_count);
+  if (measured_overlap_fraction > maximum_overlap_fraction ||
+    measured_clear_suffix_fraction < minimum_clear_suffix_fraction)
+  {
+    return false;
+  }
   if (overlap_fraction) {
-    *overlap_fraction = static_cast<double>(overlap_pose_count) /
-      static_cast<double>(checked_pose_count);
+    *overlap_fraction = measured_overlap_fraction;
   }
   return true;
 }

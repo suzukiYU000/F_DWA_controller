@@ -139,6 +139,27 @@ TEST(PathSubgoal, MeaningfulProgressUsesPathArclengthAndLookaheadHeading)
       trajectory, path, heading_target, 0.0, 0.20));
 }
 
+TEST(PathSubgoal, TranslationAndHeadingEvidenceCanBeClassifiedSeparately)
+{
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(2u);
+  path.poses[1u].x = 1.0;
+  geometry_msgs::msg::Pose2D heading_target;
+  heading_target.x = 1.0;
+  heading_target.theta = 0.0;
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(2u);
+  trajectory.poses[0u].theta = 0.3;
+  trajectory.poses[1u].theta = 0.1;
+
+  EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.1, 0.1));
+  EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.1, 0.0));
+  EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.0, 0.1));
+}
+
 TEST(PathSubgoal, ArclengthProgressRejectsGrowingPathDistance)
 {
   nav_2d_msgs::msg::Path2D path;
@@ -195,7 +216,7 @@ TEST(PathSubgoal, ArclengthProgressAllowsBoundedPathDistanceGrowth)
       trajectory, path, heading_target, 0.025, 0.025));
 }
 
-TEST(PathSubgoal, ArclengthProgressRejectsGrowingSubgoalHeadingError)
+TEST(PathSubgoal, ArclengthProgressAllowsForwardFacingAvoidanceHeading)
 {
   nav_2d_msgs::msg::Path2D path;
   path.poses.resize(2u);
@@ -208,7 +229,31 @@ TEST(PathSubgoal, ArclengthProgressRejectsGrowingSubgoalHeadingError)
   trajectory.poses[1u].x = 0.55;
   trajectory.poses[1u].theta = 0.1;
 
+  EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.025, 0.025));
+
+  trajectory.poses[1u].theta = M_PI;
   EXPECT_FALSE(f_dwa_controller::trajectory_has_meaningful_path_progress(
+      trajectory, path, heading_target, 0.025, 0.025));
+}
+
+TEST(PathSubgoal, ArclengthProgressAllowsUnknownObstacleDetour)
+{
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(2u);
+  path.poses[1u].x = 2.0;
+  geometry_msgs::msg::Pose2D heading_target;
+  heading_target.x = 2.0;
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(2u);
+  trajectory.poses[0u].x = 0.50;
+  trajectory.poses[0u].y = -0.15;
+  trajectory.poses[0u].theta = 0.05;
+  trajectory.poses[1u].x = 1.10;
+  trajectory.poses[1u].y = -0.25;
+  trajectory.poses[1u].theta = -0.35;
+
+  EXPECT_TRUE(f_dwa_controller::trajectory_has_meaningful_path_progress(
       trajectory, path, heading_target, 0.025, 0.025));
 }
 

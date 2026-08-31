@@ -12,3 +12,9 @@ builtin_interfaces/Duration duration
 
 # True when computeVelocityCommands() returned without throwing.
 bool success
+
+# Populated only when success is false. These fields preserve the controller's
+# exact failure diagnosis at the failed cycle instead of relying on a later,
+# potentially stale LocalPlanEvaluation sample.
+string failure_type
+string failure_message

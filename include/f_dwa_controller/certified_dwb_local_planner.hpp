@@ -25,6 +25,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -86,6 +87,23 @@ protected:
     geometry_msgs::msg::Pose2D terminal_pose;
   };
 
+  struct ProgressEscapeRank
+  {
+    uint64_t clearance_guard_bucket{std::numeric_limits<uint64_t>::max()};
+    bool has_translation_progress{false};
+    double progress_cost{std::numeric_limits<double>::infinity()};
+    double path_deviation_cost{std::numeric_limits<double>::infinity()};
+    uint64_t mean_path_distance_bucket{
+      std::numeric_limits<uint64_t>::max()};
+    double mean_path_distance_cost{std::numeric_limits<double>::infinity()};
+    bool consumes_uncertainty_reserve{false};
+    bool recovers_initial_clearance{false};
+    double approach_risk{std::numeric_limits<double>::infinity()};
+    uint64_t clearance_risk_bucket{std::numeric_limits<uint64_t>::max()};
+    double avoidance_horizon_seconds{0.0};
+    std::size_t canonical_index{std::numeric_limits<std::size_t>::max()};
+  };
+
   struct DiagnosticPublication
   {
     std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> evaluation;
@@ -115,7 +133,9 @@ protected:
     bool * completed_weighted_score = nullptr,
     double * path_deviation_cost = nullptr,
     double * mean_path_distance_cost = nullptr,
-    bool * strict_physical_stop_safety_proven = nullptr);
+    bool * strict_physical_stop_safety_proven = nullptr,
+    double * guard_clearance_risk = nullptr,
+    double * guard_approach_risk = nullptr);
   visualization_msgs::msg::MarkerArray build_candidate_markers(
     const dwb_msgs::msg::LocalPlanEvaluation & evaluation) const;
   static bool coalesce_stale_marker_publication(
@@ -146,6 +166,25 @@ protected:
     const geometry_msgs::msg::Pose2D & subgoal,
     double minimum_distance_progress,
     double minimum_heading_progress);
+  static bool trajectory_has_observable_motion(
+    const dwb_msgs::msg::Trajectory2D & trajectory,
+    double minimum_translation,
+    double minimum_rotation);
+  static bool pose_sequence_has_observable_rotation(
+    const std::vector<geometry_msgs::msg::Pose2D> & poses,
+    double minimum_rotation);
+  static bool pose_sequence_has_observable_translation(
+    const std::vector<geometry_msgs::msg::Pose2D> & poses,
+    double minimum_translation);
+  static bool receding_horizon_progress_is_executable(
+    bool stop_has_translation_progress,
+    bool rollout_has_translation_progress,
+    bool stop_has_heading_progress,
+    bool rollout_has_heading_progress,
+    bool stop_has_observable_heading_motion);
+  static bool preserves_established_turn_direction(
+    double candidate_angular_velocity,
+    double established_angular_velocity);
   nav_2d_msgs::msg::Path2D transformGlobalPlan(
     const nav_2d_msgs::msg::Pose2DStamped & pose) override;
   static bool terminal_plan_fallback_is_applicable(
@@ -153,6 +192,12 @@ protected:
     const geometry_msgs::msg::Pose2D & terminal_pose,
     double capture_distance);
   static bool terminal_goal_hold_is_applicable(
+    const geometry_msgs::msg::Pose2D & pose,
+    const geometry_msgs::msg::Pose2D & goal_pose,
+    double capture_distance,
+    const nav_2d_msgs::msg::Twist2D & velocity,
+    double stop_velocity_threshold);
+  static bool terminal_goal_resume_is_applicable(
     const geometry_msgs::msg::Pose2D & pose,
     const geometry_msgs::msg::Pose2D & goal_pose,
     double capture_distance,
@@ -197,6 +242,41 @@ protected:
     double best_path_departure_cost,
     std::size_t candidate_canonical_index,
     std::size_t best_canonical_index);
+  static bool recovery_candidate_preserves_uncertainty_reserve(
+    double collision_time,
+    uint64_t clearance_guard_bucket,
+    double approach_risk,
+    double maximum_approach_risk,
+    double minimum_collision_horizon);
+  static double uncertainty_reserve_approach_limit(
+    bool recovers_initial_clearance);
+  static bool consumes_uncertainty_reserve(
+    double initial_clearance,
+    double terminal_clearance,
+    double uncertainty_margin,
+    double tolerance);
+  static bool progress_escape_prefers_candidate(
+    const ProgressEscapeRank & candidate,
+    const ProgressEscapeRank & best);
+  static bool progress_escape_should_replace_weighted_winner(
+    bool candidate_found,
+    bool selected_progress_was_evaluated,
+    bool selected_has_receding_horizon_progress);
+  static bool legal_avoidance_escape_prefers_candidate(
+    uint64_t candidate_guard_risk_bucket,
+    uint64_t best_guard_risk_bucket,
+    uint64_t candidate_risk_bucket,
+    uint64_t best_risk_bucket,
+    double candidate_approach_risk,
+    double best_approach_risk,
+    bool candidate_preserves_turn_direction,
+    bool best_preserves_turn_direction,
+    double candidate_heading_excursion,
+    double best_heading_excursion,
+    double candidate_translation_distance,
+    double best_translation_distance,
+    std::size_t candidate_canonical_index,
+    std::size_t best_canonical_index);
   static double predicted_collision_time(
     const CertificationResult & result,
     const std::vector<geometry_msgs::msg::Pose2D> & poses,
@@ -232,6 +312,26 @@ private:
     uint64_t unknown_space{0};
   };
 
+  struct DurationCounter
+  {
+    uint64_t calls{0u};
+    double total_seconds{0.0};
+  };
+
+  class ScopedDuration
+  {
+public:
+    ScopedDuration(bool enabled, DurationCounter & counter);
+    ~ScopedDuration();
+
+    ScopedDuration(const ScopedDuration &) = delete;
+    ScopedDuration & operator=(const ScopedDuration &) = delete;
+
+private:
+    DurationCounter * counter_{nullptr};
+    std::chrono::steady_clock::time_point started_at_;
+  };
+
   void command_dispatch_callback(
     const f_dwa_controller::msg::CommandDispatch::SharedPtr message);
   void transport_valid_callback(
@@ -248,6 +348,7 @@ private:
     std::chrono::steady_clock::time_point started_at);
   void record_certification_rejection(CertificationFailure failure);
   void report_planning_metrics(const char * scope);
+  void reset_detailed_timing_metrics();
   bool should_publish_evaluation();
   void enqueue_diagnostic_publication(
     const std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & evaluation,
@@ -280,7 +381,8 @@ private:
   bool certify_physical_sequence(
     const std::vector<geometry_msgs::msg::Pose2D> & poses,
     CertificationResult * result = nullptr,
-    bool * used_initial_overlap_recovery = nullptr) const;
+    bool * used_boundary_margin_recovery = nullptr,
+    bool allow_persistent_localization_overlap = false) const;
   AxisLimits linear_limits() const;
   AxisLimits angular_limits() const;
   void reset_trial_callback(
@@ -332,6 +434,8 @@ private:
   double clearance_constraint_footprint_approach_trigger_risk_{0.1};
   std::shared_ptr<FootprintClearanceCritic> clearance_constraint_critic_;
   dwb_core::TrajectoryCritic::Ptr clearance_constraint_trigger_critic_;
+  std::shared_ptr<FootprintClearanceCritic>
+  clearance_constraint_trigger_footprint_critic_;
   dwb_core::TrajectoryCritic::Ptr clearance_constraint_guard_critic_;
   std::shared_ptr<FootprintClearanceCritic>
   clearance_constraint_guard_footprint_critic_;
@@ -368,6 +472,11 @@ private:
   bool reserve_recovery_hysteresis_{true};
   bool enable_initial_overlap_recovery_{false};
   double initial_overlap_footprint_inset_{0.05};
+  double localization_uncertainty_footprint_inset_{0.0};
+  bool enable_transient_boundary_margin_recovery_{false};
+  bool transient_boundary_margin_require_clearance_{true};
+  double transient_boundary_margin_maximum_overlap_fraction_{0.25};
+  double transient_boundary_margin_minimum_clear_suffix_fraction_{0.20};
   double minimum_linear_velocity_{0.0};
   double maximum_linear_velocity_{1.2};
   double maximum_angular_velocity_{1.57};
@@ -393,6 +502,19 @@ private:
   uint64_t planning_cycle_count_{0};
   uint64_t planning_deadline_miss_count_{0};
   double maximum_planning_duration_seconds_{0.0};
+  uint64_t shared_clearance_risk_path_candidate_count_{0};
+  uint64_t independent_clearance_risk_path_candidate_count_{0};
+  DurationCounter core_scoring_timing_;
+  DurationCounter candidate_evaluation_timing_;
+  DurationCounter trajectory_generation_timing_;
+  DurationCounter stop_trajectory_generation_timing_;
+  DurationCounter clearance_constraint_timing_;
+  DurationCounter clearance_primary_timing_;
+  DurationCounter clearance_trigger_timing_;
+  DurationCounter clearance_guard_timing_;
+  DurationCounter weighted_scoring_timing_;
+  DurationCounter stop_safety_timing_;
+  std::vector<DurationCounter> critic_scoring_timings_;
   CertificationRejectionCounters certification_rejections_;
   std::vector<nav_2d_msgs::msg::Twist2D> retained_backup_commands_;
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
@@ -401,7 +523,10 @@ private:
   bool terminal_stop_goal_capture_committed_{false};
   std::vector<geometry_msgs::msg::Point> certified_footprint_;
   std::vector<geometry_msgs::msg::Point> initial_overlap_core_footprint_;
+  std::vector<geometry_msgs::msg::Point> localization_core_footprint_;
   mutable CertificationWorkspace certification_workspace_;
+  mutable ObservationLayerCertificationWorkspace
+    observation_layer_certification_workspace_;
   std::vector<geometry_msgs::msg::Pose2D> stop_pose_scratch_;
   geometry_msgs::msg::Pose2D current_goal_pose_;
   bool current_goal_pose_valid_{false};

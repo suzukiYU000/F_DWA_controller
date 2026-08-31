@@ -23,12 +23,15 @@
 
 #include <array>
 #include <cstddef>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/pose2_d.hpp"
 #include "nav2_costmap_2d/costmap_2d.hpp"
+#include "nav2_costmap_2d/layered_costmap.hpp"
+#include "nav2_costmap_2d/obstacle_layer.hpp"
 
 namespace f_dwa_controller
 {
@@ -59,36 +62,86 @@ struct CertificationResult
   double failure_cell_world_y{0.0};
 };
 
+struct ObservationLayerCertificationResult
+{
+  // A localization-error recovery is fail-closed unless at least one enabled
+  // ObstacleLayer or VoxelLayer supplied a current, collision-free view.
+  bool layer_available{false};
+  bool layers_current{false};
+  bool safe{false};
+  std::string failure_layer_name;
+  CertificationResult failure;
+};
+
 constexpr std::size_t kMaximumCachedFootprintVertices = 16u;
+
+struct CachedFootprintPoint
+{
+  double x{0.0};
+  double y{0.0};
+};
+
+struct PreparedFootprintAxis
+{
+  double x{0.0};
+  double y{0.0};
+  double length{0.0};
+  double projection_minimum{0.0};
+  double projection_maximum{0.0};
+};
 
 struct PoseCheckCacheEntry
 {
   std::array<
-    nav2_costmap_2d::MapLocation,
-    kMaximumCachedFootprintVertices> map_footprint{};
+    CachedFootprintPoint,
+    kMaximumCachedFootprintVertices> world_footprint{};
   std::size_t vertex_count{0u};
   bool allow_lethal{false};
+  bool allow_unknown_space{false};
   bool lethal_overlap{false};
   CertificationResult result;
 };
 
 struct CertificationWorkspace
 {
+  std::vector<geometry_msgs::msg::Point> world_footprint;
+  std::vector<PreparedFootprintAxis> footprint_axes;
   std::vector<nav2_costmap_2d::MapLocation> map_footprint;
   std::vector<nav2_costmap_2d::MapLocation> footprint_cells;
   std::vector<std::size_t> hazard_prefix_sum;
+  // Lethal and unknown cells in row-major order. Row offsets let the exact
+  // continuous-footprint test visit only hazards inside its map AABB instead
+  // of rescanning every free cell for every rollout pose.
+  std::vector<nav2_costmap_2d::MapLocation> hazard_cells;
+  std::vector<std::size_t> hazard_row_offsets;
   unsigned int hazard_size_x{0};
   unsigned int hazard_size_y{0};
   double hazard_origin_x{0.0};
   double hazard_origin_y{0.0};
   double hazard_resolution{0.0};
+  bool hazard_unknown_space_is_hazard{true};
   bool hazard_prefix_valid{false};
-  // Costmap rasterization depends only on the ordered map-cell vertices and
-  // allow-lethal mode. F-DWA's long filtered stop tails often revisit that
-  // exact discrete polygon; retaining the exact result avoids refilling the
-  // same cells without changing any collision semantics.
+  // F-DWA's long filtered stop tails often revisit an exact continuous
+  // footprint. Cache that result without merging different sub-cell poses,
+  // because occupied cells are checked as complete squares.
   std::vector<PoseCheckCacheEntry> pose_check_cache;
   std::unordered_multimap<std::size_t, std::size_t> pose_check_cache_index;
+};
+
+struct ObservationLayerCertificationWorkspaceEntry
+{
+  nav2_costmap_2d::ObstacleLayer * layer{nullptr};
+  std::string layer_name;
+  bool broadphase_prepared{false};
+  CertificationWorkspace certification;
+};
+
+struct ObservationLayerCertificationWorkspace
+{
+  // Valid only while the caller keeps the layered Costmap snapshot locked.
+  // One entry is reused by every candidate in that control cycle.
+  bool valid{false};
+  std::vector<ObservationLayerCertificationWorkspaceEntry> layers;
 };
 
 // The prefix is valid only while the caller keeps the costmap snapshot
@@ -96,10 +149,14 @@ struct CertificationWorkspace
 // control cycle and invalidates it before the next snapshot.
 bool prepare_certification_broadphase(
   const nav2_costmap_2d::Costmap2D & costmap,
-  CertificationWorkspace & workspace);
+  CertificationWorkspace & workspace,
+  bool unknown_space_is_hazard = true);
 
 void invalidate_certification_broadphase(
   CertificationWorkspace & workspace);
+
+void invalidate_observation_layer_certification_workspace(
+  ObservationLayerCertificationWorkspace & workspace);
 
 // Return true only when the transformed footprint's complete axis-aligned
 // bounds contain no lethal or unknown Costmap cell. False is inconclusive and
@@ -115,7 +172,22 @@ CertificationResult certify_pose_sequence(
   const std::vector<geometry_msgs::msg::Point> & footprint,
   const std::vector<geometry_msgs::msg::Pose2D> & poses,
   double maximum_swept_distance,
-  CertificationWorkspace * workspace = nullptr);
+  CertificationWorkspace * workspace = nullptr,
+  bool allow_unknown_space = false);
+
+// Certify the caller's hard footprint against every enabled live sensor
+// obstacle layer, independently of the fused master and StaticLayer. For a
+// bounded localization-error recovery the caller supplies its inward core;
+// the outer error band is then governed separately by non-growing overlap and
+// clearance requirements on the fused map.
+// NO_INFORMATION means the sensor layer has not marked that cell and is not a
+// sensor-observed obstacle; stale, off-map, and lethal cells remain fail-closed.
+ObservationLayerCertificationResult certify_observation_layer_sequence(
+  nav2_costmap_2d::LayeredCostmap & layered_costmap,
+  const std::vector<geometry_msgs::msg::Point> & physical_footprint,
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  double maximum_swept_distance,
+  ObservationLayerCertificationWorkspace * workspace = nullptr);
 
 // A recovery sequence may start inside only the additional certificate
 // reserve. The planning footprint must remain safe, the trajectory must reach
@@ -146,25 +218,34 @@ bool certify_initial_overlap_recovery_sequence(
   std::size_t first_required_clear_pose,
   CertificationWorkspace * workspace = nullptr);
 
-// A boundary-margin sequence is available only when the physical footprint is
-// on a lethal cell at the current pose or enters it during the first response
-// segment. A caller checking an already-issued, no-longer-changeable command
-// prefix may opt into later entry within that prefix. Lethal cells may remain
-// in the physical footprint's outer strip,
-// but the inset core must remain safe over the complete swept sequence. Later
-// entry, re-entry after clearing, unknown space, and off-costmap overlap are
-// never accepted. overlap_fraction reports
-// how much of the swept sequence used the margin so callers can prefer prompt
-// clearance without imposing a deadline that can deadlock beside a wall.
+// A boundary-margin sequence is normally available only when the padded
+// planning footprint is on a lethal cell at the current pose or enters it during the
+// first response segment. A caller may explicitly permit one later transient
+// entry. Lethal cells may remain only in the added planning strip; the inset
+// physical footprint must remain safe over the complete swept sequence. Re-entry
+// after clearing is rejected by default; an explicitly bounded localization-error
+// prefix may permit it while the inward physical core remains continuously safe.
+// Unknown space and off-costmap overlap are never accepted.
+// Optional overlap and clear-suffix bounds let nominal rollout scoring retain
+// only a short, self-clearing quantization/noise overlap. A localization-error
+// recovery can additionally require that lethal-cell penetration never grows
+// beyond its value at first contact. The less restrictive defaults preserve
+// the committed-prefix and initial-overlap semantics.
 bool certify_initial_overlap_margin_sequence(
   nav2_costmap_2d::Costmap2D & costmap,
+  const std::vector<geometry_msgs::msg::Point> & planning_footprint,
   const std::vector<geometry_msgs::msg::Point> & physical_footprint,
-  const std::vector<geometry_msgs::msg::Point> & inset_core_footprint,
   const std::vector<geometry_msgs::msg::Pose2D> & poses,
   double maximum_swept_distance,
   double * overlap_fraction = nullptr,
   CertificationWorkspace * workspace = nullptr,
-  bool allow_committed_prefix_entry = false);
+  bool allow_later_entry = false,
+  bool require_planning_clearance = false,
+  double maximum_overlap_fraction = 1.0,
+  double minimum_clear_suffix_fraction = 0.0,
+  bool require_nonincreasing_overlap_depth = false,
+  CertificationResult * physical_certificate = nullptr,
+  bool allow_reentry_after_clearance = false);
 
 const char * certification_failure_name(CertificationFailure failure);
 

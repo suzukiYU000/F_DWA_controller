@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -33,9 +34,31 @@ void PathDeviationCritic::onInit()
   nav2_util::declare_parameter_if_not_declared(
     node, prefix + "deviation_penalty",
     rclcpp::ParameterValue(1000.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "excess_distance_scale",
+    rclcpp::ParameterValue(1000.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "heading_recovery_activation_distance",
+    rclcpp::ParameterValue(1.05));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "heading_recovery_lookahead_distance",
+    rclcpp::ParameterValue(0.9));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "heading_recovery_scale",
+    rclcpp::ParameterValue(200.0));
   node->get_parameter(
     prefix + "maximum_path_distance", maximum_path_distance_);
   node->get_parameter(prefix + "deviation_penalty", deviation_penalty_);
+  node->get_parameter(
+    prefix + "excess_distance_scale", excess_distance_scale_);
+  node->get_parameter(
+    prefix + "heading_recovery_activation_distance",
+    heading_recovery_activation_distance_);
+  node->get_parameter(
+    prefix + "heading_recovery_lookahead_distance",
+    heading_recovery_lookahead_distance_);
+  node->get_parameter(
+    prefix + "heading_recovery_scale", heading_recovery_scale_);
 
   validateParameters();
 }
@@ -44,7 +67,14 @@ void PathDeviationCritic::validateParameters() const
 {
   if (!std::isfinite(maximum_path_distance_) ||
     maximum_path_distance_ < 0.0 ||
-    !std::isfinite(deviation_penalty_) || deviation_penalty_ < 0.0)
+    !std::isfinite(deviation_penalty_) || deviation_penalty_ < 0.0 ||
+    !std::isfinite(excess_distance_scale_) || excess_distance_scale_ < 0.0 ||
+    !std::isfinite(heading_recovery_activation_distance_) ||
+    heading_recovery_activation_distance_ < 0.0 ||
+    heading_recovery_activation_distance_ > maximum_path_distance_ ||
+    !std::isfinite(heading_recovery_lookahead_distance_) ||
+    heading_recovery_lookahead_distance_ < 0.0 ||
+    !std::isfinite(heading_recovery_scale_) || heading_recovery_scale_ < 0.0)
   {
     throw std::invalid_argument(
             dwb_plugin_name_ + "." + name_ +
@@ -91,25 +121,28 @@ bool PathDeviationCritic::prepare(
   return reference_path_valid_;
 }
 
-bool PathDeviationCritic::poseIsInsideCorridor(
+double PathDeviationCritic::distanceToPath(
   const geometry_msgs::msg::Pose2D & pose,
   std::size_t & segment_hint) const
 {
   if (!std::isfinite(pose.x) || !std::isfinite(pose.y) ||
     path_segments_.empty())
   {
-    return false;
+    return std::numeric_limits<double>::infinity();
   }
-  const double maximum_squared_distance =
-    maximum_path_distance_ * maximum_path_distance_;
-  const auto segment_is_within =
-    [this, &pose, maximum_squared_distance](const PathSegment & segment) {
-      if (pose.x < segment.minimum_x - maximum_path_distance_ ||
-        pose.x > segment.maximum_x + maximum_path_distance_ ||
-        pose.y < segment.minimum_y - maximum_path_distance_ ||
-        pose.y > segment.maximum_y + maximum_path_distance_)
-      {
-        return false;
+
+  double minimum_squared_distance = std::numeric_limits<double>::infinity();
+  std::size_t nearest_segment = 0u;
+  const auto consider_segment =
+    [this, &pose, &minimum_squared_distance, &nearest_segment](
+    const std::size_t index) {
+      const auto & segment = path_segments_[index];
+      const double box_dx = std::max(
+        {segment.minimum_x - pose.x, 0.0, pose.x - segment.maximum_x});
+      const double box_dy = std::max(
+        {segment.minimum_y - pose.y, 0.0, pose.y - segment.maximum_y});
+      if (box_dx * box_dx + box_dy * box_dy >= minimum_squared_distance) {
+        return;
       }
       const double along = segment.inverse_squared_length > 0.0 ?
         std::clamp(
@@ -120,26 +153,26 @@ bool PathDeviationCritic::poseIsInsideCorridor(
         pose.x - (segment.start_x + along * segment.delta_x);
       const double offset_y =
         pose.y - (segment.start_y + along * segment.delta_y);
-      return offset_x * offset_x + offset_y * offset_y <=
-             maximum_squared_distance;
+      const double squared_distance =
+        offset_x * offset_x + offset_y * offset_y;
+      if (squared_distance < minimum_squared_distance) {
+        minimum_squared_distance = squared_distance;
+        nearest_segment = index;
+      }
     };
 
   segment_hint = std::min(segment_hint, path_segments_.size() - 1u);
-  for (std::size_t index = segment_hint;
+  consider_segment(segment_hint);
+  for (std::size_t index = segment_hint + 1u;
     index < path_segments_.size(); ++index)
   {
-    if (segment_is_within(path_segments_[index])) {
-      segment_hint = index;
-      return true;
-    }
+    consider_segment(index);
   }
   for (std::size_t index = 0u; index < segment_hint; ++index) {
-    if (segment_is_within(path_segments_[index])) {
-      segment_hint = index;
-      return true;
-    }
+    consider_segment(index);
   }
-  return false;
+  segment_hint = nearest_segment;
+  return std::sqrt(minimum_squared_distance);
 }
 
 double PathDeviationCritic::scoreTrajectory(
@@ -150,12 +183,58 @@ double PathDeviationCritic::scoreTrajectory(
   }
 
   std::size_t segment_hint = 0u;
+  bool outside_corridor = false;
+  double excess_distance_sum = 0.0;
+  double terminal_distance = 0.0;
   for (const auto & pose : trajectory.poses) {
-    if (!poseIsInsideCorridor(pose, segment_hint)) {
+    const double distance = distanceToPath(pose, segment_hint);
+    if (!std::isfinite(distance)) {
       return deviation_penalty_;
     }
+    const double excess = std::max(0.0, distance - maximum_path_distance_);
+    outside_corridor = outside_corridor || excess > 0.0;
+    excess_distance_sum += excess;
+    terminal_distance = distance;
   }
-  return 0.0;
+
+  double heading_recovery_cost = 0.0;
+  const double activation_width =
+    maximum_path_distance_ - heading_recovery_activation_distance_;
+  if (activation_width > 1.0e-12 &&
+    heading_recovery_lookahead_distance_ > 0.0 &&
+    heading_recovery_scale_ > 0.0)
+  {
+    const auto & terminal_pose = trajectory.poses.back();
+    geometry_msgs::msg::Pose2D heading_probe = terminal_pose;
+    heading_probe.x += heading_recovery_lookahead_distance_ *
+      std::cos(terminal_pose.theta);
+    heading_probe.y += heading_recovery_lookahead_distance_ *
+      std::sin(terminal_pose.theta);
+    const double probe_distance = distanceToPath(heading_probe, segment_hint);
+    if (!std::isfinite(probe_distance)) {
+      return deviation_penalty_;
+    }
+    // Activate from the projected heading probe, not only after the rollout
+    // endpoint has already departed. Acceleration-, jerk-, and FIR-limited
+    // methods need this finite gradient while their endpoint is still inside
+    // the corridor so they can start a smooth turn before crossing it.
+    const double activation = std::clamp(
+      (probe_distance - heading_recovery_activation_distance_) /
+      activation_width, 0.0, 1.0);
+    const double heading_departure = std::max(
+      0.0, probe_distance - terminal_distance);
+    heading_recovery_cost =
+      heading_recovery_scale_ * activation * heading_departure;
+  }
+
+  double boundary_cost = 0.0;
+  if (outside_corridor) {
+    const double mean_excess_distance =
+      excess_distance_sum / static_cast<double>(trajectory.poses.size());
+    boundary_cost = deviation_penalty_ +
+      excess_distance_scale_ * mean_excess_distance;
+  }
+  return boundary_cost + heading_recovery_cost;
 }
 
 }  // namespace f_dwa_controller

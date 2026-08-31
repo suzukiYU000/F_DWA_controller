@@ -114,11 +114,23 @@ void FootprintClearanceCritic::onInit()
   nav2_util::declare_parameter_if_not_declared(
     node, prefix + "clearance_margin", rclcpp::ParameterValue(0.25));
   nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "localization_uncertainty_margin",
+    rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "motion_uncertainty_seconds", rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "maximum_motion_margin", rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "uniform_sequence_period", rclcpp::ParameterValue(0.05));
+  nav2_util::declare_parameter_if_not_declared(
     node, prefix + "clearance_bands", rclcpp::ParameterValue(5));
   nav2_util::declare_parameter_if_not_declared(
     node, prefix + "risk_distance", rclcpp::ParameterValue(2.5));
   nav2_util::declare_parameter_if_not_declared(
     node, prefix + "risk_seed_time", rclcpp::ParameterValue(1.4));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "risk_path_mode",
+    rclcpp::ParameterValue(std::string{"plan_continuation"}));
   nav2_util::declare_parameter_if_not_declared(
     node, prefix + "heading_relaxation_distance",
     rclcpp::ParameterValue(1.0));
@@ -138,9 +150,19 @@ void FootprintClearanceCritic::onInit()
     node, prefix + "apply_exclude_tolerance_on_aligned_grids",
     rclcpp::ParameterValue(false));
   node->get_parameter(prefix + "clearance_margin", clearance_margin_);
+  node->get_parameter(
+    prefix + "localization_uncertainty_margin",
+    localization_uncertainty_margin_);
+  node->get_parameter(
+    prefix + "motion_uncertainty_seconds", motion_uncertainty_seconds_);
+  node->get_parameter(
+    prefix + "maximum_motion_margin", maximum_motion_margin_);
+  node->get_parameter(
+    prefix + "uniform_sequence_period", uniform_sequence_period_);
   node->get_parameter(prefix + "clearance_bands", clearance_bands_);
   node->get_parameter(prefix + "risk_distance", risk_distance_);
   node->get_parameter(prefix + "risk_seed_time", risk_seed_time_);
+  node->get_parameter(prefix + "risk_path_mode", risk_path_mode_);
   node->get_parameter(
     prefix + "heading_relaxation_distance",
     heading_relaxation_distance_);
@@ -155,9 +177,18 @@ void FootprintClearanceCritic::onInit()
     prefix + "apply_exclude_tolerance_on_aligned_grids",
     apply_exclude_tolerance_on_aligned_grids_);
   if (!std::isfinite(clearance_margin_) || clearance_margin_ <= 0.0 ||
+    !std::isfinite(localization_uncertainty_margin_) ||
+    localization_uncertainty_margin_ < 0.0 ||
+    !std::isfinite(motion_uncertainty_seconds_) ||
+    motion_uncertainty_seconds_ < 0.0 ||
+    !std::isfinite(maximum_motion_margin_) || maximum_motion_margin_ < 0.0 ||
+    !std::isfinite(uniform_sequence_period_) ||
+    uniform_sequence_period_ <= 0.0 ||
     clearance_bands_ <= 0 ||
     !std::isfinite(risk_distance_) || risk_distance_ <= 1.0e-9 ||
     !std::isfinite(risk_seed_time_) || risk_seed_time_ <= 0.0 ||
+    (risk_path_mode_ != "plan_continuation" &&
+    risk_path_mode_ != "native_time") ||
     !std::isfinite(heading_relaxation_distance_) ||
     heading_relaxation_distance_ <= 0.0 ||
     !std::isfinite(sample_resolution_) || sample_resolution_ <= 0.0 ||
@@ -256,7 +287,7 @@ void FootprintClearanceCritic::refreshProjectedExclusionCostmap()
 
 bool FootprintClearanceCritic::prepare(
   const geometry_msgs::msg::Pose2D & pose,
-  const nav_2d_msgs::msg::Twist2D &,
+  const nav_2d_msgs::msg::Twist2D & velocity,
   const geometry_msgs::msg::Pose2D &,
   const nav_2d_msgs::msg::Path2D & global_plan)
 {
@@ -277,23 +308,12 @@ bool FootprintClearanceCritic::prepare(
     return false;
   }
   global_plan_ = global_plan;
-  physical_footprint_ = costmap_ros_->getRobotFootprint();
-  if (physical_footprint_.size() < 3u) {
-    return false;
-  }
-  if (!refreshFootprintBoundarySamples()) {
+  // Clearance uncertainty is defined from the measured body. Costmap padding
+  // is a separate planning reserve and must not be counted a second time.
+  if (!refreshFootprintGeometry(costmap_ros_->getUnpaddedRobotFootprint())) {
     return false;
   }
   refreshProjectedExclusionCostmap();
-  expanded_footprints_.clear();
-  expanded_footprints_.reserve(static_cast<std::size_t>(clearance_bands_));
-  for (int band = 1; band <= clearance_bands_; ++band) {
-    auto expanded = physical_footprint_;
-    const double padding = clearance_margin_ *
-      static_cast<double>(band) / static_cast<double>(clearance_bands_);
-    nav2_costmap_2d::padFootprint(expanded, padding);
-    expanded_footprints_.push_back(std::move(expanded));
-  }
   refreshPenalizedCellMask();
   prepared_ = obstacle_distance_field_.size() ==
     static_cast<std::size_t>(costmap_->getSizeInCellsX()) *
@@ -302,9 +322,17 @@ bool FootprintClearanceCritic::prepare(
     std::isfinite(pose.theta))
   {
     prepared_pose_ = pose;
-    prepared_pose_penalty_ = scorePoseClearance(pose);
+    const double prepared_sweep_speed =
+      std::hypot(velocity.x, velocity.y) +
+      maximum_physical_footprint_radius_ * std::abs(velocity.theta);
+    prepared_pose_effective_margin_ =
+      effectiveMarginForSweepSpeed(prepared_sweep_speed);
+    prepared_pose_penalty_ = scorePoseClearance(
+      pose, prepared_pose_effective_margin_,
+      &prepared_pose_directional_clearance_);
     prepared_pose_penalty_valid_ =
-      std::isfinite(prepared_pose_penalty_);
+      std::isfinite(prepared_pose_penalty_) &&
+      std::isfinite(prepared_pose_directional_clearance_);
   }
   return prepared_;
 }
@@ -371,6 +399,7 @@ bool FootprintClearanceCritic::refreshPenalizedCellMask()
       distance_field_size_y_ = 0u;
       distance_field_resolution_ =
         std::numeric_limits<double>::quiet_NaN();
+      distance_field_has_penalized_cell_ = false;
     };
   if (!costmap_) {
     invalidate_distance_field();
@@ -420,6 +449,14 @@ bool FootprintClearanceCritic::refreshPenalizedCellMask()
     }
   }
   penalized_cell_mask_scratch_.resize(cell_count);
+  const double resolution = costmap_->getResolution();
+  const bool cached_field_geometry_matches =
+    distance_field_size_x_ == size_x &&
+    distance_field_size_y_ == size_y &&
+    distance_field_resolution_ == resolution &&
+    obstacle_distance_field_.size() == cell_count &&
+    penalized_cell_mask_.size() == cell_count;
+  bool mask_changed = !cached_field_geometry_matches;
   bool has_penalized_cell = false;
   if (!exclusion_costmap_) {
     // This is the primary research configuration.  With no exclusion layer,
@@ -436,44 +473,46 @@ bool FootprintClearanceCritic::refreshPenalizedCellMask()
         source[index] == nav2_costmap_2d::LETHAL_OBSTACLE;
       penalized_cell_mask_scratch_[index] = penalized ? 1u : 0u;
       has_penalized_cell = has_penalized_cell || penalized;
+      if (!mask_changed &&
+        penalized_cell_mask_[index] != penalized_cell_mask_scratch_[index])
+      {
+        mask_changed = true;
+      }
     }
   } else {
     // Preserve the coordinate-aware compatibility path exactly when a layer
     // must be excluded, including differently registered Costmap grids.
-    std::fill(
-      penalized_cell_mask_scratch_.begin(),
-      penalized_cell_mask_scratch_.end(), 0u);
     for (unsigned int map_y = 0u; map_y < size_y; ++map_y) {
       for (unsigned int map_x = 0u; map_x < size_x; ++map_x) {
-        if (costmap_->getCost(map_x, map_y) !=
+        bool penalized = false;
+        if (costmap_->getCost(map_x, map_y) ==
           nav2_costmap_2d::LETHAL_OBSTACLE)
         {
-          continue;
+          double world_x = 0.0;
+          double world_y = 0.0;
+          costmap_->mapToWorld(map_x, map_y, world_x, world_y);
+          penalized = !excludedByStaticLayer(world_x, world_y);
         }
-        double world_x = 0.0;
-        double world_y = 0.0;
-        costmap_->mapToWorld(map_x, map_y, world_x, world_y);
-        if (!excludedByStaticLayer(world_x, world_y)) {
-          penalized_cell_mask_scratch_[
-            static_cast<std::size_t>(map_y) * size_x + map_x] = 1u;
-          has_penalized_cell = true;
+        const std::size_t index =
+          static_cast<std::size_t>(map_y) * size_x + map_x;
+        penalized_cell_mask_scratch_[index] = penalized ? 1u : 0u;
+        has_penalized_cell = has_penalized_cell || penalized;
+        if (!mask_changed &&
+          penalized_cell_mask_[index] != penalized_cell_mask_scratch_[index])
+        {
+          mask_changed = true;
         }
       }
     }
   }
 
-  const double resolution = costmap_->getResolution();
+  distance_field_has_penalized_cell_ = has_penalized_cell;
   // Exclusion is intentionally re-evaluated above on every prepare().  Only
   // the exact grid-index mask can be cached: changes in either source layer,
   // exclusion layer registration/content, grid shape, or resolution rebuild
   // the field.  Origin alone is not part of the EDT because worldToMap applies
   // the current origin before querying this grid-index field.
-  if (distance_field_size_x_ == size_x &&
-    distance_field_size_y_ == size_y &&
-    distance_field_resolution_ == resolution &&
-    obstacle_distance_field_.size() == cell_count &&
-    penalized_cell_mask_ == penalized_cell_mask_scratch_)
-  {
+  if (!mask_changed) {
     return false;
   }
 
@@ -555,6 +594,7 @@ bool FootprintClearanceCritic::refreshFootprintBoundarySamples()
 {
   footprint_boundary_samples_.clear();
   maximum_footprint_probe_gap_ = 0.0;
+  maximum_physical_footprint_radius_ = 0.0;
   if (!costmap_ || physical_footprint_.size() < 3u) {
     return false;
   }
@@ -572,6 +612,13 @@ bool FootprintClearanceCritic::refreshFootprintBoundarySamples()
     std::min(sample_resolution_, 2.0 * band_width));
   if (!std::isfinite(probe_spacing) || probe_spacing <= 0.0) {
     return false;
+  }
+  for (const auto & point : physical_footprint_) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
+      return false;
+    }
+    maximum_physical_footprint_radius_ = std::max(
+      maximum_physical_footprint_radius_, std::hypot(point.x, point.y));
   }
   for (std::size_t index = 0u; index < physical_footprint_.size(); ++index) {
     const auto & first = physical_footprint_[index];
@@ -605,6 +652,146 @@ bool FootprintClearanceCritic::refreshFootprintBoundarySamples()
   }
   return footprint_boundary_samples_.size() >= 3u &&
          maximum_footprint_probe_gap_ > 0.0;
+}
+
+bool FootprintClearanceCritic::refreshFootprintGeometry(
+  const nav2_costmap_2d::Footprint & footprint)
+{
+  if (!costmap_ || footprint.size() < 3u) {
+    footprint_geometry_cache_valid_ = false;
+    return false;
+  }
+  const double resolution = costmap_->getResolution();
+  const bool same_footprint =
+    physical_footprint_.size() == footprint.size() &&
+    std::equal(
+    physical_footprint_.begin(), physical_footprint_.end(), footprint.begin(),
+    [](const auto & first, const auto & second) {
+      return first.x == second.x && first.y == second.y && first.z == second.z;
+    });
+  if (footprint_geometry_cache_valid_ && same_footprint &&
+    footprint_geometry_resolution_ == resolution &&
+    footprint_geometry_clearance_margin_ == clearance_margin_ &&
+    footprint_geometry_sample_resolution_ == sample_resolution_ &&
+    footprint_geometry_clearance_bands_ == clearance_bands_)
+  {
+    return true;
+  }
+
+  footprint_geometry_cache_valid_ = false;
+  physical_footprint_ = footprint;
+  if (!refreshFootprintBoundarySamples()) {
+    expanded_footprints_.clear();
+    return false;
+  }
+  expanded_footprints_.clear();
+  expanded_footprints_.reserve(static_cast<std::size_t>(clearance_bands_));
+  for (int band = 1; band <= clearance_bands_; ++band) {
+    auto expanded = physical_footprint_;
+    const double padding = clearance_margin_ *
+      static_cast<double>(band) / static_cast<double>(clearance_bands_);
+    nav2_costmap_2d::padFootprint(expanded, padding);
+    expanded_footprints_.push_back(std::move(expanded));
+  }
+  footprint_geometry_resolution_ = resolution;
+  footprint_geometry_clearance_margin_ = clearance_margin_;
+  footprint_geometry_sample_resolution_ = sample_resolution_;
+  footprint_geometry_clearance_bands_ = clearance_bands_;
+  footprint_geometry_cache_valid_ = true;
+  ++footprint_geometry_rebuild_count_;
+  return true;
+}
+
+bool FootprintClearanceCritic::posePenaltyIsProvablyZero(
+  const geometry_msgs::msg::Pose2D & pose) const
+{
+  return posePenaltyIsProvablyZero(
+    pose, clearance_margin_ + localization_uncertainty_margin_);
+}
+
+bool FootprintClearanceCritic::posePenaltyIsProvablyZero(
+  const geometry_msgs::msg::Pose2D & pose,
+  const double effective_margin) const
+{
+  if (!costmap_ || footprint_boundary_samples_.empty() ||
+    obstacle_distance_field_.size() !=
+    static_cast<std::size_t>(costmap_->getSizeInCellsX()) *
+    static_cast<std::size_t>(costmap_->getSizeInCellsY()) ||
+    !std::isfinite(pose.x) || !std::isfinite(pose.y) ||
+    !std::isfinite(pose.theta) || !std::isfinite(effective_margin) ||
+    effective_margin <= 0.0 ||
+    !std::isfinite(maximum_physical_footprint_radius_) ||
+    maximum_physical_footprint_radius_ < 0.0)
+  {
+    return false;
+  }
+
+  const double resolution = costmap_->getResolution();
+  if (!std::isfinite(resolution) || resolution <= 0.0) {
+    return false;
+  }
+  const double origin_x = costmap_->getOriginX();
+  const double origin_y = costmap_->getOriginY();
+  const double maximum_x = origin_x +
+    static_cast<double>(costmap_->getSizeInCellsX()) * resolution;
+  const double maximum_y = origin_y +
+    static_cast<double>(costmap_->getSizeInCellsY()) * resolution;
+  const double coordinate_scale = std::max(
+    {1.0, std::abs(pose.x), std::abs(pose.y), std::abs(origin_x),
+      std::abs(origin_y), std::abs(maximum_x), std::abs(maximum_y),
+      maximum_physical_footprint_radius_, effective_margin});
+  const double rounding_guard = 1.0e-12 * coordinate_scale;
+  const double required_map_boundary_clearance =
+    effective_margin + rounding_guard;
+  if (pose.x - maximum_physical_footprint_radius_ - origin_x <=
+    required_map_boundary_clearance ||
+    maximum_x - pose.x - maximum_physical_footprint_radius_ <=
+    required_map_boundary_clearance ||
+    pose.y - maximum_physical_footprint_radius_ - origin_y <=
+    required_map_boundary_clearance ||
+    maximum_y - pose.y - maximum_physical_footprint_radius_ <=
+    required_map_boundary_clearance)
+  {
+    return false;
+  }
+
+  // With no source obstacle, the Costmap boundary is the only finite term in
+  // minimumFootprintClearance().  The strict boundary proof above therefore
+  // establishes the exact zero penalty without touching every boundary probe.
+  if (!distance_field_has_penalized_cell_) {
+    return true;
+  }
+
+  unsigned int cell_x = 0u;
+  unsigned int cell_y = 0u;
+  if (!costmap_->worldToMap(pose.x, pose.y, cell_x, cell_y)) {
+    return false;
+  }
+  const std::size_t field_index =
+    static_cast<std::size_t>(cell_y) * costmap_->getSizeInCellsX() + cell_x;
+  const double center_cell_distance = obstacle_distance_field_[field_index];
+  if (std::isinf(center_cell_distance) && center_cell_distance > 0.0) {
+    return true;
+  }
+  if (!std::isfinite(center_cell_distance)) {
+    return false;
+  }
+
+  const double cell_center_x = origin_x +
+    (static_cast<double>(cell_x) + 0.5) * resolution;
+  const double cell_center_y = origin_y +
+    (static_cast<double>(cell_y) + 0.5) * resolution;
+  const double center_to_cell_center = std::hypot(
+    pose.x - cell_center_x, pose.y - cell_center_y);
+  const double cell_radius = std::sqrt(0.5) * resolution;
+  // The cell-centre EDT is 1-Lipschitz.  This lower bound covers the robot
+  // centre's raster offset, every physical-footprint point, both endpoint cell
+  // offsets, the occupied cell square and the unsampled probe interval.  It is
+  // deliberately conservative: only a strict proof bypasses the exact loop.
+  const double conservative_lower_bound = center_cell_distance -
+    center_to_cell_center - maximum_physical_footprint_radius_ -
+    3.0 * cell_radius - 0.5 * maximum_footprint_probe_gap_;
+  return conservative_lower_bound > effective_margin + rounding_guard;
 }
 
 double FootprintClearanceCritic::minimumFootprintClearance(
@@ -644,7 +831,9 @@ double FootprintClearanceCritic::minimumFootprintClearance(
         world_x - origin_x, maximum_x - world_x,
         world_y - origin_y, maximum_y - world_y}));
     if (minimum_clearance <= 0.0) {
-      return 0.0;
+      // Preserve the signed map-boundary penetration for directional recovery
+      // ranking. Ordinary soft scoring below still saturates at one.
+      return minimum_clearance;
     }
     unsigned int cell_x = 0u;
     unsigned int cell_y = 0u;
@@ -671,11 +860,11 @@ double FootprintClearanceCritic::minimumFootprintClearance(
       std::sqrt(centre_dx * centre_dx + centre_dy * centre_dy) -
       obstacle_cell_radius - probe_gap_radius;
     minimum_clearance = std::min(minimum_clearance, conservative_clearance);
-    if (minimum_clearance <= 0.0) {
-      return 0.0;
-    }
   }
-  return std::max(0.0, minimum_clearance);
+  // Keep the conservative lower bound signed. This lets exceptional recovery
+  // selection distinguish moving farther into the reserve from moving out of
+  // it even while the bounded soft penalty is saturated at one.
+  return minimum_clearance;
 }
 
 bool FootprintClearanceCritic::expandedFootprintHitsLethal(
@@ -698,37 +887,164 @@ bool FootprintClearanceCritic::expandedFootprintHitsLethal(
 double FootprintClearanceCritic::scorePoseClearance(
   const geometry_msgs::msg::Pose2D & pose) const
 {
+  return scorePoseClearance(pose, clearance_margin_);
+}
+
+double FootprintClearanceCritic::scorePoseClearance(
+  const geometry_msgs::msg::Pose2D & pose,
+  const double effective_margin) const
+{
+  return scorePoseClearance(pose, effective_margin, nullptr);
+}
+
+double FootprintClearanceCritic::scorePoseClearance(
+  const geometry_msgs::msg::Pose2D & pose,
+  const double effective_margin,
+  double * directional_clearance) const
+{
+  if (directional_clearance) {
+    *directional_clearance = 0.0;
+  }
   if (expanded_footprints_.empty() ||
     !std::isfinite(pose.x) || !std::isfinite(pose.y) ||
-    !std::isfinite(pose.theta))
+    !std::isfinite(pose.theta) || !std::isfinite(effective_margin) ||
+    effective_margin <= 0.0)
   {
     return 1.0;
   }
-  const double clearance = minimumFootprintClearance(pose);
-  if (std::isinf(clearance) && clearance > 0.0) {
-    return 0.0;
-  }
-  if (!std::isfinite(clearance) || clearance <= 0.0) {
+  const double zero_penalty_margin =
+    effective_margin + localization_uncertainty_margin_;
+  if (!std::isfinite(zero_penalty_margin)) {
     return 1.0;
   }
-  if (clearance > clearance_margin_) {
+  if (posePenaltyIsProvablyZero(pose, zero_penalty_margin)) {
+    if (directional_clearance) {
+      *directional_clearance = zero_penalty_margin;
+    }
+    return 0.0;
+  }
+  const double clearance = minimumFootprintClearance(pose);
+  if (std::isinf(clearance) && clearance > 0.0) {
+    if (directional_clearance) {
+      *directional_clearance = zero_penalty_margin;
+    }
+    return 0.0;
+  }
+  if (!std::isfinite(clearance)) {
+    if (directional_clearance) {
+      *directional_clearance = -zero_penalty_margin;
+    }
+    return 1.0;
+  }
+  if (directional_clearance) {
+    *directional_clearance = std::min(clearance, zero_penalty_margin);
+  }
+  if (clearance <= 0.0) {
+    return 1.0;
+  }
+  // Extend the continuous risk interval by the configured localization bound.
+  // Subtracting the bound and clamping at zero created a flat maximum-cost
+  // plateau throughout the last uncertainty band. Once every candidate entered
+  // that plateau, the obstacle term could no longer distinguish an outward
+  // response from one approaching the measured body. Keeping one continuous
+  // slope down to physical contact preserves that ordering without turning the
+  // uncertainty band into a hard rejection in a narrow passage.
+  if (clearance >= zero_penalty_margin) {
     return 0.0;
   }
   const double remaining_fraction = std::clamp(
-    1.0 - clearance / clearance_margin_, 0.0, 1.0);
+    1.0 - clearance / zero_penalty_margin, 0.0, 1.0);
   return std::pow(remaining_fraction, penalty_power_);
 }
 
 double FootprintClearanceCritic::scorePoseClearanceWithPreparedPoseCache(
-  const geometry_msgs::msg::Pose2D & pose) const
+  const geometry_msgs::msg::Pose2D & pose,
+  const double effective_margin,
+  double * directional_clearance) const
 {
   if (prepared_pose_penalty_valid_ &&
     pose.x == prepared_pose_.x && pose.y == prepared_pose_.y &&
-    pose.theta == prepared_pose_.theta)
+    pose.theta == prepared_pose_.theta &&
+    effective_margin == prepared_pose_effective_margin_)
   {
+    if (directional_clearance) {
+      *directional_clearance = prepared_pose_directional_clearance_;
+    }
     return prepared_pose_penalty_;
   }
-  return scorePoseClearance(pose);
+  return scorePoseClearance(pose, effective_margin, directional_clearance);
+}
+
+double FootprintClearanceCritic::effectiveMarginForSweepSpeed(
+  const double sweep_speed) const
+{
+  if (!std::isfinite(sweep_speed) || sweep_speed <= 0.0 ||
+    motion_uncertainty_seconds_ <= 0.0 || maximum_motion_margin_ <= 0.0)
+  {
+    return clearance_margin_;
+  }
+  const double motion_margin = std::min(
+    maximum_motion_margin_, sweep_speed * motion_uncertainty_seconds_);
+  return clearance_margin_ + motion_margin;
+}
+
+double FootprintClearanceCritic::trajectoryEffectiveMargin(
+  const dwb_msgs::msg::Trajectory2D & trajectory) const
+{
+  const std::size_t sample_count = std::min(
+    trajectory.poses.size(), trajectory.time_offsets.size());
+  if (sample_count < 2u) {
+    return clearance_margin_;
+  }
+  const auto duration_seconds = [](const auto & duration) {
+      return static_cast<double>(duration.sec) +
+             1.0e-9 * static_cast<double>(duration.nanosec);
+    };
+  double maximum_sweep_speed = 0.0;
+  for (std::size_t index = 1u; index < sample_count; ++index) {
+    const double time_step =
+      duration_seconds(trajectory.time_offsets[index]) -
+      duration_seconds(trajectory.time_offsets[index - 1u]);
+    if (!std::isfinite(time_step) || time_step <= 1.0e-9) {
+      continue;
+    }
+    const auto & previous = trajectory.poses[index - 1u];
+    const auto & current = trajectory.poses[index];
+    const double translation = std::hypot(
+      current.x - previous.x, current.y - previous.y);
+    const double rotation = std::abs(std::remainder(
+        current.theta - previous.theta, 2.0 * M_PI));
+    const double sweep_speed =
+      (translation + maximum_physical_footprint_radius_ * rotation) /
+      time_step;
+    if (std::isfinite(sweep_speed)) {
+      maximum_sweep_speed = std::max(maximum_sweep_speed, sweep_speed);
+    }
+  }
+  return effectiveMarginForSweepSpeed(maximum_sweep_speed);
+}
+
+double FootprintClearanceCritic::uniformSequenceEffectiveMargin(
+  const std::vector<geometry_msgs::msg::Pose2D> & poses) const
+{
+  if (poses.size() < 2u) {
+    return clearance_margin_;
+  }
+  double maximum_sweep_speed = 0.0;
+  for (std::size_t index = 1u; index < poses.size(); ++index) {
+    const double translation = std::hypot(
+      poses[index].x - poses[index - 1u].x,
+      poses[index].y - poses[index - 1u].y);
+    const double rotation = std::abs(std::remainder(
+        poses[index].theta - poses[index - 1u].theta, 2.0 * M_PI));
+    const double sweep_speed =
+      (translation + maximum_physical_footprint_radius_ * rotation) /
+      uniform_sequence_period_;
+    if (std::isfinite(sweep_speed)) {
+      maximum_sweep_speed = std::max(maximum_sweep_speed, sweep_speed);
+    }
+  }
+  return effectiveMarginForSweepSpeed(maximum_sweep_speed);
 }
 
 double FootprintClearanceCritic::scoreTrajectory(
@@ -739,6 +1055,235 @@ double FootprintClearanceCritic::scoreTrajectory(
 
 double FootprintClearanceCritic::scoreTrajectoryWithApproachRisk(
   const dwb_msgs::msg::Trajectory2D & trajectory,
+  double * approach_risk)
+{
+  const auto & risk_path = buildRiskPath(trajectory);
+  return scoreTrajectoryWithPreparedRiskPathAndApproachRisk(
+    trajectory, risk_path, approach_risk);
+}
+
+bool FootprintClearanceCritic::trajectoryRecoversInitialClearance(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  const double tolerance,
+  double * initial_clearance,
+  double * terminal_clearance) const
+{
+  if (!prepared_) {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "clearance field is not prepared");
+  }
+  if (trajectory.poses.empty()) {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "executable trajectory is empty");
+  }
+  if (!std::isfinite(tolerance) || tolerance < 0.0) {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "clearance recovery tolerance must be finite and non-negative");
+  }
+
+  const double effective_margin = trajectoryEffectiveMargin(trajectory);
+  double first_directional_clearance = 0.0;
+  double final_directional_clearance = 0.0;
+  scorePoseClearanceWithPreparedPoseCache(
+    trajectory.poses.front(), effective_margin,
+    &first_directional_clearance);
+  scorePoseClearanceWithPreparedPoseCache(
+    trajectory.poses.back(), effective_margin,
+    &final_directional_clearance);
+  if (!std::isfinite(first_directional_clearance) ||
+    !std::isfinite(final_directional_clearance))
+  {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "clearance recovery endpoints are non-finite");
+  }
+  if (initial_clearance) {
+    *initial_clearance = first_directional_clearance;
+  }
+  if (terminal_clearance) {
+    *terminal_clearance = final_directional_clearance;
+  }
+  return final_directional_clearance + tolerance >=
+         first_directional_clearance;
+}
+
+bool FootprintClearanceCritic::poseSequenceRecoversInitialClearance(
+  const std::vector<geometry_msgs::msg::Pose2D> & poses,
+  const double tolerance,
+  double * initial_clearance,
+  double * terminal_clearance) const
+{
+  if (!prepared_) {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "clearance field is not prepared");
+  }
+  if (poses.empty()) {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "executable pose sequence is empty");
+  }
+  if (!std::isfinite(tolerance) || tolerance < 0.0) {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "clearance recovery tolerance must be finite and non-negative");
+  }
+
+  const double effective_margin = uniformSequenceEffectiveMargin(poses);
+  double first_directional_clearance = 0.0;
+  double final_directional_clearance = 0.0;
+  scorePoseClearanceWithPreparedPoseCache(
+    poses.front(), effective_margin, &first_directional_clearance);
+  scorePoseClearanceWithPreparedPoseCache(
+    poses.back(), effective_margin, &final_directional_clearance);
+  if (!std::isfinite(first_directional_clearance) ||
+    !std::isfinite(final_directional_clearance))
+  {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "clearance recovery endpoints are non-finite");
+  }
+  if (initial_clearance) {
+    *initial_clearance = first_directional_clearance;
+  }
+  if (terminal_clearance) {
+    *terminal_clearance = final_directional_clearance;
+  }
+  return final_directional_clearance + tolerance >=
+         first_directional_clearance;
+}
+
+bool FootprintClearanceCritic::hasEquivalentRiskPathDefinition(
+  const FootprintClearanceCritic & other) const noexcept
+{
+  const double effective_resolution = std::min(
+    sample_resolution_, 0.5 * clearance_margin_);
+  const double other_effective_resolution = std::min(
+    other.sample_resolution_, 0.5 * other.clearance_margin_);
+  if (!prepared_ || !other.prepared_ ||
+    prepared_plan_geometry_.empty() != other.prepared_plan_geometry_.empty() ||
+    risk_distance_ != other.risk_distance_ ||
+    effective_resolution != other_effective_resolution ||
+    risk_seed_time_ != other.risk_seed_time_ ||
+    risk_path_mode_ != other.risk_path_mode_ ||
+    heading_relaxation_distance_ != other.heading_relaxation_distance_ ||
+    global_plan_.poses.size() != other.global_plan_.poses.size())
+  {
+    return false;
+  }
+  for (std::size_t index = 0u; index < global_plan_.poses.size(); ++index) {
+    const auto & pose = global_plan_.poses[index];
+    const auto & other_pose = other.global_plan_.poses[index];
+    if (pose.x != other_pose.x || pose.y != other_pose.y ||
+      pose.theta != other_pose.theta)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+const std::vector<RiskPathSample> & FootprintClearanceCritic::buildRiskPath(
+  const dwb_msgs::msg::Trajectory2D & trajectory)
+{
+  if (!prepared_) {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "clearance field is not prepared");
+  }
+  if (!std::isfinite(risk_distance_) || risk_distance_ <= 1.0e-9) {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "risk_distance must be finite and greater than 1e-9");
+  }
+  if (risk_path_mode_ == "native_time") {
+    constexpr double kTimeTolerance = 1.0e-9;
+    const auto duration_seconds = [](const auto & duration) {
+        return static_cast<double>(duration.sec) +
+               1.0e-9 * static_cast<double>(duration.nanosec);
+      };
+    const std::size_t timed_pose_count = trajectory.time_offsets.size();
+    if (timed_pose_count < 2u ||
+      (trajectory.poses.size() != timed_pose_count &&
+      trajectory.poses.size() != timed_pose_count + 1u))
+    {
+      throw dwb_core::IllegalTrajectoryException(
+              name_, "native-time risk path has an unsupported Nav2 layout");
+    }
+
+    native_time_risk_path_workspace_.clear();
+    native_time_risk_path_workspace_.reserve(timed_pose_count + 1u);
+    double previous_time = 0.0;
+    for (std::size_t index = 0u; index < timed_pose_count; ++index) {
+      const double pose_time = duration_seconds(trajectory.time_offsets[index]);
+      const auto & pose = trajectory.poses[index];
+      if (!std::isfinite(pose_time) || pose_time < -kTimeTolerance ||
+        !std::isfinite(pose.x) || !std::isfinite(pose.y) ||
+        !std::isfinite(pose.theta) ||
+        (index == 0u && std::abs(pose_time) > kTimeTolerance) ||
+        (index > 0u && pose_time <= previous_time + kTimeTolerance))
+      {
+        throw dwb_core::IllegalTrajectoryException(
+                name_, "native-time risk path requires finite increasing samples");
+      }
+      if (pose_time < risk_seed_time_ - kTimeTolerance) {
+        native_time_risk_path_workspace_.push_back(
+          RiskPathSample{pose, risk_distance_ * pose_time / risk_seed_time_});
+        previous_time = pose_time;
+        continue;
+      }
+      if (std::abs(pose_time - risk_seed_time_) <= kTimeTolerance) {
+        native_time_risk_path_workspace_.push_back(
+          RiskPathSample{pose, risk_distance_});
+        return native_time_risk_path_workspace_;
+      }
+      if (index == 0u || native_time_risk_path_workspace_.empty()) {
+        throw dwb_core::IllegalTrajectoryException(
+                name_, "native-time risk seed precedes the first pose");
+      }
+      const double interval = pose_time - previous_time;
+      const double ratio = std::clamp(
+        (risk_seed_time_ - previous_time) / interval, 0.0, 1.0);
+      const auto & first = trajectory.poses[index - 1u];
+      geometry_msgs::msg::Pose2D interpolated;
+      interpolated.x = first.x + ratio * (pose.x - first.x);
+      interpolated.y = first.y + ratio * (pose.y - first.y);
+      interpolated.theta = first.theta + ratio * std::remainder(
+        pose.theta - first.theta, 2.0 * M_PI);
+      native_time_risk_path_workspace_.push_back(
+        RiskPathSample{interpolated, risk_distance_});
+      return native_time_risk_path_workspace_;
+    }
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "trajectory does not reach native-time risk seed");
+  }
+  // This is a soft margin, not the physical collision gate.  Sampling at the
+  // 0.025 m Costmap cell size made a 2.5 m probe evaluate 101 poses for every
+  // candidate.  Bound the spatial gap by half the configured clearance band
+  // instead: an obstacle entering the 0.25 m soft margin is then at most one
+  // half-gap from a probe, while HorizonObstacleFootprintCritic continues its
+  // independent 0.0125 m hard swept-footprint check.
+  const double effective_resolution = std::min(
+    sample_resolution_, 0.5 * clearance_margin_);
+  return [this, &trajectory, effective_resolution]()
+         -> const std::vector<RiskPathSample> &
+         {
+           try {
+             if (!prepared_plan_geometry_.empty()) {
+               return build_plan_continued_risk_path(
+            trajectory, prepared_plan_geometry_, risk_distance_,
+            effective_resolution, risk_seed_time_,
+            heading_relaxation_distance_, risk_path_workspace_);
+             }
+        // Compatibility for derived tests which directly seed global_plan_.
+        // Production prepare() always builds the cache before scoring.
+             return build_plan_continued_risk_path(
+          trajectory, global_plan_, risk_distance_, effective_resolution,
+          risk_seed_time_, heading_relaxation_distance_,
+          risk_path_workspace_);
+           } catch (const std::invalid_argument & exception) {
+             throw dwb_core::IllegalTrajectoryException(name_, exception.what());
+           }
+         }();
+}
+
+double
+FootprintClearanceCritic::scoreTrajectoryWithPreparedRiskPathAndApproachRisk(
+  const dwb_msgs::msg::Trajectory2D & trajectory,
+  const std::vector<RiskPathSample> & risk_path,
   double * approach_risk)
 {
   if (approach_risk) {
@@ -760,46 +1305,20 @@ double FootprintClearanceCritic::scoreTrajectoryWithApproachRisk(
   // Retain a configurable peak component so a short future encounter is not
   // diluted by the otherwise-clear soft horizon.
   double maximum_penalty = 0.0;
-  // This is a soft margin, not the physical collision gate.  Sampling at the
-  // 0.025 m Costmap cell size made a 2.5 m probe evaluate 101 poses for every
-  // candidate.  Bound the spatial gap by half the configured clearance band
-  // instead: an obstacle entering the 0.25 m soft margin is then at most one
-  // half-gap from a probe, while HorizonObstacleFootprintCritic continues its
-  // independent 0.0125 m hard swept-footprint check.
-  const double effective_resolution = std::min(
-    sample_resolution_, 0.5 * clearance_margin_);
-  const auto & risk_path = [this, &trajectory, effective_resolution]()
-    -> const std::vector<RiskPathSample> &
-    {
-      try {
-        if (!prepared_plan_geometry_.empty()) {
-          return build_plan_continued_risk_path(
-            trajectory, prepared_plan_geometry_, risk_distance_,
-            effective_resolution, risk_seed_time_,
-            heading_relaxation_distance_, risk_path_workspace_);
-        }
-        // Compatibility for derived tests which directly seed global_plan_.
-        // Production prepare() always builds the cache before scoring.
-        return build_plan_continued_risk_path(
-          trajectory, global_plan_, risk_distance_, effective_resolution,
-          risk_seed_time_, heading_relaxation_distance_,
-          risk_path_workspace_);
-      } catch (const std::invalid_argument & exception) {
-        throw dwb_core::IllegalTrajectoryException(name_, exception.what());
-      }
-    }();
   if (risk_path.size() < 2u) {
     throw dwb_core::IllegalTrajectoryException(
             name_, "fixed-distance clearance path is incomplete");
   }
 
+  const double effective_margin = trajectoryEffectiveMargin(trajectory);
   double previous_penalty =
-    scorePoseClearanceWithPreparedPoseCache(risk_path.front().pose);
+    scorePoseClearanceWithPreparedPoseCache(
+    risk_path.front().pose, effective_margin);
   maximum_penalty = previous_penalty;
   double exposure_integral = 0.0;
   for (std::size_t index = 1u; index < risk_path.size(); ++index) {
     const double penalty = scorePoseClearanceWithPreparedPoseCache(
-      risk_path[index].pose);
+      risk_path[index].pose, effective_margin);
     maximum_penalty = std::max(maximum_penalty, penalty);
     const double interval =
       risk_path[index].arc_length - risk_path[index - 1u].arc_length;
@@ -821,27 +1340,35 @@ double FootprintClearanceCritic::scoreTrajectoryWithApproachRisk(
     // the avoidance hierarchy active over the entire route.
     constexpr double kTimeTolerance = 1.0e-9;
     constexpr double kAngularSampleResolution = 0.10;
-    double minimum_candidate_penalty =
-      scorePoseClearanceWithPreparedPoseCache(trajectory.poses.front());
+    const double effective_resolution = std::min(
+      sample_resolution_, 0.5 * clearance_margin_);
+    const double directional_scale =
+      effective_margin + localization_uncertainty_margin_;
+    double maximum_candidate_clearance = 0.0;
+    scorePoseClearanceWithPreparedPoseCache(
+      trajectory.poses.front(), effective_margin,
+      &maximum_candidate_clearance);
     double maximum_approach_risk = 0.0;
     geometry_msgs::msg::Pose2D previous_sample = trajectory.poses.front();
     const auto update_approach =
-      [this, &minimum_candidate_penalty, &maximum_approach_risk,
+      [this, effective_margin, directional_scale,
+        &maximum_candidate_clearance,
+        &maximum_approach_risk,
         &previous_sample](const geometry_msgs::msg::Pose2D & pose)
       {
-        const double penalty = scorePoseClearanceWithPreparedPoseCache(pose);
-        if (penalty > minimum_candidate_penalty) {
-          const double available_increase = std::max(
-            1.0 - minimum_candidate_penalty, 1.0e-9);
+        double directional_clearance = 0.0;
+        scorePoseClearanceWithPreparedPoseCache(
+          pose, effective_margin, &directional_clearance);
+        if (directional_clearance < maximum_candidate_clearance) {
           maximum_approach_risk = std::max(
             maximum_approach_risk,
             std::clamp(
-              (penalty - minimum_candidate_penalty) /
-              available_increase,
+              (maximum_candidate_clearance - directional_clearance) /
+              directional_scale,
               0.0, 1.0));
         }
-        minimum_candidate_penalty = std::min(
-          minimum_candidate_penalty, penalty);
+        maximum_candidate_clearance = std::max(
+          maximum_candidate_clearance, directional_clearance);
         previous_sample = pose;
       };
     const std::size_t timed_pose_count = trajectory.time_offsets.size();
@@ -907,32 +1434,70 @@ double FootprintClearanceCritic::scoreUniformPoseSequenceWithApproachRisk(
             name_, "executable pose sequence is empty");
   }
 
-  double previous_penalty =
-    scorePoseClearanceWithPreparedPoseCache(poses.front());
-  double minimum_penalty = previous_penalty;
+  const double effective_margin = uniformSequenceEffectiveMargin(poses);
+  const double directional_scale =
+    effective_margin + localization_uncertainty_margin_;
+  double previous_directional_clearance = 0.0;
+  double previous_penalty = scorePoseClearanceWithPreparedPoseCache(
+    poses.front(), effective_margin, &previous_directional_clearance);
+  double maximum_directional_clearance = previous_directional_clearance;
   double maximum_penalty = previous_penalty;
   double maximum_approach_risk = 0.0;
   double exposure_sum = 0.0;
+  constexpr double kAngularSampleResolution = 0.10;
+  const double effective_resolution = std::min(
+    sample_resolution_, 0.5 * clearance_margin_);
+  // Stop admissibility checks every input pose separately. This soft ranking
+  // path may therefore use the configured spatial/angular resolution and
+  // retain the original time exposure through interval-count weighting.
+  std::size_t previous_sample_index = 0u;
+  geometry_msgs::msg::Pose2D previous_pose = poses.front();
+  geometry_msgs::msg::Pose2D previous_sample_pose = poses.front();
+  double accumulated_translation = 0.0;
+  double accumulated_rotation = 0.0;
   for (std::size_t index = 1u; index < poses.size(); ++index) {
+    accumulated_translation += std::hypot(
+      poses[index].x - previous_pose.x,
+      poses[index].y - previous_pose.y);
+    accumulated_rotation += std::abs(std::remainder(
+        poses[index].theta - previous_pose.theta, 2.0 * M_PI));
+    previous_pose = poses[index];
+    const bool final_pose = index + 1u == poses.size();
+    if (!final_pose &&
+      accumulated_translation < effective_resolution - 1.0e-12 &&
+      accumulated_rotation < kAngularSampleResolution - 1.0e-12)
+    {
+      continue;
+    }
     const bool repeats_previous_pose =
-      poses[index].x == poses[index - 1u].x &&
-      poses[index].y == poses[index - 1u].y &&
-      poses[index].theta == poses[index - 1u].theta;
+      poses[index].x == previous_sample_pose.x &&
+      poses[index].y == previous_sample_pose.y &&
+      poses[index].theta == previous_sample_pose.theta;
+    double directional_clearance = previous_directional_clearance;
     const double penalty = repeats_previous_pose ? previous_penalty :
-      scorePoseClearanceWithPreparedPoseCache(poses[index]);
+      scorePoseClearanceWithPreparedPoseCache(
+      poses[index], effective_margin, &directional_clearance);
     maximum_penalty = std::max(maximum_penalty, penalty);
-    exposure_sum += 0.5 * (previous_penalty + penalty);
-    if (penalty > minimum_penalty) {
-      const double available_increase = std::max(
-        1.0 - minimum_penalty, 1.0e-9);
+    const double interval_count = static_cast<double>(
+      index - previous_sample_index);
+    exposure_sum +=
+      0.5 * interval_count * (previous_penalty + penalty);
+    if (directional_clearance < maximum_directional_clearance) {
       maximum_approach_risk = std::max(
         maximum_approach_risk,
         std::clamp(
-          (penalty - minimum_penalty) / available_increase,
+          (maximum_directional_clearance - directional_clearance) /
+          directional_scale,
           0.0, 1.0));
     }
-    minimum_penalty = std::min(minimum_penalty, penalty);
+    maximum_directional_clearance = std::max(
+      maximum_directional_clearance, directional_clearance);
     previous_penalty = penalty;
+    previous_directional_clearance = directional_clearance;
+    previous_sample_index = index;
+    previous_sample_pose = poses[index];
+    accumulated_translation = 0.0;
+    accumulated_rotation = 0.0;
   }
   if (approach_risk) {
     *approach_risk = maximum_approach_risk;

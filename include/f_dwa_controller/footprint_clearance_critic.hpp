@@ -9,6 +9,7 @@
 #define F_DWA_CONTROLLER__FOOTPRINT_CLEARANCE_CRITIC_HPP_
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <utility>
@@ -61,14 +62,45 @@ public:
   /**
    * @brief Score clearance and report whether the footprint moves closer.
    *
-   * The returned score is identical to scoreTrajectory(). approach_risk is a
-   * bounded [0, 1] increase from the best clearance already reached along the
-   * fixed-distance risk path. A constant parallel-wall clearance therefore
-   * reports zero while a future side or corner encounter reports a positive
-   * value.
+   * The returned score is identical to scoreTrajectory(). approach_risk is the
+   * bounded [0, 1] loss of signed conservative clearance from the best point
+   * already reached along the executable prefix. A constant parallel-wall
+   * clearance therefore reports zero, while deeper entry remains visible even
+   * after the ordinary soft score has saturated at one.
    */
   double scoreTrajectoryWithApproachRisk(
     const dwb_msgs::msg::Trajectory2D & trajectory,
+    double * approach_risk);
+
+  /**
+   * @brief Whether two critics build the same fixed-distance risk path.
+   *
+   * This deliberately compares every path-construction input exactly.  It
+   * does not compare either critic's Costmap or clearance parameters because
+   * those affect scoring after the shared path has been built.
+   */
+  bool hasEquivalentRiskPathDefinition(
+    const FootprintClearanceCritic & other) const noexcept;
+
+  /**
+   * @brief Build this critic's risk path in its reusable workspace.
+   *
+   * The returned reference remains valid until this critic builds another
+   * risk path.  It can be scored by another critic only when
+   * hasEquivalentRiskPathDefinition() is true.
+   */
+  const std::vector<RiskPathSample> & buildRiskPath(
+    const dwb_msgs::msg::Trajectory2D & trajectory);
+
+  /**
+   * @brief Score an already-built equivalent risk path.
+   *
+   * Candidate-prefix approach risk is still calculated with this critic's
+   * own distance field.  Only path construction is shared.
+   */
+  double scoreTrajectoryWithPreparedRiskPathAndApproachRisk(
+    const dwb_msgs::msg::Trajectory2D & trajectory,
+    const std::vector<RiskPathSample> & risk_path,
     double * approach_risk);
 
   /**
@@ -85,6 +117,43 @@ public:
     const std::vector<geometry_msgs::msg::Pose2D> & poses,
     double * approach_risk);
 
+  /**
+   * @brief Whether a complete executable rollout recovers its initial clearance.
+   *
+   * This compares signed conservative physical-footprint clearance at the
+   * first and final poses with one effective soft margin for the whole
+   * rollout. It does not certify collision safety; callers must first pass the
+   * independent hard ObstacleFootprint rollout and complete-stop checks. The
+   * result lets a hard-legal avoidance rollout enter localization uncertainty
+   * temporarily only when its full method-native horizon exits at least as
+   * far from obstacles as it started.
+   */
+  bool trajectoryRecoversInitialClearance(
+    const dwb_msgs::msg::Trajectory2D & trajectory,
+    double tolerance,
+    double * initial_clearance = nullptr,
+    double * terminal_clearance = nullptr) const;
+
+  /**
+   * @brief Whether a uniformly timed executable stop recovers initial clearance.
+   *
+   * The caller must independently certify the complete sequence with the
+   * physical footprint. This endpoint test uses the same speed-dependent soft
+   * margin as scoreUniformPoseSequenceWithApproachRisk(), allowing temporary
+   * localization-margin exposure only when the method-native stop finishes no
+   * closer to an obstacle than it started.
+   */
+  bool poseSequenceRecoversInitialClearance(
+    const std::vector<geometry_msgs::msg::Pose2D> & poses,
+    double tolerance,
+    double * initial_clearance = nullptr,
+    double * terminal_clearance = nullptr) const;
+
+  double localizationUncertaintyMargin() const noexcept
+  {
+    return localization_uncertainty_margin_;
+  }
+
 protected:
   bool excludedByStaticLayer(double world_x, double world_y) const;
 
@@ -93,6 +162,16 @@ protected:
   bool refreshPenalizedCellMask();
 
   bool refreshFootprintBoundarySamples();
+
+  bool refreshFootprintGeometry(
+    const nav2_costmap_2d::Footprint & footprint);
+
+  bool posePenaltyIsProvablyZero(
+    const geometry_msgs::msg::Pose2D & pose) const;
+
+  bool posePenaltyIsProvablyZero(
+    const geometry_msgs::msg::Pose2D & pose,
+    double effective_margin) const;
 
   virtual double minimumFootprintClearance(
     const geometry_msgs::msg::Pose2D & pose) const;
@@ -104,8 +183,27 @@ protected:
   double scorePoseClearance(
     const geometry_msgs::msg::Pose2D & pose) const;
 
+  double scorePoseClearance(
+    const geometry_msgs::msg::Pose2D & pose,
+    double effective_margin) const;
+
+  double scorePoseClearance(
+    const geometry_msgs::msg::Pose2D & pose,
+    double effective_margin,
+    double * directional_clearance) const;
+
   double scorePoseClearanceWithPreparedPoseCache(
-    const geometry_msgs::msg::Pose2D & pose) const;
+    const geometry_msgs::msg::Pose2D & pose,
+    double effective_margin,
+    double * directional_clearance = nullptr) const;
+
+  double trajectoryEffectiveMargin(
+    const dwb_msgs::msg::Trajectory2D & trajectory) const;
+
+  double uniformSequenceEffectiveMargin(
+    const std::vector<geometry_msgs::msg::Pose2D> & poses) const;
+
+  double effectiveMarginForSweepSpeed(double sweep_speed) const;
 
   nav2_costmap_2d::Costmap2D * costmap_{nullptr};
   nav2_costmap_2d::Costmap2D * exclusion_costmap_{nullptr};
@@ -115,6 +213,7 @@ protected:
   nav_2d_msgs::msg::Path2D global_plan_;
   PreparedPlanGeometry prepared_plan_geometry_;
   RiskPathWorkspace risk_path_workspace_;
+  std::vector<RiskPathSample> native_time_risk_path_workspace_;
   std::string source_layer_;
   std::string exclude_layer_;
   nav2_costmap_2d::Footprint physical_footprint_;
@@ -144,16 +243,42 @@ protected:
   unsigned int distance_field_size_y_{0u};
   double distance_field_resolution_{
     std::numeric_limits<double>::quiet_NaN()};
+  bool distance_field_has_penalized_cell_{false};
   double maximum_footprint_probe_gap_{0.0};
+  double maximum_physical_footprint_radius_{0.0};
+  bool footprint_geometry_cache_valid_{false};
+  double footprint_geometry_resolution_{
+    std::numeric_limits<double>::quiet_NaN()};
+  double footprint_geometry_clearance_margin_{
+    std::numeric_limits<double>::quiet_NaN()};
+  double footprint_geometry_sample_resolution_{
+    std::numeric_limits<double>::quiet_NaN()};
+  int footprint_geometry_clearance_bands_{0};
+  std::uint64_t footprint_geometry_rebuild_count_{0u};
   bool prepared_{false};
   geometry_msgs::msg::Pose2D prepared_pose_;
   double prepared_pose_penalty_{1.0};
+  double prepared_pose_directional_clearance_{0.0};
+  double prepared_pose_effective_margin_{0.0};
   bool prepared_pose_penalty_valid_{false};
   double clearance_margin_{0.25};
+  // Worst-case translational localization error. Clearance inside this band
+  // receives maximum soft risk, but remains selectable until the independent
+  // physical-footprint critic reports an actual collision.
+  double localization_uncertainty_margin_{0.0};
+  // The hard footprint remains unchanged. This bounded extra soft margin
+  // covers motion during measured transport/localization timing uncertainty.
+  double motion_uncertainty_seconds_{0.0};
+  double maximum_motion_margin_{0.0};
+  double uniform_sequence_period_{0.05};
   double exclude_layer_tolerance_{0.0};
   bool apply_exclude_tolerance_on_aligned_grids_{false};
   double risk_distance_{2.5};
   double risk_seed_time_{1.4};
+  // plan_continuation preserves the historical fixed-distance terminal probe.
+  // native_time scores only the method-native executable prediction over the
+  // common risk_seed_time horizon and never projects it back onto the Path.
+  std::string risk_path_mode_{"plan_continuation"};
   double heading_relaxation_distance_{1.0};
   double sample_resolution_{0.10};
   double peak_weight_{0.5};

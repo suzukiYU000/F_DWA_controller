@@ -645,6 +645,50 @@ public:
       minimum_heading_progress);
   }
 
+  static bool has_observable_motion(
+    const dwb_msgs::msg::Trajectory2D & trajectory,
+    const double minimum_translation,
+    const double minimum_rotation)
+  {
+    return trajectory_has_observable_motion(
+      trajectory, minimum_translation, minimum_rotation);
+  }
+
+  static bool executable_progress(
+    const bool stop_translation,
+    const bool rollout_translation,
+    const bool stop_heading,
+    const bool rollout_heading,
+    const bool stop_heading_motion)
+  {
+    return receding_horizon_progress_is_executable(
+      stop_translation, rollout_translation, stop_heading, rollout_heading,
+      stop_heading_motion);
+  }
+
+  static bool has_observable_rotation(
+    const std::vector<geometry_msgs::msg::Pose2D> & poses,
+    const double minimum_rotation)
+  {
+    return pose_sequence_has_observable_rotation(poses, minimum_rotation);
+  }
+
+  static bool has_observable_translation(
+    const std::vector<geometry_msgs::msg::Pose2D> & poses,
+    const double minimum_translation)
+  {
+    return pose_sequence_has_observable_translation(
+      poses, minimum_translation);
+  }
+
+  static bool preserves_turn(
+    const double candidate_angular_velocity,
+    const double established_angular_velocity)
+  {
+    return preserves_established_turn_direction(
+      candidate_angular_velocity, established_angular_velocity);
+  }
+
   static bool terminal_plan_fallback(
     const geometry_msgs::msg::Pose2D & pose,
     const geometry_msgs::msg::Pose2D & terminal_pose,
@@ -662,6 +706,18 @@ public:
     const double stop_velocity_threshold)
   {
     return terminal_goal_hold_is_applicable(
+      pose, goal_pose, capture_distance, velocity,
+      stop_velocity_threshold);
+  }
+
+  static bool terminal_goal_resume(
+    const geometry_msgs::msg::Pose2D & pose,
+    const geometry_msgs::msg::Pose2D & goal_pose,
+    const double capture_distance,
+    const nav_2d_msgs::msg::Twist2D & velocity,
+    const double stop_velocity_threshold)
+  {
+    return terminal_goal_resume_is_applicable(
       pose, goal_pose, capture_distance, velocity,
       stop_velocity_threshold);
   }
@@ -717,6 +773,80 @@ public:
       candidate_collision_time, best_collision_time,
       candidate_clearance_risk, best_clearance_risk,
       candidate_path_departure_cost, best_path_departure_cost,
+      candidate_index, best_index);
+  }
+
+  static bool recovery_preserves_uncertainty_reserve(
+    const double collision_time,
+    const uint64_t clearance_guard_bucket,
+    const double approach_risk,
+    const double maximum_approach_risk,
+    const double minimum_collision_horizon)
+  {
+    return recovery_candidate_preserves_uncertainty_reserve(
+      collision_time, clearance_guard_bucket, approach_risk,
+      maximum_approach_risk, minimum_collision_horizon);
+  }
+
+  using ProgressRank = ProgressEscapeRank;
+
+  static double reserve_approach_limit(
+    const bool recovers_initial_clearance)
+  {
+    return uncertainty_reserve_approach_limit(
+      recovers_initial_clearance);
+  }
+
+  static bool consumes_reserve(
+    const double initial_clearance,
+    const double terminal_clearance,
+    const double uncertainty_margin,
+    const double tolerance)
+  {
+    return consumes_uncertainty_reserve(
+      initial_clearance, terminal_clearance, uncertainty_margin, tolerance);
+  }
+
+  static bool progress_escape_prefers(
+    const ProgressRank & candidate,
+    const ProgressRank & best)
+  {
+    return progress_escape_prefers_candidate(candidate, best);
+  }
+
+  static bool progress_escape_replaces_weighted_winner(
+    const bool candidate_found,
+    const bool selected_progress_was_evaluated,
+    const bool selected_has_receding_horizon_progress)
+  {
+    return progress_escape_should_replace_weighted_winner(
+      candidate_found, selected_progress_was_evaluated,
+      selected_has_receding_horizon_progress);
+  }
+
+  static bool legal_escape_prefers_candidate(
+    const uint64_t candidate_guard_bucket,
+    const uint64_t best_guard_bucket,
+    const uint64_t candidate_risk_bucket,
+    const uint64_t best_risk_bucket,
+    const double candidate_approach_risk,
+    const double best_approach_risk,
+    const bool candidate_preserves_turn_direction,
+    const bool best_preserves_turn_direction,
+    const double candidate_heading_excursion,
+    const double best_heading_excursion,
+    const double candidate_translation_distance,
+    const double best_translation_distance,
+    const std::size_t candidate_index,
+    const std::size_t best_index)
+  {
+    return legal_avoidance_escape_prefers_candidate(
+      candidate_guard_bucket, best_guard_bucket,
+      candidate_risk_bucket, best_risk_bucket,
+      candidate_approach_risk, best_approach_risk,
+      candidate_preserves_turn_direction, best_preserves_turn_direction,
+      candidate_heading_excursion, best_heading_excursion,
+      candidate_translation_distance, best_translation_distance,
       candidate_index, best_index);
   }
 
@@ -1334,7 +1464,7 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
-  ClearanceConstraintUsesProgressOnlyAfterRiskAndWeightedScoreTie)
+  ClearanceConstraintRanksGoalProgressBeforeWeightedScoreWithinRiskBand)
 {
   EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
       true, false, 8u, 3u, 140.0, 100.0, 8u, 9u));
@@ -1348,8 +1478,10 @@ TEST_F(
       true, true, 7u, 8u, 150.0, 140.0, 8u, 9u));
   EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
       true, true, 9u, 8u, 100.0, 140.0, 8u, 9u));
-  EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
+  EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
       true, false, 0u, 0u, 175.58, 113.35, 127u, 74u));
+  EXPECT_FALSE(ScorePlannerAdapter::clearance_prefers_candidate(
+      false, true, 0u, 0u, 80.0, 140.0, 8u, 9u));
   EXPECT_TRUE(ScorePlannerAdapter::clearance_prefers_candidate(
       true, false, 0u, 0u, 100.0, 100.0, 8u, 9u));
 }
@@ -1420,6 +1552,97 @@ TEST_F(
   trajectory.poses[2u].theta = 0.60;
   EXPECT_FALSE(ScorePlannerAdapter::has_meaningful_subgoal_progress(
       trajectory, path, subgoal, 0.10, 0.15));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  AvoidanceMotionUsesTheCompleteNativeRollout)
+{
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.velocity.x = 6.0e-5;
+  trajectory.velocity.theta = 1.0e-3;
+  trajectory.poses.resize(3u);
+
+  EXPECT_FALSE(ScorePlannerAdapter::has_observable_motion(
+      trajectory, 5.0e-4, 5.0e-4));
+
+  trajectory.poses[1u].theta = 2.0e-4;
+  trajectory.poses[2u].theta = 0.70;
+  EXPECT_TRUE(ScorePlannerAdapter::has_observable_motion(
+      trajectory, 5.0e-4, 5.0e-4));
+
+  trajectory.poses[2u].theta = 0.0;
+  trajectory.poses[1u].x = 0.01;
+  EXPECT_TRUE(ScorePlannerAdapter::has_observable_motion(
+      trajectory, 5.0e-4, 5.0e-4));
+
+  trajectory.poses[1u].x = 0.0;
+  trajectory.poses[2u].x = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(ScorePlannerAdapter::has_observable_motion(
+      trajectory, 5.0e-4, 5.0e-4));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  HeadingOnlyRecoveryRequiresExecutableStopEvidence)
+{
+  EXPECT_FALSE(ScorePlannerAdapter::executable_progress(
+      false, false, false, true, false));
+  EXPECT_TRUE(ScorePlannerAdapter::executable_progress(
+      false, false, false, true, true));
+  EXPECT_TRUE(ScorePlannerAdapter::executable_progress(
+      false, false, true, false, false));
+  EXPECT_TRUE(ScorePlannerAdapter::executable_progress(
+      false, true, false, false, false));
+  EXPECT_TRUE(ScorePlannerAdapter::executable_progress(
+      true, false, false, false, false));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  StopSequenceRotationMustBeFiniteAndObservable)
+{
+  std::vector<geometry_msgs::msg::Pose2D> poses(3u);
+  poses[1u].theta = 2.0e-4;
+  poses[2u].theta = -7.0e-4;
+  EXPECT_TRUE(ScorePlannerAdapter::has_observable_rotation(poses, 5.0e-4));
+
+  poses[2u].theta = -4.0e-4;
+  EXPECT_FALSE(ScorePlannerAdapter::has_observable_rotation(poses, 5.0e-4));
+  poses[2u].theta = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(ScorePlannerAdapter::has_observable_rotation(poses, 5.0e-4));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  StopSequenceTranslationSeparatesApproachFromInPlaceRotation)
+{
+  std::vector<geometry_msgs::msg::Pose2D> poses(3u);
+  poses[1u].theta = -0.02;
+  poses[2u].theta = -0.10;
+  EXPECT_FALSE(ScorePlannerAdapter::has_observable_translation(
+      poses, 5.0e-4));
+
+  poses[1u].x = 2.0e-4;
+  poses[2u].x = 7.0e-4;
+  EXPECT_TRUE(ScorePlannerAdapter::has_observable_translation(
+      poses, 5.0e-4));
+
+  poses[2u].x = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(ScorePlannerAdapter::has_observable_translation(
+      poses, 5.0e-4));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ExceptionalAvoidanceRetainsAnEstablishedTurnDirection)
+{
+  EXPECT_TRUE(ScorePlannerAdapter::preserves_turn(-0.001, 0.0));
+  EXPECT_TRUE(ScorePlannerAdapter::preserves_turn(-0.001, -1.0e-6));
+  EXPECT_FALSE(ScorePlannerAdapter::preserves_turn(0.001, -1.0e-6));
+  EXPECT_TRUE(ScorePlannerAdapter::preserves_turn(0.0, -1.0e-6));
+  EXPECT_FALSE(ScorePlannerAdapter::preserves_turn(
+      std::numeric_limits<double>::quiet_NaN(), 0.1));
 }
 
 TEST_F(
@@ -1514,6 +1737,30 @@ TEST_F(
   stopped_pose.x = goal_pose.x - 0.250001;
   EXPECT_FALSE(ScorePlannerAdapter::terminal_goal_hold(
       stopped_pose, goal_pose, 0.25, velocity, 0.01));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  TerminalGoalResumeRequiresClearedMotionOutsideTolerance)
+{
+  geometry_msgs::msg::Pose2D goal_pose;
+  goal_pose.x = 5.0;
+  geometry_msgs::msg::Pose2D stopped_pose = goal_pose;
+  stopped_pose.x -= 0.250001;
+  nav_2d_msgs::msg::Twist2D velocity;
+
+  EXPECT_TRUE(ScorePlannerAdapter::terminal_goal_resume(
+      stopped_pose, goal_pose, 0.25, velocity, 0.01));
+  stopped_pose.x = goal_pose.x - 0.25;
+  EXPECT_FALSE(ScorePlannerAdapter::terminal_goal_resume(
+      stopped_pose, goal_pose, 0.25, velocity, 0.01));
+  stopped_pose.x = goal_pose.x - 0.250001;
+  velocity.x = 0.010001;
+  EXPECT_FALSE(ScorePlannerAdapter::terminal_goal_resume(
+      stopped_pose, goal_pose, 0.25, velocity, 0.01));
+  velocity.x = 0.0;
+  EXPECT_FALSE(ScorePlannerAdapter::terminal_goal_resume(
+      stopped_pose, goal_pose, 0.0, velocity, 0.01));
 }
 
 TEST_F(
@@ -3405,6 +3652,196 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
+  RecoveryReserveAllowsOnlyRoundoffAtHighRisk)
+{
+  constexpr double minimum_horizon = 0.17;
+  constexpr double maximum_approach_risk = 1.0e-9;
+  EXPECT_TRUE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      std::numeric_limits<double>::infinity(), 50u, 0.0,
+      maximum_approach_risk, minimum_horizon));
+  EXPECT_FALSE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      std::numeric_limits<double>::infinity(), 50u, 1.0e-8,
+      maximum_approach_risk, minimum_horizon));
+  EXPECT_TRUE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      std::numeric_limits<double>::infinity(), 50u, 0.004,
+      0.005, minimum_horizon));
+  EXPECT_FALSE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      std::numeric_limits<double>::infinity(), 50u, 0.006,
+      0.005, minimum_horizon));
+  EXPECT_TRUE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      minimum_horizon, 0u, 1.0, maximum_approach_risk, minimum_horizon));
+  EXPECT_TRUE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      minimum_horizon, 1u, maximum_approach_risk,
+      maximum_approach_risk, minimum_horizon));
+  EXPECT_FALSE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      0.0, 0u, 0.0, maximum_approach_risk, minimum_horizon));
+  EXPECT_FALSE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      0.45, 1u, 0.1, maximum_approach_risk, minimum_horizon));
+  EXPECT_FALSE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      std::numeric_limits<double>::quiet_NaN(), 0u, 0.0,
+      maximum_approach_risk, minimum_horizon));
+  EXPECT_FALSE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      0.5, 0u, std::numeric_limits<double>::quiet_NaN(),
+      maximum_approach_risk, minimum_horizon));
+  EXPECT_FALSE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      0.5, 0u, 0.0, maximum_approach_risk, -0.1));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ProgressReserveRequiresRecoveryBeforeFurtherApproach)
+{
+  constexpr double minimum_horizon = 0.17;
+  const double no_recovery_limit =
+    ScorePlannerAdapter::reserve_approach_limit(false);
+  const double recovery_limit =
+    ScorePlannerAdapter::reserve_approach_limit(true);
+  EXPECT_DOUBLE_EQ(no_recovery_limit, 1.0e-9);
+  EXPECT_DOUBLE_EQ(recovery_limit, 1.0);
+  EXPECT_FALSE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      std::numeric_limits<double>::infinity(), 50u,
+      0.95, no_recovery_limit, minimum_horizon));
+  EXPECT_TRUE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      std::numeric_limits<double>::infinity(), 50u,
+      0.95, recovery_limit, minimum_horizon));
+  EXPECT_TRUE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      std::numeric_limits<double>::infinity(), 50u,
+      0.0, no_recovery_limit, minimum_horizon));
+  EXPECT_TRUE(ScorePlannerAdapter::recovery_preserves_uncertainty_reserve(
+      std::numeric_limits<double>::infinity(), 0u,
+      0.95, no_recovery_limit, minimum_horizon));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ReserveConsumptionRequiresBothEntryAndFurtherApproach)
+{
+  EXPECT_TRUE(ScorePlannerAdapter::consumes_reserve(
+      0.25, 0.04, 0.10, 1.0e-6));
+  EXPECT_FALSE(ScorePlannerAdapter::consumes_reserve(
+      0.25, 0.12, 0.10, 1.0e-6));
+  EXPECT_FALSE(ScorePlannerAdapter::consumes_reserve(
+      0.04, 0.04, 0.10, 1.0e-6));
+  EXPECT_FALSE(ScorePlannerAdapter::consumes_reserve(
+      0.04, 0.05, 0.10, 1.0e-6));
+  EXPECT_FALSE(ScorePlannerAdapter::consumes_reserve(
+      std::numeric_limits<double>::quiet_NaN(), 0.0, 0.10, 1.0e-6));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  ProgressEscapeRanksPathProgressWithinOneLocalizationRiskClass)
+{
+  ScorePlannerAdapter::ProgressRank best;
+  best.clearance_guard_bucket = 0u;
+  best.has_translation_progress = true;
+  best.progress_cost = 1.0;
+  best.path_deviation_cost = 0.1;
+  best.mean_path_distance_bucket = 0u;
+  best.mean_path_distance_cost = 0.1;
+  best.recovers_initial_clearance = true;
+  best.approach_risk = 0.0;
+  best.clearance_risk_bucket = 0u;
+  best.avoidance_horizon_seconds =
+    std::numeric_limits<double>::infinity();
+  best.canonical_index = 10u;
+
+  auto candidate = best;
+  candidate.progress_cost = 0.5;
+  candidate.path_deviation_cost = 10.0;
+  candidate.recovers_initial_clearance = false;
+  candidate.approach_risk = 0.9;
+  candidate.canonical_index = 11u;
+  EXPECT_TRUE(ScorePlannerAdapter::progress_escape_prefers(candidate, best));
+
+  candidate = best;
+  candidate.consumes_uncertainty_reserve = true;
+  candidate.progress_cost = 2.0;
+  candidate.canonical_index = 11u;
+  EXPECT_FALSE(ScorePlannerAdapter::progress_escape_prefers(candidate, best));
+
+  candidate = best;
+  best.consumes_uncertainty_reserve = true;
+  candidate.progress_cost = 2.0;
+  candidate.canonical_index = 11u;
+  EXPECT_FALSE(ScorePlannerAdapter::progress_escape_prefers(candidate, best));
+  candidate.progress_cost = best.progress_cost;
+  EXPECT_TRUE(ScorePlannerAdapter::progress_escape_prefers(candidate, best));
+  best.consumes_uncertainty_reserve = false;
+
+  candidate = best;
+  candidate.clearance_guard_bucket = 1u;
+  candidate.progress_cost = 2.0;
+  candidate.canonical_index = 11u;
+  EXPECT_FALSE(ScorePlannerAdapter::progress_escape_prefers(candidate, best));
+  candidate.progress_cost = 0.0;
+  EXPECT_TRUE(ScorePlannerAdapter::progress_escape_prefers(candidate, best));
+
+  candidate = best;
+  candidate.has_translation_progress = true;
+  candidate.clearance_guard_bucket = 100u;
+  candidate.progress_cost = 100.0;
+  candidate.canonical_index = 11u;
+  best.has_translation_progress = false;
+  EXPECT_TRUE(ScorePlannerAdapter::progress_escape_prefers(candidate, best));
+
+  ScorePlannerAdapter::ProgressRank absent;
+  EXPECT_TRUE(ScorePlannerAdapter::progress_escape_prefers(candidate, absent));
+  EXPECT_FALSE(ScorePlannerAdapter::progress_escape_prefers(absent, candidate));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  StopCertifiedProgressReplacesOnlyARecedingHorizonStall)
+{
+  EXPECT_FALSE(ScorePlannerAdapter::progress_escape_replaces_weighted_winner(
+      false, true, false));
+  EXPECT_TRUE(ScorePlannerAdapter::progress_escape_replaces_weighted_winner(
+      true, true, false));
+  EXPECT_FALSE(ScorePlannerAdapter::progress_escape_replaces_weighted_winner(
+      true, false, false));
+  EXPECT_FALSE(ScorePlannerAdapter::progress_escape_replaces_weighted_winner(
+      true, true, true));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  LegalAvoidanceEscapePrefersSafetyThenExecutableProgress)
+{
+  const std::size_t no_candidate =
+    std::numeric_limits<std::size_t>::max();
+  EXPECT_TRUE(ScorePlannerAdapter::legal_escape_prefers_candidate(
+      2u, 0u, 3u, 0u, 0.4, 0.0, false, false,
+      0.2, 0.0, 0.1, 0.0,
+      7u, no_candidate));
+  EXPECT_TRUE(ScorePlannerAdapter::legal_escape_prefers_candidate(
+      0u, 1u, 9u, 0u, 0.9, 0.1, false, true,
+      0.1, 0.2, 0.2, 0.1, 8u, 7u));
+  EXPECT_TRUE(ScorePlannerAdapter::legal_escape_prefers_candidate(
+      0u, 0u, 1u, 2u, 0.9, 0.1, false, true,
+      0.1, 0.2, 0.2, 0.1, 8u, 7u));
+  EXPECT_FALSE(ScorePlannerAdapter::legal_escape_prefers_candidate(
+      0u, 0u, 1u, 1u, 0.9, 0.1, true, false,
+      0.1, 0.2, 0.2, 0.1, 8u, 7u));
+  EXPECT_TRUE(ScorePlannerAdapter::legal_escape_prefers_candidate(
+      0u, 0u, 1u, 1u, 0.1, 0.9, false, true,
+      0.1, 0.2, 0.1, 0.2, 8u, 7u));
+  EXPECT_TRUE(ScorePlannerAdapter::legal_escape_prefers_candidate(
+      0u, 0u, 1u, 1u, 0.1, 0.1, true, true,
+      0.3, 0.2, 0.2, 0.1, 8u, 7u));
+  EXPECT_TRUE(ScorePlannerAdapter::legal_escape_prefers_candidate(
+      0u, 0u, 1u, 1u, 0.1, 0.1, true, true,
+      0.2, 0.3, 0.2, 0.1, 8u, 7u));
+  EXPECT_FALSE(ScorePlannerAdapter::legal_escape_prefers_candidate(
+      0u, 0u, 1u, 1u, 0.1, 0.1, true, true,
+      0.3, 0.2, 0.1, 0.2, 8u, 7u));
+  EXPECT_FALSE(ScorePlannerAdapter::legal_escape_prefers_candidate(
+      0u, 0u, 1u, 1u, -0.1, 0.1, true, true,
+      0.2, 0.2, 0.1, 0.2, 8u, 7u));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
   RecoveryCollisionTimePreservesSweptInterpolationOrder)
 {
   std::vector<geometry_msgs::msg::Pose2D> poses(2u);
@@ -3471,6 +3908,18 @@ TEST_F(
       "Trajectory Hits Obstacle.;pose_index=0;subdivision=0",
       poses, footprint, 0.1, 0.05),
     0.0);
+  EXPECT_DOUBLE_EQ(
+    ScorePlannerAdapter::rejection_collision_time(
+      "Trajectory Hits Obstacle.;pose_index=0;subdivision=0;"
+      "physical_core_pose_index=1;physical_core_subdivision=0",
+      poses, footprint, 0.1, 0.05),
+    0.05);
+  EXPECT_NEAR(
+    ScorePlannerAdapter::rejection_collision_time(
+      "Trajectory Hits Obstacle.;pose_index=0;subdivision=0;"
+      "physical_core_pose_index=1;physical_core_subdivision=2",
+      poses, footprint, 0.1, 0.05),
+    2.0 * 0.05 / 3.0, 1.0e-12);
   EXPECT_TRUE(std::isnan(
       ScorePlannerAdapter::rejection_collision_time(
         "Trajectory Hits Obstacle.;pose_index=1",

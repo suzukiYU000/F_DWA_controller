@@ -21,11 +21,13 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <memory>
 #include <random>
 #include <vector>
 
 #include "f_dwa_controller/trajectory_certifier.hpp"
 #include "nav2_costmap_2d/cost_values.hpp"
+#include "nav2_costmap_2d/obstacle_layer.hpp"
 
 namespace f_dwa_controller
 {
@@ -72,6 +74,40 @@ std::vector<geometry_msgs::msg::Point> inset_footprint(
   }
   return result;
 }
+
+std::vector<geometry_msgs::msg::Point> outset_footprint(
+  const std::vector<geometry_msgs::msg::Point> & footprint,
+  const double outset)
+{
+  std::vector<geometry_msgs::msg::Point> result = footprint;
+  for (geometry_msgs::msg::Point & point : result) {
+    point.x = std::copysign(std::abs(point.x) + outset, point.x);
+    point.y = std::copysign(std::abs(point.y) + outset, point.y);
+  }
+  return result;
+}
+
+class TestObservationLayer : public nav2_costmap_2d::ObstacleLayer
+{
+public:
+  void configure(const bool current)
+  {
+    name_ = "test_observation_layer";
+    enabled_ = true;
+    current_ = current;
+    resizeMap(200u, 200u, 0.05, -5.0, -5.0);
+    for (unsigned int y = 0u; y < getSizeInCellsY(); ++y) {
+      for (unsigned int x = 0u; x < getSizeInCellsX(); ++x) {
+        setCost(x, y, nav2_costmap_2d::FREE_SPACE);
+      }
+    }
+  }
+
+  void setCurrentForTest(const bool current)
+  {
+    current_ = current;
+  }
+};
 
 void expect_same_certification(
   const CertificationResult & reference,
@@ -124,6 +160,139 @@ TEST(TrajectoryCertifier, AcceptsFreeSpaceAndDensifiesSweep)
   EXPECT_GT(result.checked_pose_count, poses.size());
 }
 
+TEST(TrajectoryCertifier, ObservationLayersCorroborateOnlyCurrentFreeSweep)
+{
+  nav2_costmap_2d::LayeredCostmap layered_costmap("odom", true, true);
+  const auto observation_layer = std::make_shared<TestObservationLayer>();
+  observation_layer->configure(true);
+  layered_costmap.addPlugin(observation_layer);
+  std::vector<geometry_msgs::msg::Pose2D> poses(2u);
+  poses.back().x = 0.2;
+
+  const ObservationLayerCertificationResult free_result =
+    certify_observation_layer_sequence(
+    layered_costmap, rectangle_footprint(), poses, 0.025);
+  EXPECT_TRUE(free_result.layer_available);
+  EXPECT_TRUE(free_result.layers_current);
+  EXPECT_TRUE(free_result.safe);
+
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(observation_layer->worldToMap(
+      0.0, 0.0, obstacle_x, obstacle_y));
+  observation_layer->setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::NO_INFORMATION);
+  const ObservationLayerCertificationResult unobserved_result =
+    certify_observation_layer_sequence(
+    layered_costmap, rectangle_footprint(), poses, 0.025);
+  EXPECT_TRUE(unobserved_result.layer_available);
+  EXPECT_TRUE(unobserved_result.layers_current);
+  EXPECT_TRUE(unobserved_result.safe);
+
+  observation_layer->setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  const ObservationLayerCertificationResult collision_result =
+    certify_observation_layer_sequence(
+    layered_costmap, rectangle_footprint(), poses, 0.025);
+  EXPECT_TRUE(collision_result.layer_available);
+  EXPECT_TRUE(collision_result.layers_current);
+  EXPECT_FALSE(collision_result.safe);
+  EXPECT_EQ(
+    collision_result.failure.failure,
+    CertificationFailure::kLethalObstacle);
+  EXPECT_EQ(
+    collision_result.failure_layer_name, "test_observation_layer");
+
+  observation_layer->setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::FREE_SPACE);
+  observation_layer->setCurrentForTest(false);
+  const ObservationLayerCertificationResult stale_result =
+    certify_observation_layer_sequence(
+    layered_costmap, rectangle_footprint(), poses, 0.025);
+  EXPECT_TRUE(stale_result.layer_available);
+  EXPECT_FALSE(stale_result.layers_current);
+  EXPECT_FALSE(stale_result.safe);
+}
+
+TEST(TrajectoryCertifier, ObservationCertificationFailsWithoutSensorLayer)
+{
+  nav2_costmap_2d::LayeredCostmap layered_costmap("odom", true, true);
+  const std::vector<geometry_msgs::msg::Pose2D> poses(1u);
+
+  const ObservationLayerCertificationResult result =
+    certify_observation_layer_sequence(
+    layered_costmap, rectangle_footprint(), poses, 0.025);
+
+  EXPECT_FALSE(result.layer_available);
+  EXPECT_TRUE(result.layers_current);
+  EXPECT_FALSE(result.safe);
+}
+
+TEST(TrajectoryCertifier, ObservationLayerKeepsLocalizationCoreHard)
+{
+  nav2_costmap_2d::LayeredCostmap layered_costmap("odom", true, true);
+  const auto observation_layer = std::make_shared<TestObservationLayer>();
+  observation_layer->configure(true);
+  layered_costmap.addPlugin(observation_layer);
+  const std::vector<geometry_msgs::msg::Pose2D> poses(1u);
+  const auto physical_footprint = rectangle_footprint();
+  const auto localization_core = inset_footprint(physical_footprint, 0.10);
+
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(observation_layer->worldToMap(
+      0.47, 0.0, obstacle_x, obstacle_y));
+  observation_layer->setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  EXPECT_FALSE(
+    certify_observation_layer_sequence(
+      layered_costmap, physical_footprint, poses, 0.025).safe);
+  EXPECT_TRUE(
+    certify_observation_layer_sequence(
+      layered_costmap, localization_core, poses, 0.025).safe);
+
+  observation_layer->setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::FREE_SPACE);
+  ASSERT_TRUE(observation_layer->worldToMap(
+      0.0, 0.0, obstacle_x, obstacle_y));
+  observation_layer->setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  EXPECT_FALSE(
+    certify_observation_layer_sequence(
+      layered_costmap, localization_core, poses, 0.025).safe);
+}
+
+TEST(TrajectoryCertifier, ObservationWorkspaceRefreshesAtCycleBoundary)
+{
+  nav2_costmap_2d::LayeredCostmap layered_costmap("odom", true, true);
+  const auto observation_layer = std::make_shared<TestObservationLayer>();
+  observation_layer->configure(true);
+  layered_costmap.addPlugin(observation_layer);
+  const std::vector<geometry_msgs::msg::Pose2D> poses(1u);
+  ObservationLayerCertificationWorkspace workspace;
+
+  EXPECT_TRUE(
+    certify_observation_layer_sequence(
+      layered_costmap, rectangle_footprint(), poses, 0.025,
+      &workspace).safe);
+
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(observation_layer->worldToMap(
+      0.0, 0.0, obstacle_x, obstacle_y));
+  observation_layer->setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  invalidate_observation_layer_certification_workspace(workspace);
+
+  const ObservationLayerCertificationResult collision_result =
+    certify_observation_layer_sequence(
+    layered_costmap, rectangle_footprint(), poses, 0.025, &workspace);
+  EXPECT_FALSE(collision_result.safe);
+  EXPECT_EQ(
+    collision_result.failure.failure,
+    CertificationFailure::kLethalObstacle);
+}
+
 TEST(TrajectoryCertifier, RejectsObstacleInsideFootprintInterior)
 {
   nav2_costmap_2d::Costmap2D costmap(200, 200, 0.05, -5.0, -5.0);
@@ -154,6 +323,33 @@ TEST(TrajectoryCertifier, RejectsObstacleInsideFootprintInterior)
   EXPECT_EQ(
     broadphase.failure_cell_cost, nav2_costmap_2d::LETHAL_OBSTACLE);
   EXPECT_EQ(broadphase.failure_source_pose_index, 0u);
+}
+
+TEST(TrajectoryCertifier, RejectsSubcellOverlapOutsideRasterizedPolygon)
+{
+  nav2_costmap_2d::Costmap2D costmap(40, 40, 0.10, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.45, 0.35, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  std::vector<geometry_msgs::msg::Pose2D> poses(1);
+  poses.front().theta = 0.25 * std::acos(-1.0);
+
+  const CertificationResult reference =
+    certify_pose_sequence(
+    costmap, rectangle_footprint(), poses, 0.025);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(costmap, workspace));
+  const CertificationResult broadphase =
+    certify_pose_sequence(
+    costmap, rectangle_footprint(), poses, 0.025, &workspace);
+
+  expect_same_certification(reference, broadphase);
+  EXPECT_FALSE(broadphase.safe);
+  EXPECT_EQ(broadphase.failure, CertificationFailure::kLethalObstacle);
+  EXPECT_EQ(broadphase.failure_cell_x, obstacle_x);
+  EXPECT_EQ(broadphase.failure_cell_y, obstacle_y);
 }
 
 TEST(TrajectoryCertifier, RejectsObstacleCrossingSweptBoundary)
@@ -532,6 +728,273 @@ TEST(TrajectoryCertifier, CommittedPrefixMayEnterSafeBoundaryStrip)
     certify_initial_overlap_margin_sequence(
       costmap, physical_footprint, inset_core, poses, 0.005,
       nullptr, nullptr, true));
+}
+
+TEST(TrajectoryCertifier, LocalizationPrefixMayHoldBoundedCurrentOverlap)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.76, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> measured_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> localization_core =
+    inset_footprint(measured_footprint, 0.10);
+  const std::vector<geometry_msgs::msg::Pose2D> response_prefix(5u);
+
+  EXPECT_FALSE(
+    certify_pose_sequence(
+      costmap, measured_footprint, response_prefix, 0.005).safe);
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, measured_footprint, localization_core, response_prefix,
+      0.005, nullptr, nullptr, false, false, 1.0, 0.0, false));
+}
+
+TEST(TrajectoryCertifier, LocalizationPrefixMayReenterOnlyOuterErrorBand)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(-0.18, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> measured_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> localization_core =
+    inset_footprint(measured_footprint, 0.10);
+  std::vector<geometry_msgs::msg::Pose2D> response_prefix(3u);
+  response_prefix[1].x = 0.16;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, measured_footprint, localization_core, response_prefix,
+      0.005, nullptr, nullptr, false, false, 1.0, 0.0, false));
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, measured_footprint, localization_core, response_prefix,
+      0.005, nullptr, nullptr, false, false, 1.0, 0.0, false, nullptr,
+      true));
+}
+
+TEST(TrajectoryCertifier, TransientFutureBoundaryEntryMustClearBeforeHorizon)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.82, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(5);
+  poses[2].x = 0.04;
+  poses[3].x = 0.0;
+  poses[4].x = -0.04;
+  double overlap_fraction = 0.0;
+
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005,
+      &overlap_fraction, nullptr, true, true, 1.0, 0.10));
+  EXPECT_GT(overlap_fraction, 0.0);
+  EXPECT_LT(overlap_fraction, 1.0);
+}
+
+TEST(TrajectoryCertifier, TransientFutureBoundaryEntryCannotEndInMargin)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.82, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[2].x = 0.04;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005,
+      nullptr, nullptr, true, true));
+}
+
+TEST(TrajectoryCertifier, TransientFutureBoundaryEntryMayUseSoftMargin)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.89, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> planning_footprint =
+    outset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].x = 0.02;
+  poses[2].x = 0.05;
+  double overlap_fraction = 0.0;
+
+  const CertificationResult physical_result =
+    certify_pose_sequence(
+    costmap, physical_footprint, poses, 0.005);
+  ASSERT_TRUE(physical_result.safe)
+    << certification_failure_name(physical_result.failure);
+
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, planning_footprint, physical_footprint, poses, 0.005,
+      &overlap_fraction, nullptr, true, false, 1.0, 0.0));
+  EXPECT_GT(overlap_fraction, 0.0);
+  EXPECT_LT(overlap_fraction, 1.0);
+}
+
+TEST(TrajectoryCertifier, TransientFutureBoundaryEntryIsBounded)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.82, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> inset_core =
+    inset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(5);
+  poses[2].x = 0.04;
+  poses[3].x = 0.0;
+  poses[4].x = -0.04;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005,
+      nullptr, nullptr, true, true, 0.0, 0.0));
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, physical_footprint, inset_core, poses, 0.005,
+      nullptr, nullptr, true, true, 1.0, 0.90));
+}
+
+TEST(TrajectoryCertifier, PlanningMarginNeverHidesPhysicalCollision)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.79, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> planning_footprint =
+    outset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].x = -0.04;
+  poses[2].x = -0.08;
+
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, planning_footprint, physical_footprint, poses, 0.005));
+}
+
+TEST(TrajectoryCertifier, PlanningMarginAllowsPhysicalSafeEscape)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.83, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> physical_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> planning_footprint =
+    outset_footprint(physical_footprint, 0.05);
+  std::vector<geometry_msgs::msg::Pose2D> poses(3);
+  poses[1].x = -0.04;
+  poses[2].x = -0.08;
+
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, planning_footprint, physical_footprint, poses, 0.005));
+}
+
+TEST(TrajectoryCertifier, LocalizationBandRequiresMeasuredBodyToEscape)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.76, 0.0, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> measured_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> localization_core =
+    inset_footprint(measured_footprint, 0.10);
+  std::vector<geometry_msgs::msg::Pose2D> escape_poses(4);
+  escape_poses[1].x = -0.03;
+  escape_poses[2].x = -0.07;
+  escape_poses[3].x = -0.11;
+  const std::vector<geometry_msgs::msg::Pose2D> stationary_poses(4);
+
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, measured_footprint, localization_core, escape_poses, 0.005,
+      nullptr, nullptr, false, true, 1.0, 0.0, true));
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, measured_footprint, localization_core, stationary_poses,
+      0.005, nullptr, nullptr, false, true, 1.0, 0.0, true));
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, measured_footprint, localization_core, stationary_poses,
+      0.005, nullptr, nullptr, false, false, 1.0, 0.0));
+}
+
+TEST(TrajectoryCertifier, LocalizationBandRejectsDeeperPenetrationBeforeEscape)
+{
+  nav2_costmap_2d::Costmap2D costmap(400, 400, 0.01, -2.0, -2.0);
+  unsigned int obstacle_x = 0u;
+  unsigned int obstacle_y = 0u;
+  ASSERT_TRUE(costmap.worldToMap(0.0, 0.26, obstacle_x, obstacle_y));
+  costmap.setCost(
+    obstacle_x, obstacle_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+
+  const std::vector<geometry_msgs::msg::Point> measured_footprint =
+    whill_footprint();
+  const std::vector<geometry_msgs::msg::Point> localization_core =
+    inset_footprint(measured_footprint, 0.10);
+  std::vector<geometry_msgs::msg::Pose2D> outward_poses(4);
+  outward_poses[1].y = -0.03;
+  outward_poses[2].y = -0.07;
+  outward_poses[3].y = -0.11;
+  std::vector<geometry_msgs::msg::Pose2D> inward_then_escape = outward_poses;
+  inward_then_escape[1].y = 0.03;
+
+  EXPECT_TRUE(
+    certify_initial_overlap_margin_sequence(
+      costmap, measured_footprint, localization_core, outward_poses, 0.005,
+      nullptr, nullptr, false, true, 1.0, 0.0, true));
+  EXPECT_FALSE(
+    certify_initial_overlap_margin_sequence(
+      costmap, measured_footprint, localization_core, inward_then_escape,
+      0.005, nullptr, nullptr, false, true, 1.0, 0.0, true));
 }
 
 TEST(TrajectoryCertifier, InitialOverlapMarginAllowsFirstResponseEntry)

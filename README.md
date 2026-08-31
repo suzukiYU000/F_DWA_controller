@@ -12,11 +12,51 @@ implemented in this package. The pinned Navigation2 source remains unmodified.
 ## Current status
 
 The DWB-derived A-DWA, J-DWA, and F-DWA controller class names and native-input
-trajectory generators are registered. They preserve the 11 x 11 candidate
-budget and use the common 2.4 s DWB rollout. Each cycle builds one immutable
-planning snapshot from the latest TF pose, the last robot-facing software
-dispatch, locally issued commands, and the configured 70 ms nominal delay.
-Odometry velocity is not a nominal-state input.
+trajectory generators are registered. The common source configuration uses an
+11 x 15 candidate budget and a 1.6 s rollout; the experiment GUI applies its
+centralized planning defaults when it launches a run. Each cycle builds one
+immutable planning snapshot from the latest TF pose, the last robot-facing
+software dispatch, locally issued commands, and the configured 70 ms nominal
+delay. Odometry velocity is not a nominal-state input.
+
+The clearance critics first apply result-preserving caches. Physical-footprint
+boundary samples and padded polygons are rebuilt only when the exact footprint,
+costmap resolution, clearance margin, sampling resolution, or band count
+changes. When the primary and trigger `FootprintClearanceCritic` instances have
+exactly equal transformed paths and fixed-distance path parameters, the primary
+critic builds the sampled risk path once and both critics score that same pose
+sequence against their own distance fields. Scores, weights, thresholds,
+short-circuit order, and candidate enumeration remain independent and
+unchanged. Periodic and trial-end logs report this as
+`clearance_risk_path_cache`; `avoided_path_builds` is the number of duplicate
+path constructions skipped since the last trial reset.
+
+Pose scoring also skips the physical-footprint probe loop only when a strict
+distance-field lower bound proves that the original score is exactly `0.0`.
+The bound includes map-edge clearance, the complete physical-footprint radius,
+Costmap cell extents, and the maximum unsampled boundary interval. Any pose near
+an obstacle or map edge, or any numerically inconclusive pose, follows the
+original probe-by-probe implementation. Penalized-cell mask comparison is fused
+into the mandatory source-grid scan; the exact mask still controls whether the
+Euclidean distance field is rebuilt.
+
+The soft clearance exposure of a terminal stopping rollout is additionally
+sampled by traveled distance and heading change. The configured spatial
+resolution and a 0.10 rad angular limit determine the sampled poses, while the
+integral retains the skipped time interval. This is an intentional approximation
+of candidate ranking, not a result-preserving cache. Hard stop admissibility and
+collision checks still inspect every original rollout pose, so the optimization
+cannot make a colliding stop rollout legal merely by skipping a soft-cost sample.
+
+The configured soft band also gains a bounded motion-uncertainty allowance.
+For each already-generated candidate, the critic derives maximum boundary
+sweep speed from pose translation plus physical-footprint-radius times heading
+change. The common 0.04 s uncertainty bound can add at most 0.05 m to the soft
+margin. The same calculation uses the 0.05 s samples of the method-native stop
+sequence. It reads generated motion and never modifies sampled acceleration,
+jerk, FIR state, rollout poses, or the returned command. Entering this expanded
+band remains a finite score; physical swept-footprint and complete-stop checks
+remain the only hard gates.
 
 `/controller/command_dispatch` is an
 `f_dwa_controller/msg/CommandDispatch` event published only when a command is
@@ -134,7 +174,11 @@ violations invalidate the candidate rather than clipping its velocity. Critics
 run before the terminal-stop certificate, and only candidates capable of
 improving the best certified score receive that expensive certificate. Every configured
 number of cycles, `planning_timing` logs p50/p95/p99/maximum and the cumulative
-50 ms deadline-miss count using a steady clock. `certificate_rejections`
+50 ms deadline-miss count using a steady clock. Trial-end
+`planning_detail_timing` records candidate generation, stop-rollout generation,
+the three clearance stages, weighted critic scoring, terminal-stop safety, and
+each critic's measured call time. The stage timers overlap by design and their
+shares must not be summed. `certificate_rejections`
 separates terminal-stop infeasibility from invalid-input, off-costmap,
 lethal-obstacle, and unknown-space failures. Trial reset emits the final run
 summary before clearing these metrics.

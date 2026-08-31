@@ -16,12 +16,16 @@ namespace f_dwa_controller
 {
 
 /**
- * @brief Apply one fixed soft cost outside a Path corridor.
+ * @brief Apply a finite, recovery-directed soft cost outside a Path corridor.
  *
  * If any predicted pose is farther than the configured distance, the critic
- * returns one finite penalty. Otherwise it returns zero. It never rejects a
- * trajectory, so an outside candidate remains selectable when every candidate
- * is outside. MeanPathDistCritic independently retains continuous path ranking.
+ * returns one finite boundary penalty plus the mean excess-distance cost.
+ * Near that boundary, a smooth heading term also penalizes a terminal heading
+ * whose forward probe moves farther from the Path. The probe activates the
+ * term before the rollout endpoint itself leaves the corridor, giving
+ * acceleration/jerk/FIR rollouts enough lead distance to turn smoothly. It
+ * never rejects a trajectory, so obstacle avoidance remains selectable and
+ * the physical-footprint critic stays the independent hard gate.
  */
 class PathDeviationCritic : public dwb_core::TrajectoryCritic
 {
@@ -52,7 +56,7 @@ protected:
   };
 
   void validateParameters() const;
-  bool poseIsInsideCorridor(
+  double distanceToPath(
     const geometry_msgs::msg::Pose2D & pose,
     std::size_t & segment_hint) const;
 
@@ -60,6 +64,10 @@ protected:
   std::vector<PathSegment> path_segments_;
   double maximum_path_distance_{1.5};
   double deviation_penalty_{1000.0};
+  double excess_distance_scale_{1000.0};
+  double heading_recovery_activation_distance_{1.05};
+  double heading_recovery_lookahead_distance_{0.9};
+  double heading_recovery_scale_{200.0};
   bool reference_path_valid_{false};
 };
 

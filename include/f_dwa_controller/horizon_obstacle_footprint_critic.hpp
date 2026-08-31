@@ -53,8 +53,18 @@ protected:
   bool enable_initial_overlap_recovery_{false};
   double initial_overlap_footprint_inset_{0.05};
   double initial_overlap_recovery_penalty_{1000000.0};
+  double localization_uncertainty_footprint_inset_{0.0};
+  double localization_uncertainty_recovery_penalty_{2000000.0};
+  bool enable_transient_boundary_margin_recovery_{false};
+  bool transient_boundary_margin_require_clearance_{true};
+  double transient_boundary_margin_maximum_overlap_fraction_{0.25};
+  double transient_boundary_margin_minimum_clear_suffix_fraction_{0.20};
+  double transient_boundary_margin_recovery_penalty_{10.0};
   std::vector<geometry_msgs::msg::Point> inset_core_footprint_;
+  std::vector<geometry_msgs::msg::Point> localization_core_footprint_;
   CertificationWorkspace certification_workspace_;
+  ObservationLayerCertificationWorkspace
+    observation_layer_certification_workspace_;
   CertificationWorkspace * shared_certification_workspace_{nullptr};
   bool certification_workspace_prepared_{false};
   bool detailed_failure_diagnostics_{true};

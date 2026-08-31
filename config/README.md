@@ -8,7 +8,7 @@ Method files should contain only the plugin and native-dynamics differences.
 Setting it to `true` is reserved for an explicit terminal-stop-certificate
 ablation; normal experiments do not reject candidates with that certificate.
 The common Config retains a method-native stop suffix once its predicted end
-is within the GoalChecker's 0.25 m position window. This prevents the stopped
+is within the GoalChecker's complete 0.20 m position window. This prevents the stopped
 GoalChecker from losing the final Path point while a fast candidate is still
 crossing the goal. The
 common nominal command-history rollout remains enabled.
@@ -54,6 +54,28 @@ The common dispatch-state parameters are:
   condition; a candidate is legal only when its method-native deceleration can
   stop the physical footprint on the current costmap, without the optional
   certificate reserve
+- `FootprintClearance.motion_uncertainty_seconds`: timing-uncertainty horizon
+  used only by the soft clearance rank; the common configuration uses 0.04 s,
+  rounded above the measured dispatch p05--p95 spread without duplicating the
+  nominal activation preview
+- `FootprintClearance.maximum_motion_margin`: upper bound on the extra soft
+  margin produced by generated translation and footprint-corner rotation;
+  0.05 m in the common comparison configuration
+- `FootprintClearance.localization_uncertainty_margin`: worst-case
+  translational pose error outside the measured body; the common 0.10 m band
+  extends one continuous clearance-risk curve down to physical contact and
+  never makes a trajectory illegal by itself
+- `localization_uncertainty_footprint_inset`: bounded localization-error
+  recovery. Bringup maps the measured pose-error setting (normally `0.10 m`)
+  here. It is admissible only when every current Obstacle/Voxel observation
+  layer certifies the inward uncertainty core. Ordinary rollout scoring
+  requires overlap in the outer error band to be non-growing and self-clearing.
+  A retained method-native recovery prefix may re-enter only that outer band;
+  its complete inward core and all current observation layers remain hard-
+  certified, so this exception does not bypass J-DWA jerk or F-DWA FIR state.
+- `FootprintClearance.uniform_sequence_period`: period of the generated
+  method-native stopping poses used to recover their sweep rate; 0.05 s at the
+  common 20 Hz Controller rate
 - `terminal_stop_command_delay_seconds`: delay included before terminal stop
 - `terminal_stop_velocity_threshold`: common numerical capture threshold for
   velocity, controller-internal acceleration, and F-DWA raw-input history;
@@ -61,8 +83,9 @@ The common dispatch-state parameters are:
 - `terminal_stop_maximum_time`: upper bound for constructing a certified stop,
   not a commanded stop duration; the common 12 s bound accommodates the F-8
   filter-history drain and each sequence ends as soon as capture is reached
-- `terminal_stop_goal_capture_distance`: 0.24 m common method-native terminal
-  capture set; each cycle revalidates the retained deceleration suffix
+- `terminal_stop_goal_capture_distance`: 0.20 m common method-native terminal
+  capture set, matching GoalChecker; each cycle revalidates the retained
+  deceleration suffix
 - `stop_capture_velocity`: planned-stop completion threshold
 - `planning_deadline_seconds`: 0.05 s deadline at the common 20 Hz control rate
 
@@ -80,8 +103,9 @@ command is within the same stopped threshold, then rechecks pose, yaw, and
 measured odometry. If delayed commands moved the robot outside the goal
 condition, the runner resends the same saved Path within the original run
 deadline. A new setPlan resets stateful DWB components before control resumes.
-The research-common stopping critic and GoalChecker both use the same 0.25 m
-position window. Its
+The research-common stopping critic, GoalChecker, and retained method-native
+stop use the same 0.20 m position window so Controller Server cannot finish
+outside the method-native stop latch. Its
 `RotateToGoal.xy_goal_tolerance_release_margin` is -1.0, so terminal braking
 remains latched after the robot first enters the acceptance boundary and is
 cleared only when a new Path resets the critic. This prevents delayed motion

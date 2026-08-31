@@ -272,6 +272,16 @@ public:
     risk_seed_time_ = value;
   }
 
+  void setRiskPathMode(const std::string & value)
+  {
+    risk_path_mode_ = value;
+  }
+
+  void setReferencePlan(const nav_2d_msgs::msg::Path2D & plan)
+  {
+    global_plan_ = plan;
+  }
+
   void setFixedClearance(const double clearance)
   {
     fixed_clearance_ = clearance;
@@ -283,6 +293,29 @@ public:
     penalty_power_ = power;
   }
 
+  void setLocalizationUncertaintyMargin(const double margin)
+  {
+    localization_uncertainty_margin_ = margin;
+  }
+
+  void setMotionEnvelope(
+    const double uncertainty_seconds,
+    const double maximum_margin,
+    const double footprint_radius,
+    const double sequence_period = 0.05)
+  {
+    motion_uncertainty_seconds_ = uncertainty_seconds;
+    maximum_motion_margin_ = maximum_margin;
+    maximum_physical_footprint_radius_ = footprint_radius;
+    uniform_sequence_period_ = sequence_period;
+  }
+
+  void setLinearClearance(const double intercept, const double slope)
+  {
+    clearance_intercept_ = intercept;
+    clearance_slope_ = slope;
+  }
+
   double scorePose(const geometry_msgs::msg::Pose2D & pose) const
   {
     return scorePoseClearance(pose);
@@ -292,6 +325,11 @@ protected:
   double minimumFootprintClearance(
     const geometry_msgs::msg::Pose2D & pose) const override
   {
+    if (std::isfinite(clearance_intercept_) &&
+      std::isfinite(clearance_slope_))
+    {
+      return clearance_intercept_ + clearance_slope_ * pose.x;
+    }
     if (std::isfinite(fixed_clearance_)) {
       return fixed_clearance_;
     }
@@ -314,6 +352,8 @@ private:
   double maximum_collision_abs_y_{
     std::numeric_limits<double>::infinity()};
   double fixed_clearance_{std::numeric_limits<double>::quiet_NaN()};
+  double clearance_intercept_{std::numeric_limits<double>::quiet_NaN()};
+  double clearance_slope_{std::numeric_limits<double>::quiet_NaN()};
 };
 
 class CostmapFootprintClearanceCritic
@@ -365,6 +405,24 @@ public:
     return refreshFootprintBoundarySamples();
   }
 
+  bool refreshGeometry(const nav2_costmap_2d::Footprint & footprint)
+  {
+    return refreshFootprintGeometry(footprint);
+  }
+
+  std::uint64_t geometryRebuildCount() const
+  {
+    return footprint_geometry_rebuild_count_;
+  }
+
+  void setGeometryParameters(
+    const double margin, const int bands, const double sample_resolution)
+  {
+    clearance_margin_ = margin;
+    clearance_bands_ = bands;
+    sample_resolution_ = sample_resolution;
+  }
+
   double minimumClearance(
     const geometry_msgs::msg::Pose2D & pose) const
   {
@@ -374,6 +432,12 @@ public:
   double poseScore(const geometry_msgs::msg::Pose2D & pose) const
   {
     return scorePoseClearance(pose);
+  }
+
+  bool penaltyIsProvablyZero(
+    const geometry_msgs::msg::Pose2D & pose) const
+  {
+    return posePenaltyIsProvablyZero(pose);
   }
 
   double score(const dwb_msgs::msg::Trajectory2D & trajectory)
@@ -502,6 +566,18 @@ nav_2d_msgs::msg::Path2D straight_path(double length)
   geometry_msgs::msg::Pose2D end;
   end.x = length;
   path.poses = {start, end};
+  return path;
+}
+
+nav_2d_msgs::msg::Path2D right_angle_path()
+{
+  nav_2d_msgs::msg::Path2D path;
+  geometry_msgs::msg::Pose2D start;
+  geometry_msgs::msg::Pose2D corner;
+  corner.x = 1.0;
+  geometry_msgs::msg::Pose2D end = corner;
+  end.y = 2.0;
+  path.poses = {start, corner, end};
   return path;
 }
 
@@ -669,7 +745,7 @@ TEST(PathDeviationCritic, IsNeutralAtOrInsideMaximumDistance)
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(trajectory), 0.0);
 }
 
-TEST(PathDeviationCritic, AnyPointBeyondCorridorGetsFixedPenalty)
+TEST(PathDeviationCritic, AddsMeanExcessDistanceOutsideCorridor)
 {
   f_dwa_controller::PathDeviationCritic critic;
   geometry_msgs::msg::Pose2D current_pose;
@@ -683,8 +759,8 @@ TEST(PathDeviationCritic, AnyPointBeyondCorridorGetsFixedPenalty)
   auto far_outside = trajectory_to(1.0, 1.0);
   far_outside.poses.back().y = -3.0;
 
-  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(slightly_outside), 1000.0);
-  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(far_outside), 1000.0);
+  EXPECT_NEAR(critic.scoreTrajectory(slightly_outside), 1000.0005, 1.0e-9);
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(far_outside), 1750.0);
 }
 
 TEST(PathDeviationCritic, OutsideCostRemainsFiniteAndDoesNotReject)
@@ -706,8 +782,74 @@ TEST(PathDeviationCritic, OutsideCostRemainsFiniteAndDoesNotReject)
   const double far_outside_score = critic.scoreTrajectory(far_outside);
 
   EXPECT_TRUE(std::isfinite(slightly_outside_score));
-  EXPECT_DOUBLE_EQ(slightly_outside_score, 1000.0);
-  EXPECT_DOUBLE_EQ(far_outside_score, slightly_outside_score);
+  EXPECT_NEAR(slightly_outside_score, 1000.0005, 1.0e-9);
+  EXPECT_GT(far_outside_score, slightly_outside_score);
+}
+
+TEST(PathDeviationCritic, PrefersRecoveryWhenAllCandidatesStartOutside)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  geometry_msgs::msg::Pose2D current_pose;
+  current_pose.y = 2.0;
+  geometry_msgs::msg::Pose2D goal;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(
+      current_pose, velocity, goal, straight_path(10.0)));
+
+  auto recovering = trajectory_to(1.0, 1.0);
+  recovering.poses.front().y = 2.0;
+  recovering.poses.back().y = 1.0;
+  auto departing = recovering;
+  departing.poses.back().y = 3.0;
+
+  EXPECT_LT(
+    critic.scoreTrajectory(recovering), critic.scoreTrajectory(departing));
+}
+
+TEST(PathDeviationCritic, SmoothlyPenalizesHeadingAwayNearBoundary)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  geometry_msgs::msg::Pose2D current_pose;
+  current_pose.y = 1.2;
+  geometry_msgs::msg::Pose2D goal;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(
+      current_pose, velocity, goal, straight_path(10.0)));
+
+  auto returning = trajectory_to(1.0, 1.0);
+  returning.poses.front().y = 1.2;
+  returning.poses.back().y = 1.2;
+  returning.poses.back().theta = -M_PI_2;
+  auto departing = returning;
+  departing.poses.back().theta = M_PI_2;
+  auto comfortably_inside = departing;
+  comfortably_inside.poses.front().y = 0.0;
+  comfortably_inside.poses.back().y = 0.0;
+
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(returning), 0.0);
+  EXPECT_GT(critic.scoreTrajectory(departing), 0.0);
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(comfortably_inside), 0.0);
+}
+
+TEST(PathDeviationCritic, HeadingProbeAnticipatesDepartureInsideBoundary)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  geometry_msgs::msg::Pose2D current_pose;
+  current_pose.y = 0.5;
+  geometry_msgs::msg::Pose2D goal;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(
+      current_pose, velocity, goal, straight_path(10.0)));
+
+  auto returning = trajectory_to(1.0, 1.0);
+  returning.poses.front().y = 0.5;
+  returning.poses.back().y = 0.5;
+  returning.poses.back().theta = -M_PI_2;
+  auto departing = returning;
+  departing.poses.back().theta = M_PI_2;
+
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(returning), 0.0);
+  EXPECT_GT(critic.scoreTrajectory(departing), 0.0);
 }
 
 TEST(ForwardObstacleCritic, PenalizesBlockedNominalPath)
@@ -808,6 +950,26 @@ TEST(FootprintClearanceCritic, AppliesContinuousPoweredClearancePenalty)
   EXPECT_DOUBLE_EQ(critic.scorePose(pose), 0.0);
 }
 
+TEST(FootprintClearanceCritic, AppliesLocalizationUncertaintyAsSoftRisk)
+{
+  StubFootprintClearanceCritic critic;
+  geometry_msgs::msg::Pose2D pose;
+  critic.setClearanceShape(0.50, 1.0);
+  critic.setLocalizationUncertaintyMargin(0.10);
+
+  critic.setFixedClearance(0.0);
+  EXPECT_DOUBLE_EQ(critic.scorePose(pose), 1.0);
+  critic.setFixedClearance(0.10);
+  const double at_uncertainty_boundary = critic.scorePose(pose);
+  EXPECT_NEAR(at_uncertainty_boundary, 5.0 / 6.0, 1.0e-12);
+  critic.setFixedClearance(0.20);
+  const double further_from_body = critic.scorePose(pose);
+  EXPECT_NEAR(further_from_body, 2.0 / 3.0, 1.0e-12);
+  EXPECT_GT(at_uncertainty_boundary, further_from_body);
+  critic.setFixedClearance(0.60);
+  EXPECT_DOUBLE_EQ(critic.scorePose(pose), 0.0);
+}
+
 TEST(FootprintClearanceCritic, ReturnsBoundedDistanceExposure)
 {
   StubFootprintClearanceCritic critic;
@@ -845,6 +1007,19 @@ TEST(FootprintClearanceCritic, SoftlyObservesBeyondExecutableEndpoint)
   EXPECT_NEAR(critic.scoreTrajectory(trajectory), 0.5625, 1.0e-12);
 }
 
+TEST(FootprintClearanceCritic, NativeTimeDoesNotProjectBackToBlockedPath)
+{
+  StubFootprintClearanceCritic critic;
+  critic.setFirstCollidingBand(0);
+  critic.setMinimumCollisionX(1.0);
+  critic.setRiskPath(1.0, 2);
+  critic.setRiskPathMode("native_time");
+
+  const auto executable_prefix_stays_clear = trajectory_to(0.5, 1.0);
+  EXPECT_DOUBLE_EQ(
+    critic.scoreTrajectory(executable_prefix_stays_clear), 0.0);
+}
+
 TEST(FootprintClearanceCritic, ReportsApproachWithoutPenalizingParallelRisk)
 {
   StubFootprintClearanceCritic critic;
@@ -866,6 +1041,105 @@ TEST(FootprintClearanceCritic, ReportsApproachWithoutPenalizingParallelRisk)
   EXPECT_DOUBLE_EQ(
     critic.scoreTrajectoryWithApproachRisk(parallel, &approach_risk), 0.9);
   EXPECT_DOUBLE_EQ(approach_risk, 0.0);
+}
+
+TEST(FootprintClearanceCritic, CompleteRolloutMustRecoverInitialClearance)
+{
+  StubFootprintClearanceCritic critic;
+  auto rollout = trajectory_to(1.0, 1.0);
+  rollout.poses.insert(rollout.poses.begin() + 1u, rollout.poses.front());
+  rollout.poses[1].x = 0.5;
+  rollout.time_offsets.insert(
+    rollout.time_offsets.begin() + 1u, duration(0.5));
+
+  double initial_clearance = -1.0;
+  double terminal_clearance = -1.0;
+  critic.setLinearClearance(0.20, 0.10);
+  EXPECT_TRUE(critic.trajectoryRecoversInitialClearance(
+      rollout, 1.0e-9, &initial_clearance, &terminal_clearance));
+  EXPECT_NEAR(initial_clearance, 0.25, 1.0e-12);
+  EXPECT_NEAR(terminal_clearance, 0.30, 1.0e-12);
+
+  critic.setLinearClearance(0.30, -0.10);
+  EXPECT_FALSE(critic.trajectoryRecoversInitialClearance(
+      rollout, 1.0e-9, &initial_clearance, &terminal_clearance));
+  EXPECT_NEAR(initial_clearance, 0.25, 1.0e-12);
+  EXPECT_NEAR(terminal_clearance, 0.20, 1.0e-12);
+
+  dwb_msgs::msg::Trajectory2D empty;
+  EXPECT_THROW(
+    critic.trajectoryRecoversInitialClearance(empty, 1.0e-9),
+    dwb_core::IllegalTrajectoryException);
+}
+
+TEST(FootprintClearanceCritic, CompleteUniformStopMustRecoverInitialClearance)
+{
+  StubFootprintClearanceCritic critic;
+  std::vector<geometry_msgs::msg::Pose2D> stop_poses(3u);
+  stop_poses[1].x = 0.5;
+  stop_poses[2].x = 1.0;
+
+  double initial_clearance = -1.0;
+  double terminal_clearance = -1.0;
+  critic.setLinearClearance(0.20, 0.10);
+  EXPECT_TRUE(critic.poseSequenceRecoversInitialClearance(
+      stop_poses, 1.0e-9, &initial_clearance, &terminal_clearance));
+  EXPECT_NEAR(initial_clearance, 0.20, 1.0e-12);
+  EXPECT_NEAR(terminal_clearance, 0.30, 1.0e-12);
+
+  critic.setLinearClearance(0.30, -0.10);
+  EXPECT_FALSE(critic.poseSequenceRecoversInitialClearance(
+      stop_poses, 1.0e-9, &initial_clearance, &terminal_clearance));
+  EXPECT_NEAR(initial_clearance, 0.30, 1.0e-12);
+  EXPECT_NEAR(terminal_clearance, 0.20, 1.0e-12);
+
+  EXPECT_THROW(
+    critic.poseSequenceRecoversInitialClearance({}, 1.0e-9),
+    dwb_core::IllegalTrajectoryException);
+}
+
+TEST(FootprintClearanceCritic, SharedRiskPathPreservesExactScores)
+{
+  StubFootprintClearanceCritic path_owner;
+  StubFootprintClearanceCritic second_critic;
+  path_owner.setFirstCollidingBand(1);
+  second_critic.setFirstCollidingBand(0);
+  second_critic.setMinimumCollisionX(0.75);
+  const auto trajectory = trajectory_to(1.0, 1.0);
+
+  ASSERT_TRUE(path_owner.hasEquivalentRiskPathDefinition(second_critic));
+  const auto & shared_path = path_owner.buildRiskPath(trajectory);
+  double shared_approach_risk = -1.0;
+  const double shared_score =
+    second_critic.scoreTrajectoryWithPreparedRiskPathAndApproachRisk(
+    trajectory, shared_path, &shared_approach_risk);
+  double independent_approach_risk = -1.0;
+  const double independent_score =
+    second_critic.scoreTrajectoryWithApproachRisk(
+    trajectory, &independent_approach_risk);
+
+  EXPECT_DOUBLE_EQ(shared_score, independent_score);
+  EXPECT_DOUBLE_EQ(shared_approach_risk, independent_approach_risk);
+}
+
+TEST(FootprintClearanceCritic, SharesOnlyExactlyEquivalentRiskPaths)
+{
+  StubFootprintClearanceCritic first;
+  StubFootprintClearanceCritic second;
+  ASSERT_TRUE(first.hasEquivalentRiskPathDefinition(second));
+
+  second.setRiskPathResolution(1.0, 0.25);
+  EXPECT_FALSE(first.hasEquivalentRiskPathDefinition(second));
+
+  second.setRiskPathResolution(1.0, 0.5);
+  second.setRiskPathMode("native_time");
+  EXPECT_FALSE(first.hasEquivalentRiskPathDefinition(second));
+
+  second.setRiskPathMode("plan_continuation");
+  auto different_plan = default_reference_plan();
+  different_plan.poses.back().y += 1.0e-12;
+  second.setReferencePlan(different_plan);
+  EXPECT_FALSE(first.hasEquivalentRiskPathDefinition(second));
 }
 
 TEST(FootprintClearanceCritic, PlanContinuationCannotActivateApproach)
@@ -911,6 +1185,50 @@ TEST(FootprintClearanceCritic, ScoresCompleteUniformStopSequence)
     dwb_core::IllegalTrajectoryException);
 }
 
+TEST(FootprintClearanceCritic, SpatiallySamplesUniformStopExposure)
+{
+  StubFootprintClearanceCritic critic;
+  critic.setFirstCollidingBand(0);
+  critic.setMinimumCollisionX(0.5);
+
+  std::vector<geometry_msgs::msg::Pose2D> poses(6u);
+  for (std::size_t index = 0u; index < poses.size(); ++index) {
+    poses[index].x = 0.1 * static_cast<double>(index);
+  }
+  double approach_risk = -1.0;
+  // The two sampled penalties are 0.0 and 0.9. Their trapezoid spans all five
+  // original time intervals, so mean=0.45 and peak/mean blend=0.675.
+  EXPECT_NEAR(
+    critic.scoreUniformPoseSequenceWithApproachRisk(poses, &approach_risk),
+    0.675, 1.0e-12);
+  EXPECT_NEAR(approach_risk, 0.9, 1.0e-12);
+}
+
+TEST(FootprintClearanceCritic, PreservesDirectionInsideSaturatedSoftRisk)
+{
+  StubFootprintClearanceCritic critic;
+  critic.setLinearClearance(-0.02, -0.04);
+
+  geometry_msgs::msg::Pose2D first;
+  geometry_msgs::msg::Pose2D middle = first;
+  middle.x = 0.5;
+  geometry_msgs::msg::Pose2D last = first;
+  last.x = 1.0;
+  double approach_risk = -1.0;
+  EXPECT_DOUBLE_EQ(
+    critic.scoreUniformPoseSequenceWithApproachRisk(
+      {first, middle, last}, &approach_risk),
+    1.0);
+  EXPECT_NEAR(approach_risk, 0.04, 1.0e-12);
+
+  approach_risk = -1.0;
+  EXPECT_DOUBLE_EQ(
+    critic.scoreUniformPoseSequenceWithApproachRisk(
+      {last, middle, first}, &approach_risk),
+    1.0);
+  EXPECT_DOUBLE_EQ(approach_risk, 0.0);
+}
+
 TEST(FootprintClearanceCritic, WeightsShortFinalDistanceInterval)
 {
   StubFootprintClearanceCritic critic;
@@ -941,6 +1259,34 @@ TEST(FootprintClearanceCritic, IgnoresInitialCommandVelocityInTerminalValue)
 
   EXPECT_DOUBLE_EQ(
     critic.scoreTrajectory(first), critic.scoreTrajectory(second));
+}
+
+TEST(FootprintClearanceCritic, SoftlyExpandsMarginFromGeneratedMotion)
+{
+  StubFootprintClearanceCritic critic;
+  critic.setClearanceShape(0.5, 1.0);
+  critic.setFixedClearance(0.525);
+  critic.setMotionEnvelope(0.1, 0.05, 0.5);
+
+  const auto slow = trajectory_to(1.0, 2.0);
+  const auto fast = trajectory_to(1.0, 1.0);
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(slow), 0.0);
+  EXPECT_GT(critic.scoreTrajectory(fast), 0.0);
+  EXPECT_LT(critic.scoreTrajectory(fast), 1.0);
+
+  dwb_msgs::msg::Trajectory2D rotating;
+  geometry_msgs::msg::Pose2D start;
+  geometry_msgs::msg::Pose2D end = start;
+  end.theta = 1.0;
+  rotating.poses = {start, end};
+  rotating.time_offsets = {duration(0.0), duration(1.0)};
+  EXPECT_GT(critic.scoreTrajectory(rotating), 0.0);
+
+  // Motion expansion is a finite ranking term. Entering it never throws an
+  // IllegalTrajectoryException; hard swept-footprint checks remain separate.
+  critic.setFixedClearance(0.01);
+  EXPECT_NO_THROW(critic.scoreTrajectory(fast));
+  EXPECT_LT(critic.scoreTrajectory(fast), 1.0);
 }
 
 TEST(FootprintClearanceCritic, FindsIsolatedCellInsideExpandedBand)
@@ -977,6 +1323,32 @@ TEST(FootprintClearanceCritic, BoundsSoftBoundaryProbesByClearanceBand)
   EXPECT_LE(critic.maximumProbeGap(), 0.10 + 1.0e-12);
 }
 
+TEST(FootprintClearanceCritic, ReusesUnchangedFootprintGeometry)
+{
+  nav2_costmap_2d::Costmap2D costmap(60, 60, 0.1, -3.0, -3.0, 0u);
+  CostmapFootprintClearanceCritic critic;
+  ASSERT_TRUE(critic.configure(&costmap));
+  critic.setGeometryParameters(0.45, 9, 0.10);
+  nav2_costmap_2d::Footprint footprint(4);
+  footprint[0].x = -0.6;
+  footprint[0].y = -0.4;
+  footprint[1].x = 0.6;
+  footprint[1].y = -0.4;
+  footprint[2].x = 0.6;
+  footprint[2].y = 0.4;
+  footprint[3].x = -0.6;
+  footprint[3].y = 0.4;
+
+  ASSERT_TRUE(critic.refreshGeometry(footprint));
+  ASSERT_EQ(critic.geometryRebuildCount(), 1u);
+  ASSERT_TRUE(critic.refreshGeometry(footprint));
+  EXPECT_EQ(critic.geometryRebuildCount(), 1u);
+
+  critic.setGeometryParameters(0.50, 9, 0.10);
+  ASSERT_TRUE(critic.refreshGeometry(footprint));
+  EXPECT_EQ(critic.geometryRebuildCount(), 2u);
+}
+
 TEST(FootprintClearanceCritic, DistanceFieldSeparatesNearAndFarPoses)
 {
   nav2_costmap_2d::Costmap2D costmap(100, 40, 0.05, -1.0, -1.0, 0u);
@@ -997,6 +1369,92 @@ TEST(FootprintClearanceCritic, DistanceFieldSeparatesNearAndFarPoses)
 
   EXPECT_LT(critic.minimumClearance(near_pose), 0.25);
   EXPECT_GT(critic.minimumClearance(far_pose), 0.25);
+}
+
+TEST(FootprintClearanceCritic, ZeroPenaltyBoundPreservesExactPoseScores)
+{
+  nav2_costmap_2d::Costmap2D costmap(160, 120, 0.05, -4.0, -3.0, 0u);
+  for (const auto & obstacle : std::vector<std::pair<double, double>>{
+    {0.0, 0.0}, {2.0, 1.0}, {-1.0, -1.5}})
+  {
+    unsigned int map_x = 0u;
+    unsigned int map_y = 0u;
+    ASSERT_TRUE(costmap.worldToMap(
+        obstacle.first, obstacle.second, map_x, map_y));
+    costmap.setCost(map_x, map_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  }
+
+  CostmapFootprintClearanceCritic critic;
+  critic.setGeometryParameters(0.45, 9, 0.10);
+  ASSERT_TRUE(critic.configure(&costmap));
+  nav2_costmap_2d::Footprint footprint(4);
+  footprint[0].x = -0.2;
+  footprint[0].y = -0.3;
+  footprint[1].x = 0.8;
+  footprint[1].y = -0.3;
+  footprint[2].x = 0.8;
+  footprint[2].y = 0.3;
+  footprint[3].x = -0.2;
+  footprint[3].y = 0.3;
+  ASSERT_TRUE(critic.refreshGeometry(footprint));
+
+  std::size_t proven_zero_count = 0u;
+  std::size_t exact_fallback_count = 0u;
+  for (double x = -3.5; x <= 3.5; x += 0.25) {
+    for (double y = -2.5; y <= 2.5; y += 0.25) {
+      for (const double theta : {0.0, 0.3, 1.2, -2.4}) {
+        geometry_msgs::msg::Pose2D pose;
+        pose.x = x;
+        pose.y = y;
+        pose.theta = theta;
+        const double clearance = critic.minimumClearance(pose);
+        double expected_score = 1.0;
+        if (std::isinf(clearance) && clearance > 0.0) {
+          expected_score = 0.0;
+        } else if (std::isfinite(clearance) && clearance > 0.45) {
+          expected_score = 0.0;
+        } else if (std::isfinite(clearance) && clearance > 0.0) {
+          expected_score = std::pow(1.0 - clearance / 0.45, 1.0);
+        }
+        EXPECT_DOUBLE_EQ(critic.poseScore(pose), expected_score);
+        if (critic.penaltyIsProvablyZero(pose)) {
+          ++proven_zero_count;
+          EXPECT_DOUBLE_EQ(expected_score, 0.0);
+        } else {
+          ++exact_fallback_count;
+        }
+      }
+    }
+  }
+  EXPECT_GT(proven_zero_count, 0u);
+  EXPECT_GT(exact_fallback_count, 0u);
+}
+
+TEST(FootprintClearanceCritic, EmptyFieldSkipsOnlyBeyondMapBoundaryMargin)
+{
+  nav2_costmap_2d::Costmap2D costmap(160, 120, 0.05, -4.0, -3.0, 0u);
+  CostmapFootprintClearanceCritic critic;
+  critic.setGeometryParameters(0.45, 9, 0.10);
+  ASSERT_TRUE(critic.configure(&costmap));
+  nav2_costmap_2d::Footprint footprint(4);
+  footprint[0].x = -0.2;
+  footprint[0].y = -0.3;
+  footprint[1].x = 0.8;
+  footprint[1].y = -0.3;
+  footprint[2].x = 0.8;
+  footprint[2].y = 0.3;
+  footprint[3].x = -0.2;
+  footprint[3].y = 0.3;
+  ASSERT_TRUE(critic.refreshGeometry(footprint));
+
+  geometry_msgs::msg::Pose2D central_pose;
+  EXPECT_TRUE(critic.penaltyIsProvablyZero(central_pose));
+  EXPECT_DOUBLE_EQ(critic.poseScore(central_pose), 0.0);
+
+  geometry_msgs::msg::Pose2D boundary_pose;
+  boundary_pose.x = -3.75;
+  EXPECT_FALSE(critic.penaltyIsProvablyZero(boundary_pose));
+  EXPECT_GT(critic.poseScore(boundary_pose), 0.0);
 }
 
 TEST(FootprintClearanceCritic, ReusesDistanceFieldForUnchangedLethalMask)
@@ -2265,9 +2723,29 @@ TEST(TrajectoryProgressCritic, DoesNotRewardLateralDistance)
   nav_2d_msgs::msg::Twist2D velocity;
   geometry_msgs::msg::Pose2D goal;
   ASSERT_TRUE(critic.prepare(pose, velocity, goal, straight_path(4.0)));
-  auto trajectory = trajectory_to(1.0, 1.0);
-  trajectory.poses.back().y = 3.0;
-  EXPECT_NEAR(critic.scoreTrajectory(trajectory), 1.88, 1.0e-9);
+  const auto nominal = trajectory_to(1.0, 1.0);
+  auto lateral = nominal;
+  lateral.poses.back().y = 3.0;
+  EXPECT_GT(
+    critic.scoreTrajectory(lateral), critic.scoreTrajectory(nominal));
+  EXPECT_NEAR(critic.scoreTrajectory(lateral), 2.38, 1.0e-9);
+}
+
+TEST(TrajectoryProgressCritic, DoesNotRewardShortcutAcrossBend)
+{
+  f_dwa_controller::TrajectoryProgressCritic critic;
+  geometry_msgs::msg::Pose2D pose;
+  nav_2d_msgs::msg::Twist2D velocity;
+  geometry_msgs::msg::Pose2D goal;
+  ASSERT_TRUE(critic.prepare(pose, velocity, goal, right_angle_path()));
+
+  auto following = trajectory_to(1.0, 1.0);
+  following.poses.back().y = 0.5;
+  auto shortcut = following;
+  shortcut.poses.back().x = 2.0;
+
+  EXPECT_LT(
+    critic.scoreTrajectory(following), critic.scoreTrajectory(shortcut));
 }
 
 TEST(TrajectoryProgressCritic, IsNeutralForSinglePosePlanNearGoal)

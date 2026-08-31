@@ -5,9 +5,11 @@
 #include "f_dwa_controller/instrumented_controller.hpp"
 
 #include <chrono>
+#include <exception>
 #include <stdexcept>
 #include <utility>
 
+#include "nav2_core/controller_exceptions.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "rclcpp/qos.hpp"
@@ -111,10 +113,24 @@ geometry_msgs::msg::TwistStamped InstrumentedController::computeVelocityCommands
       std::chrono::steady_clock::now() - start).count();
     publish_computation(start_stamp, duration_ns, true);
     return command;
+  } catch (const nav2_core::NoValidControl & exception) {
+    const auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - start).count();
+    publish_computation(
+      start_stamp, duration_ns, false, "NoValidControl", exception.what());
+    throw;
+  } catch (const std::exception & exception) {
+    const auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - start).count();
+    publish_computation(
+      start_stamp, duration_ns, false, "std_exception", exception.what());
+    throw;
   } catch (...) {
     const auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - start).count();
-    publish_computation(start_stamp, duration_ns, false);
+    publish_computation(
+      start_stamp, duration_ns, false, "unknown_exception",
+      "non-standard controller exception");
     throw;
   }
 }
@@ -139,7 +155,9 @@ void InstrumentedController::reset()
 }
 
 void InstrumentedController::publish_computation(
-  const rclcpp::Time & start_stamp, int64_t duration_ns, bool success) noexcept
+  const rclcpp::Time & start_stamp, int64_t duration_ns, bool success,
+  const std::string & failure_type,
+  const std::string & failure_message) noexcept
 {
   if (!publisher_ || !publisher_->is_activated()) {
     return;
@@ -152,6 +170,8 @@ void InstrumentedController::publish_computation(
   message.duration.sec = static_cast<int32_t>(duration_ns / 1000000000LL);
   message.duration.nanosec = static_cast<uint32_t>(duration_ns % 1000000000LL);
   message.success = success;
+  message.failure_type = failure_type;
+  message.failure_message = failure_message;
   try {
     publisher_->publish(message);
   } catch (...) {

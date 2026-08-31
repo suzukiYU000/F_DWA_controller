@@ -58,7 +58,9 @@ public:
 
 private:
   void publish_computation(
-    const rclcpp::Time & start_stamp, int64_t duration_ns, bool success) noexcept;
+    const rclcpp::Time & start_stamp, int64_t duration_ns, bool success,
+    const std::string & failure_type = {},
+    const std::string & failure_message = {}) noexcept;
 
   pluginlib::ClassLoader<nav2_core::Controller> controller_loader_;
   nav2_core::Controller::Ptr primary_controller_;

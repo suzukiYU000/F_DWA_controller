@@ -393,6 +393,32 @@ TEST(TerminalStopDynamics, JerkReleasesStateInsideVelocityCaptureTube)
   EXPECT_LE(std::abs(sequence.states.back().acceleration), 0.01);
 }
 
+TEST(TerminalStopDynamics, JerkTerminalStateKeepsExactZeroAndHoldWithinLimit)
+{
+  const AxisLimits limits{-0.8, 0.8, -1.6, 1.6, -3.2, 3.2};
+  constexpr double time_step = 0.05;
+  constexpr double initial_speed = 0.008060001544707356;
+
+  for (const double direction : {-1.0, 1.0}) {
+    const StopSequence sequence =
+      generate_jerk_stop_sequence(
+      AxisState{direction * initial_speed, 0.0}, limits,
+      time_step, 200, 0.01);
+
+    SCOPED_TRACE(direction);
+    ASSERT_TRUE(sequence.feasible);
+    ASSERT_TRUE(sequence.terminal_state_cleared);
+    ASSERT_FALSE(sequence.states.empty());
+    const AxisState & terminal = sequence.states.back();
+    const double zero_acceleration = -terminal.velocity / time_step;
+    const double zero_transition_jerk =
+      (zero_acceleration - terminal.acceleration) / time_step;
+    const double zero_hold_jerk = -zero_acceleration / time_step;
+    EXPECT_LT(std::abs(zero_transition_jerk), 3.2);
+    EXPECT_LT(std::abs(zero_hold_jerk), 3.2);
+  }
+}
+
 TEST(TerminalStopDynamics, JerkRandomizedStopsRetainTerminalState)
 {
   const AxisLimits limits{-1.2, 1.2, -1.2, 1.2, -1.57, 1.57};

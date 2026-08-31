@@ -425,6 +425,40 @@ bool state_is_terminal(
          std::abs(state.acceleration) <= terminal_threshold;
 }
 
+bool jerk_state_allows_exact_zero_and_hold(
+  const AxisState & state,
+  const AxisLimits & limits,
+  const double time_step,
+  const double terminal_threshold)
+{
+  if (!state_is_terminal(state, terminal_threshold) ||
+    !std::isfinite(time_step) || time_step <= 0.0)
+  {
+    return false;
+  }
+
+  // The materialized stop suffix ends with an exact zero command followed by
+  // a zero hold. Include both transitions in the terminal condition so the
+  // appended command cannot violate J-DWA's jerk bound near zero velocity.
+  const double zero_transition_acceleration = -state.velocity / time_step;
+  const double zero_transition_jerk =
+    (zero_transition_acceleration - state.acceleration) / time_step;
+  const double zero_hold_jerk =
+    -zero_transition_acceleration / time_step;
+  const double acceleration_minimum =
+    limits.acceleration_min + kBoundTightening;
+  const double acceleration_maximum =
+    limits.acceleration_max - kBoundTightening;
+  const double jerk_minimum = limits.native_input_min + kBoundTightening;
+  const double jerk_maximum = limits.native_input_max - kBoundTightening;
+  return zero_transition_acceleration >= acceleration_minimum &&
+         zero_transition_acceleration <= acceleration_maximum &&
+         zero_transition_jerk >= jerk_minimum &&
+         zero_transition_jerk <= jerk_maximum &&
+         zero_hold_jerk >= jerk_minimum &&
+         zero_hold_jerk <= jerk_maximum;
+}
+
 bool positive_stop_direction(const AxisState & state)
 {
   return state.velocity > 0.0 ||
@@ -533,7 +567,9 @@ StopSequence generate_jerk_stop_sequence(
   {
     return sequence;
   }
-  if (state_is_terminal(initial_state, stop_velocity_threshold)) {
+  if (jerk_state_allows_exact_zero_and_hold(
+      initial_state, limits, time_step, stop_velocity_threshold))
+  {
     sequence.feasible = true;
     sequence.terminal_state_cleared = true;
     return sequence;
@@ -621,7 +657,9 @@ StopSequence generate_jerk_stop_sequence(
     sequence.native_inputs.push_back(step.applied_native_input);
     sequence.states.push_back(step.state);
     state = step.state;
-    if (state_is_terminal(state, stop_velocity_threshold)) {
+    if (jerk_state_allows_exact_zero_and_hold(
+        state, limits, time_step, stop_velocity_threshold))
+    {
       mark_terminal(sequence);
       return sequence;
     }

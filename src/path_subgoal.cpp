@@ -145,25 +145,31 @@ bool pose_sequence_has_meaningful_path_progress(
     heading_error(poses.front());
   // Nearest-path arclength can increase during the first few samples even
   // when the remainder of a trajectory misses a turn. Classify progress from
-  // the executable endpoint, so an early 2.5 cm projection cannot hide a
-  // later departure from the Path.
-  const double maximum_path_distance_growth =
-    std::max(0.0, minimum_arclength_progress);
-  const double maximum_heading_error_growth =
-    minimum_heading_progress > 0.0 ?
-    minimum_heading_progress : std::numeric_limits<double>::infinity();
+  // the executable endpoint. A local planner must, however, be allowed to
+  // leave the reference temporarily to avoid an unknown obstacle. Treat an
+  // endpoint as translational progress when its Path-station advance is at
+  // least as large as any newly introduced cross-track error. PathDeviation
+  // remains the finite corridor constraint; this test only prevents a motion
+  // dominated by departure from being promoted as recovery progress.
   const auto & terminal_pose = poses.back();
   PathProjection terminal_projection;
   if (!project_pose_onto_path(path, terminal_pose, terminal_projection)) {
     return false;
   }
+  const double arclength_progress =
+    terminal_projection.arclength - initial_projection.arclength;
+  const double path_distance_growth =
+    terminal_projection.distance - initial_projection.distance;
+  const double maximum_path_distance_growth = std::max(
+    std::max(0.0, minimum_arclength_progress), arclength_progress);
+  const double terminal_path_heading_error = std::abs(std::remainder(
+      terminal_projection.tangent_heading - terminal_pose.theta,
+      2.0 * M_PI));
   if (minimum_arclength_progress > 0.0 &&
-    terminal_projection.arclength - initial_projection.arclength >=
+    arclength_progress >=
     minimum_arclength_progress - 1.0e-12 &&
-    terminal_projection.distance <= initial_projection.distance +
-    maximum_path_distance_growth + 1.0e-12 &&
-    heading_error(terminal_pose) <= initial_heading_error +
-    maximum_heading_error_growth + 1.0e-12)
+    path_distance_growth <= maximum_path_distance_growth + 1.0e-12 &&
+    terminal_path_heading_error <= M_PI_2 + 1.0e-12)
   {
     return true;
   }
