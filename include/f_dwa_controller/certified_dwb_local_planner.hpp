@@ -358,7 +358,7 @@ private:
   void stop_diagnostic_publisher();
   void diagnostic_publisher_loop();
   void publish_diagnostics_now(const DiagnosticPublication & publication);
-  bool should_publish_candidate_markers() const;
+  bool should_publish_candidate_markers();
   void publish_candidate_markers(
     const dwb_msgs::msg::LocalPlanEvaluation & evaluation);
   void prepare_collision_footprints();
@@ -496,8 +496,11 @@ private:
   bool publish_candidate_markers_{true};
   bool record_full_evaluation_details_{false};
   double evaluation_publish_frequency_{0.0};
+  double candidate_marker_publish_frequency_{5.0};
   rclcpp::Time last_evaluation_publish_time_{0, 0, RCL_ROS_TIME};
   bool has_evaluation_publish_time_{false};
+  rclcpp::Time last_candidate_marker_publish_time_{0, 0, RCL_ROS_TIME};
+  bool has_candidate_marker_publish_time_{false};
   std::vector<double> planning_durations_seconds_;
   uint64_t planning_cycle_count_{0};
   uint64_t planning_deadline_miss_count_{0};

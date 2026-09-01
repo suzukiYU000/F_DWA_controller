@@ -307,6 +307,10 @@ controller_server:
       # separate candidate-animation diagnostic mode is explicitly enabled.
       publish_evaluation: true
       evaluation_publish_frequency: 0.2
+      # Rendering every 20 Hz control cycle adds no control information but
+      # forces RViz to rebuild all 165 trajectory markers each time. Keep the
+      # live fan responsive while limiting diagnostic CPU/GPU and DDS load.
+      candidate_marker_publish_frequency: 5.0
       publish_trajectories: false
       stateful: true
       critics:
@@ -655,10 +659,9 @@ local_costmap:
       # Match the 20 Hz controller so a newly marked obstacle is not held for
       # an additional 100 ms before committed-delay revalidation.
       update_frequency: 20.0
-      # One snapshot per second is sufficient to associate every 0.5 Hz
-      # candidate evaluation with its local costmap without affecting the
-      # internal 20 Hz costmap update used by control.
-      publish_frequency: 1.0
+      # Publish the visualization grid at 10 Hz so RViz exposes short-lived
+      # obstacle changes without changing the internal 20 Hz control update.
+      publish_frequency: 10.0
       resolution: 0.05
       # A 10 m rolling window has a 5 m half-width and clipped the LB_N
       # obstacle until after J/F-DWA had committed their jerk/FIR state. Keep
@@ -702,6 +705,12 @@ local_costmap:
 global_costmap:
   global_costmap:
     ros__parameters:
+      # Keep RViz's global planning-cost display aligned with the local
+      # visualization cadence. Nav2 only publishes after a Costmap update, so
+      # its update timer must run at the same rate to produce a real 10 Hz
+      # stream.
+      update_frequency: 10.0
+      publish_frequency: 10.0
       resolution: 0.05
       footprint: "[[-0.2, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.2, 0.3]]"
       # Keep the global and local planning geometry identical. This also keeps

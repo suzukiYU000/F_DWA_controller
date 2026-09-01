@@ -485,6 +485,9 @@ void CertifiedDWBLocalPlanner::configure(
   nav2_util::declare_parameter_if_not_declared(
     node, name + ".publish_candidate_markers",
     rclcpp::ParameterValue(true));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".candidate_marker_publish_frequency",
+    rclcpp::ParameterValue(5.0));
 
   node->get_parameter(name + ".enable_certification", certification_enabled_);
   node->get_parameter(
@@ -668,6 +671,9 @@ void CertifiedDWBLocalPlanner::configure(
   node->get_parameter(
     name + ".publish_candidate_markers",
     publish_candidate_markers_);
+  node->get_parameter(
+    name + ".candidate_marker_publish_frequency",
+    candidate_marker_publish_frequency_);
   const std::string command_dispatch_topic =
     node->get_parameter(name + ".command_dispatch_topic").as_string();
   const std::string transport_valid_topic =
@@ -739,7 +745,9 @@ void CertifiedDWBLocalPlanner::configure(
     planning_metrics_report_interval_ <= 0 ||
     !is_positive_finite(planning_deadline_seconds_) ||
     !std::isfinite(evaluation_publish_frequency_) ||
-    evaluation_publish_frequency_ < 0.0)
+    evaluation_publish_frequency_ < 0.0 ||
+    !std::isfinite(candidate_marker_publish_frequency_) ||
+    candidate_marker_publish_frequency_ < 0.0)
   {
     throw nav2_core::ControllerException(
             "Invalid delay-preview or trajectory-certification parameter");
@@ -2740,11 +2748,29 @@ void CertifiedDWBLocalPlanner::publish_diagnostics_now(
   }
 }
 
-bool CertifiedDWBLocalPlanner::should_publish_candidate_markers() const
+bool CertifiedDWBLocalPlanner::should_publish_candidate_markers()
 {
-  return publish_candidate_markers_ && candidate_marker_publisher_ &&
-         candidate_marker_publisher_->is_activated() &&
-         candidate_marker_publisher_->get_subscription_count() > 0u;
+  if (!publish_candidate_markers_ || !candidate_marker_publisher_ ||
+    !candidate_marker_publisher_->is_activated() ||
+    candidate_marker_publisher_->get_subscription_count() == 0u)
+  {
+    return false;
+  }
+  const rclcpp::Time current_time = clock_->now();
+  if (candidate_marker_publish_frequency_ > 0.0) {
+    const double minimum_period =
+      1.0 / candidate_marker_publish_frequency_;
+    if (has_candidate_marker_publish_time_ &&
+      current_time >= last_candidate_marker_publish_time_ &&
+      (current_time - last_candidate_marker_publish_time_).seconds() <
+      minimum_period)
+    {
+      return false;
+    }
+  }
+  last_candidate_marker_publish_time_ = current_time;
+  has_candidate_marker_publish_time_ = true;
+  return true;
 }
 
 void CertifiedDWBLocalPlanner::publish_candidate_markers(
@@ -2937,6 +2963,7 @@ void CertifiedDWBLocalPlanner::setPlan(const nav_msgs::msg::Path & path)
   terminal_stop_goal_capture_active_ = false;
   terminal_stop_goal_capture_committed_ = false;
   has_evaluation_publish_time_ = false;
+  has_candidate_marker_publish_time_ = false;
   current_goal_pose_valid_ = false;
   current_terminal_path_heading_valid_ = false;
   current_terminal_distance_target_pose_valid_ = false;
@@ -3007,6 +3034,7 @@ void CertifiedDWBLocalPlanner::reset()
   terminal_stop_goal_capture_committed_ = false;
   planning_snapshot_.reset();
   has_evaluation_publish_time_ = false;
+  has_candidate_marker_publish_time_ = false;
   current_goal_pose_valid_ = false;
   terminal_reference_plan_.poses.clear();
   current_terminal_path_heading_valid_ = false;
