@@ -823,20 +823,7 @@ void CertifiedDWBLocalPlanner::configure(
   clearance_constraint_guard_footprint_critic_ =
     std::dynamic_pointer_cast<FootprintClearanceCritic>(
     clearance_constraint_guard_critic_);
-  node->get_parameter(
-    plugin_name + ".min_vel_x", minimum_linear_velocity_);
-  node->get_parameter(
-    plugin_name + ".max_vel_x", maximum_linear_velocity_);
-  node->get_parameter(
-    plugin_name + ".max_vel_theta", maximum_angular_velocity_);
-  node->get_parameter(
-    plugin_name + ".acc_lim_x", maximum_linear_acceleration_);
-  node->get_parameter(
-    plugin_name + ".decel_lim_x", maximum_linear_deceleration_);
-  node->get_parameter(
-    plugin_name + ".acc_lim_theta", maximum_angular_acceleration_);
-  node->get_parameter(
-    plugin_name + ".decel_lim_theta", maximum_angular_deceleration_);
+  reload_motion_limits();
 
   clock_ = node->get_clock();
   // Evaluation is diagnostic output. Buffer two seconds at the common 10 Hz
@@ -6498,11 +6485,56 @@ AxisLimits CertifiedDWBLocalPlanner::angular_limits() const
     maximum_angular_deceleration_, maximum_angular_acceleration_};
 }
 
+void CertifiedDWBLocalPlanner::reload_motion_limits()
+{
+  const auto node = node_.lock();
+  if (!node) {
+    throw std::runtime_error("Controller node is unavailable for motion-limit reload");
+  }
+  const auto parameters = node->get_parameters({
+      dwb_plugin_name_ + ".min_vel_x", dwb_plugin_name_ + ".max_vel_x",
+      dwb_plugin_name_ + ".max_vel_theta", dwb_plugin_name_ + ".acc_lim_x",
+      dwb_plugin_name_ + ".decel_lim_x", dwb_plugin_name_ + ".acc_lim_theta",
+      dwb_plugin_name_ + ".decel_lim_theta"});
+  std::vector<double> values;
+  for (const auto & parameter : parameters) {
+    const double value = parameter.as_double();
+    if (!std::isfinite(value)) {
+      throw std::invalid_argument(parameter.get_name() + " must be finite");
+    }
+    values.push_back(value);
+  }
+  if (values[0] > values[1] || values[1] <= 0.0 || values[2] <= 0.0 ||
+    values[3] <= 0.0 || values[4] >= 0.0 || values[5] <= 0.0 || values[6] >= 0.0)
+  {
+    throw std::invalid_argument("Invalid Controller velocity or acceleration limits");
+  }
+  // Commit together at the stopped trial boundary, not during a rollout.
+  minimum_linear_velocity_ = values[0];
+  maximum_linear_velocity_ = values[1];
+  maximum_angular_velocity_ = values[2];
+  maximum_linear_acceleration_ = values[3];
+  maximum_linear_deceleration_ = values[4];
+  maximum_angular_acceleration_ = values[5];
+  maximum_angular_deceleration_ = values[6];
+  RCLCPP_INFO(
+    logger_, "%s internal motion limits reloaded: v=%.6f w=%.6f a=%.6f aw=%.6f",
+    dwb_plugin_name_.c_str(), maximum_linear_velocity_, maximum_angular_velocity_,
+    maximum_linear_acceleration_, maximum_angular_acceleration_);
+}
+
 void CertifiedDWBLocalPlanner::reset_trial_callback(
   const std::shared_ptr<std_srvs::srv::Trigger::Request>/*request*/,
   std::shared_ptr<std_srvs::srv::Trigger::Response> response)
 {
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
+  try {
+    reload_motion_limits();
+  } catch (const std::exception & error) {
+    response->success = false;
+    response->message = error.what();
+    return;
+  }
   report_planning_metrics("trial_end");
   planning_durations_seconds_.clear();
   planning_cycle_count_ = 0;

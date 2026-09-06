@@ -2833,6 +2833,60 @@ TEST_F(
   EXPECT_DOUBLE_EQ(first_command.theta, second_command.theta);
 }
 
+TEST_F(NativeInputTrajectoryGeneratorTest, VdwaRuntimeLimitsReachGuiSpeed)
+{
+  const auto node = make_node("v_runtime_limits", true, false, false, 0.0, 0.2, 0.2, 0.05);
+  VLimitedAccelTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  ASSERT_TRUE(node->set_parameters_atomically({
+      rclcpp::Parameter("FollowPath.max_vel_x", 0.8),
+      rclcpp::Parameter("FollowPath.max_speed_xy", 0.8),
+      rclcpp::Parameter("FollowPath.max_vel_theta", 0.8),
+      rclcpp::Parameter("FollowPath.acc_lim_x", 1.6),
+      rclcpp::Parameter("FollowPath.decel_lim_x", -1.6),
+      rclcpp::Parameter("FollowPath.acc_lim_theta", 1.6),
+      rclcpp::Parameter("FollowPath.decel_lim_theta", -1.6),
+      rclcpp::Parameter("FollowPath.sim_time", 2.5)}).successful);
+  generator.reset();
+  nav_2d_msgs::msg::Twist2D velocity;
+  for (int cycle = 0; cycle < 12; ++cycle) {
+    generator.startNewIteration(velocity);
+    ASSERT_TRUE(generator.hasMoreTwists());
+    nav_2d_msgs::msg::Twist2D selected;
+    while (generator.hasMoreTwists()) {
+      const auto candidate = generator.nextTwist();
+      EXPECT_LE(candidate.x, 0.8 + 1e-9);
+      EXPECT_LE(std::abs(candidate.theta), 0.8 + 1e-9);
+      EXPECT_LE(std::abs(candidate.x - velocity.x), 1.6 * 0.05 + 1e-9);
+      EXPECT_LE(std::abs(candidate.theta - velocity.theta), 1.6 * 0.05 + 1e-9);
+      if (candidate.x > selected.x ||
+        (candidate.x == selected.x && candidate.theta > selected.theta))
+      {
+        selected = candidate;
+      }
+    }
+    velocity = selected;
+  }
+  EXPECT_NEAR(velocity.x, 0.8, 1e-9);
+  EXPECT_NEAR(velocity.theta, 0.8, 1e-9);
+  const auto trajectory = generator.generateTrajectory(
+    geometry_msgs::msg::Pose2D(), velocity, velocity);
+  ASSERT_FALSE(trajectory.time_offsets.empty());
+  EXPECT_NEAR(rclcpp::Duration(trajectory.time_offsets.back()).seconds(), 2.5, 1e-8);
+  ASSERT_TRUE(node->set_parameters_atomically({
+      rclcpp::Parameter("FollowPath.max_vel_x", 0.1),
+      rclcpp::Parameter("FollowPath.max_speed_xy", 0.1),
+      rclcpp::Parameter("FollowPath.max_vel_theta", 0.1)}).successful);
+  generator.reset();
+  generator.startNewIteration(nav_2d_msgs::msg::Twist2D());
+  ASSERT_TRUE(generator.hasMoreTwists());
+  while (generator.hasMoreTwists()) {
+    const auto candidate = generator.nextTwist();
+    EXPECT_LE(candidate.x, 0.1 + 1e-9);
+    EXPECT_LE(std::abs(candidate.theta), 0.1 + 1e-9);
+  }
+}
+
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
   VdwaWindowContinuesFromCorrelatedActivationCommand)

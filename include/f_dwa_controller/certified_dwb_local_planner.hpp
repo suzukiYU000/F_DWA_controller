@@ -385,6 +385,7 @@ private:
     bool allow_persistent_localization_overlap = false) const;
   AxisLimits linear_limits() const;
   AxisLimits angular_limits() const;
+  void reload_motion_limits();
   void reset_trial_callback(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
