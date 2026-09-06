@@ -218,9 +218,15 @@ CommandDelayNode::CommandDelayNode(const rclcpp::NodeOptions & options)
   const auto publish_period = std::chrono::nanoseconds(
     static_cast<int64_t>(std::llround(1.0e9 / publish_frequency_hz)));
   publish_period_nanoseconds_ = publish_period.count();
-  publish_timer_ = create_wall_timer(
-    publish_period,
-    std::bind(&CommandDelayNode::timer_callback, this));
+  use_sim_time_ = get_parameter("use_sim_time").as_bool();
+  if (use_sim_time_) {
+    publish_timer_ = rclcpp::create_timer(
+      get_node_base_interface(), get_node_timers_interface(), get_clock(),
+      publish_period, std::bind(&CommandDelayNode::timer_callback, this));
+  } else {
+    publish_timer_ = create_wall_timer(
+      publish_period, std::bind(&CommandDelayNode::timer_callback, this));
+  }
   reset_trial_service_ = create_service<std_srvs::srv::Trigger>(
     reset_trial_service_name,
     std::bind(
@@ -299,8 +305,8 @@ void CommandDelayNode::command_callback(
       return;
     }
     if (has_command_received_steady_time_) {
-      const double input_interval_seconds =
-        static_cast<double>(
+      const double input_interval_seconds = use_sim_time_ ?
+        (received_at - last_command_received_time_).seconds() : static_cast<double>(
         received_steady_time_ns - last_command_received_steady_time_ns_) * 1.0e-9;
       if (input_interval_seconds < minimum_input_interval_seconds_) {
         std::ostringstream reason;
@@ -358,11 +364,13 @@ void CommandDelayNode::timer_callback()
     {
       invalidate_transport(callback_time, "ROS time moved backwards");
     }
-    if (has_robot_publish_steady_time_ &&
-      callback_started_steady_time_ns >= last_robot_publish_steady_time_ns_ &&
+    const bool early_publish = use_sim_time_ ?
+      (callback_time >= last_robot_publish_time_ &&
+      (callback_time - last_robot_publish_time_).nanoseconds() < publish_period_nanoseconds_) :
+      (callback_started_steady_time_ns >= last_robot_publish_steady_time_ns_ &&
       callback_started_steady_time_ns - last_robot_publish_steady_time_ns_ <
-      static_cast<uint64_t>(publish_period_nanoseconds_))
-    {
+      static_cast<uint64_t>(publish_period_nanoseconds_));
+    if (has_robot_publish_steady_time_ && early_publish) {
       // A reset request or executor scheduling race can make a callback ready
       // before one complete robot-facing period has elapsed. It must neither
       // consume the FIFO nor publish early.
@@ -389,8 +397,10 @@ void CommandDelayNode::timer_callback()
       reset_applied = true;
     } else if (transport_valid_) {
       advance_velocity_response_locked(callback_time);
-      const auto due_command = delay_queue_->pop_due_steady(
-        callback_started_steady_time_ns);
+      // Keep monotonic receipt provenance for ledger matching, but model the
+      // delay in the same time domain as the simulated plant and controller.
+      const auto due_command = use_sim_time_ ? delay_queue_->pop_due(callback_time) :
+        delay_queue_->pop_due_steady(callback_started_steady_time_ns);
       if (due_command.has_value()) {
         last_dispatched_command_ = due_command->command;
         if (velocity_response_model_enabled_) {
@@ -426,13 +436,14 @@ void CommandDelayNode::timer_callback()
     dispatch_steady_time_ns =
       steady_time_nanoseconds(std::chrono::steady_clock::now());
     last_robot_publish_steady_time_ns_ = dispatch_steady_time_ns;
+    last_robot_publish_time_ = dispatch_time;
     has_robot_publish_steady_time_ = true;
   }
 
   // Re-anchor at the Timer-owned robot handoff epoch before DDS and status
   // work. In accelerated simulation, adding that work to every period makes
   // an equally rated upstream producer slowly fill the bounded FIFO.
-  // The strict steady-time handoff gate above still prevents catch-up.
+  // The clock-specific handoff gate above still prevents catch-up.
   publish_timer_->reset();
 
   std::lock_guard<std::mutex> publication_lock(publish_mutex_);
@@ -559,6 +570,7 @@ void CommandDelayNode::emergency_stop_callback(
     last_command_received_steady_time_ns_ = 0u;
     has_command_received_steady_time_ = false;
     last_robot_publish_steady_time_ns_ = stopped_steady_time_ns;
+    last_robot_publish_time_ = stopped_at;
     has_robot_publish_steady_time_ = true;
   }
 

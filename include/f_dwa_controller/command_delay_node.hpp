@@ -103,6 +103,7 @@ private:
   double stopped_velocity_threshold_{0.01};
   double minimum_input_interval_seconds_{0.0};
   bool velocity_response_model_enabled_{false};
+  bool use_sim_time_{false};
   AxisVelocityResponseModel linear_velocity_response_model_{0.035, 0.02, 1.0};
   AxisVelocityResponseModel angular_velocity_response_model_{0.015, 0.085, 0.95};
   rclcpp::Time response_state_time_{0, 0, RCL_ROS_TIME};
@@ -114,6 +115,7 @@ private:
   int64_t publish_period_nanoseconds_{30000000};
   uint64_t last_robot_publish_steady_time_ns_{0};
   bool has_robot_publish_steady_time_{false};
+  rclcpp::Time last_robot_publish_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_observed_time_{0, 0, RCL_ROS_TIME};
   bool has_observed_time_{false};
   rclcpp::Time last_command_received_time_{0, 0, RCL_ROS_TIME};

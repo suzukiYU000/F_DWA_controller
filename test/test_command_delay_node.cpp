@@ -22,11 +22,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <future>
 #include <limits>
 #include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "f_dwa_controller/command_delay_node.hpp"
@@ -54,6 +56,145 @@ protected:
     rclcpp::shutdown();
   }
 };
+
+class SimulatedCommandDelayNodeTest : public CommandDelayNodeTest,
+  public ::testing::WithParamInterface<std::tuple<int, int64_t>>
+{};
+
+TEST_P(SimulatedCommandDelayNodeTest, DelayResponseAndResetFollowPlantClock)
+{
+  const int wall_wait_ms = std::get<0>(GetParam());
+  const int64_t period_ns = std::get<1>(GetParam());
+  const double period_s = period_ns * 1e-9;
+  constexpr int64_t kEpoch = 1000000000;
+  constexpr int64_t kResetEpoch = 500000000;
+  rclcpp::NodeOptions options;
+  options.parameter_overrides(std::vector<rclcpp::Parameter>{
+      {"use_sim_time", true},
+      {"input_topic", "/clock_test/input"},
+      {"output_topic", "/clock_test/output"},
+      {"dispatch_topic", "/clock_test/dispatch"},
+      {"transport_valid_topic", "/clock_test/valid"},
+      {"reset_trial_service_name", "/clock_test/reset"},
+      {"emergency_stop_service_name", "/clock_test/emergency"},
+      {"publish_frequency_hz", 1.0 / period_s},
+      {"minimum_input_interval_ms", 500.0 * period_s},
+      {"min_delay_ms", 2000.0 * period_s}, {"max_delay_ms", 2000.0 * period_s},
+      {"mean_delay_ms", 2000.0 * period_s}, {"delay_stddev_ms", 0.0},
+      {"enable_velocity_response_model", true},
+      {"linear_velocity_response_dead_time_seconds", period_s},
+      {"linear_velocity_response_time_constant_seconds", 2.0 * period_s},
+      {"linear_velocity_response_gain", 1.0}});
+  const auto transport = std::make_shared<CommandDelayNode>(options);
+  const auto client = std::make_shared<rclcpp::Node>("clock_test_client");
+  const auto publisher = client->create_publisher<geometry_msgs::msg::Twist>(
+    "/clock_test/input", 10);
+  std::vector<geometry_msgs::msg::Twist> outputs;
+  std::vector<msg::CommandDispatch> dispatches;
+  std::vector<bool> validity;
+  const auto output_sub = client->create_subscription<geometry_msgs::msg::Twist>(
+    "/clock_test/output", 10,
+    [&](geometry_msgs::msg::Twist::SharedPtr message) {outputs.push_back(*message);});
+  const auto dispatch_sub = client->create_subscription<msg::CommandDispatch>(
+    "/clock_test/dispatch", rclcpp::QoS(10).reliable().transient_local(),
+    [&](msg::CommandDispatch::SharedPtr message) {dispatches.push_back(*message);});
+  const auto valid_sub = client->create_subscription<std_msgs::msg::Bool>(
+    "/clock_test/valid", rclcpp::QoS(10).reliable().transient_local(),
+    [&](std_msgs::msg::Bool::SharedPtr message) {validity.push_back(message->data);});
+  const auto reset = client->create_client<std_srvs::srv::Trigger>("/clock_test/reset");
+  const auto emergency = client->create_client<std_srvs::srv::Trigger>("/clock_test/emergency");
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(transport);
+  executor.add_node(client);
+  const auto spin_for = [&](int wall_ms) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wall_ms);
+      while (std::chrono::steady_clock::now() < deadline) {
+        executor.spin_some();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    };
+  const auto set_time = [&](int64_t stamp_ns) {
+      EXPECT_EQ(rcl_set_ros_time_override(
+          transport->get_clock()->get_clock_handle(), stamp_ns), RCL_RET_OK);
+      spin_for(wall_wait_ms);
+    };
+  ASSERT_TRUE(reset->wait_for_service(std::chrono::seconds(1)));
+  spin_for(200);
+  set_time(kEpoch);
+  geometry_msgs::msg::Twist command;
+  command.linear.x = 1.0;
+  publisher->publish(command);
+  spin_for(200);
+  ASSERT_FALSE(outputs.empty());
+  EXPECT_DOUBLE_EQ(outputs.back().linear.x, 0.0);
+  const auto paused_count = outputs.size();
+  spin_for(200);
+  EXPECT_EQ(outputs.size(), paused_count);
+  set_time(kEpoch + period_ns);
+  EXPECT_DOUBLE_EQ(outputs.back().linear.x, 0.0);
+  EXPECT_FALSE(dispatches.back().has_sequence);
+  set_time(kEpoch + 2 * period_ns);
+  ASSERT_TRUE(dispatches.back().has_sequence);
+  EXPECT_EQ(rclcpp::Time(dispatches.back().header.stamp).nanoseconds(), kEpoch + 2 * period_ns);
+  EXPECT_EQ(rclcpp::Time(dispatches.back().received_at).nanoseconds(), kEpoch);
+  EXPECT_GT(dispatches.back().received_steady_time_ns, 0u);
+  set_time(kEpoch + 3 * period_ns);
+  EXPECT_NEAR(outputs.back().linear.x, 0.0, 1e-12);
+  set_time(kEpoch + 4 * period_ns);
+  EXPECT_NEAR(outputs.back().linear.x, 1.0 - std::exp(-0.5), 1e-12);
+  set_time(kEpoch + 5 * period_ns);
+  EXPECT_NEAR(outputs.back().linear.x, 1.0 - std::exp(-1.0), 1e-12);
+
+  // Time reversal invalidates pending history, requiring an explicit reset.
+  publisher->publish(command);
+  spin_for(50);
+  set_time(kResetEpoch);
+  set_time(kResetEpoch + period_ns);
+  ASSERT_FALSE(validity.empty());
+  EXPECT_FALSE(validity.back());
+  EXPECT_DOUBLE_EQ(outputs.back().linear.x, 0.0);
+  auto reset_result =
+    reset->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+  spin_for(100);
+  ASSERT_EQ(reset_result.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  EXPECT_TRUE(reset_result.get()->success);
+  EXPECT_FALSE(validity.back());
+  set_time(kResetEpoch + 2 * period_ns);
+  EXPECT_TRUE(validity.back());
+  EXPECT_FALSE(dispatches.back().has_sequence);
+  set_time(kResetEpoch + 3 * period_ns);
+  EXPECT_DOUBLE_EQ(outputs.back().linear.x, 0.0);
+  EXPECT_FALSE(dispatches.back().has_sequence);
+
+  // An explicit emergency remains immediate, including while /clock is paused.
+  publisher->publish(command);
+  spin_for(50);
+  auto stopped = emergency->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+  spin_for(100);
+  ASSERT_EQ(stopped.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  EXPECT_TRUE(stopped.get()->success);
+  EXPECT_FALSE(validity.back());
+  EXPECT_DOUBLE_EQ(outputs.back().linear.x, 0.0);
+
+  // Paused-clock duplicate inputs cannot evade spacing validation merely by
+  // arriving many wall milliseconds apart.
+  auto reset_after_stop = reset->async_send_request(
+    std::make_shared<std_srvs::srv::Trigger::Request>());
+  spin_for(100);
+  ASSERT_EQ(reset_after_stop.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  EXPECT_TRUE(reset_after_stop.get()->success);
+  set_time(kResetEpoch + 4 * period_ns);
+  EXPECT_TRUE(validity.back());
+  publisher->publish(command);
+  spin_for(50);
+  publisher->publish(command);
+  spin_for(50);
+  EXPECT_FALSE(validity.back());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  WallPacing, SimulatedCommandDelayNodeTest,
+  ::testing::Combine(::testing::Values(20, 120), ::testing::Values(30000000LL, 50000000LL)));
 
 TEST_F(CommandDelayNodeTest, TrialResetIsAppliedOnlyAtNextTimerBoundary)
 {
