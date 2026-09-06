@@ -982,6 +982,45 @@ TEST(FootprintClearanceCritic, ReturnsBoundedDistanceExposure)
     critic.scoreTrajectory(empty), dwb_core::IllegalTrajectoryException);
 }
 
+TEST(FootprintClearanceCritic, PreservesGradientInsideConservativeDistanceAllowance)
+{
+  StubFootprintClearanceCritic critic;
+  geometry_msgs::msg::Pose2D pose;
+  critic.setClearanceShape(0.50, 3.0);
+  critic.setLocalizationUncertaintyMargin(0.10);
+
+  critic.setFixedClearance(0.0);
+  EXPECT_DOUBLE_EQ(critic.scorePose(pose), 1.0);
+  critic.setFixedClearance(-0.01);
+  const double shallow = critic.scorePose(pose);
+  critic.setFixedClearance(-0.06);
+  const double deeper = critic.scorePose(pose);
+  EXPECT_GT(shallow, 1.0);
+  EXPECT_GT(deeper, shallow);
+  EXPECT_NEAR(deeper, 1.331, 1.0e-12);
+
+  const auto trajectory = trajectory_to(1.0, 1.0);
+  EXPECT_NEAR(critic.scoreTrajectory(trajectory), deeper, 1.0e-12);
+  double approach = 0.0;
+  EXPECT_NEAR(
+    critic.scoreUniformPoseSequenceWithApproachRisk(trajectory.poses, &approach),
+    deeper, 1.0e-12);
+  EXPECT_DOUBLE_EQ(approach, 0.0);
+
+  critic.setLinearClearance(-0.06, 0.06);
+  auto away = trajectory.poses;
+  auto toward = trajectory.poses;
+  for (auto & point : toward) {
+    point.x = -point.x;
+  }
+  const double away_cost =
+    critic.scoreUniformPoseSequenceWithApproachRisk(away, nullptr);
+  const double toward_cost =
+    critic.scoreUniformPoseSequenceWithApproachRisk(toward, nullptr);
+  EXPECT_LT(away_cost, deeper);
+  EXPECT_GT(toward_cost, deeper);
+}
+
 TEST(FootprintClearanceCritic, RewardsLeavingAnAlreadyEnteredSoftMargin)
 {
   StubFootprintClearanceCritic critic;
@@ -1204,7 +1243,7 @@ TEST(FootprintClearanceCritic, SpatiallySamplesUniformStopExposure)
   EXPECT_NEAR(approach_risk, 0.9, 1.0e-12);
 }
 
-TEST(FootprintClearanceCritic, PreservesDirectionInsideSaturatedSoftRisk)
+TEST(FootprintClearanceCritic, PreservesDirectionInsideSignedSoftRisk)
 {
   StubFootprintClearanceCritic critic;
   critic.setLinearClearance(-0.02, -0.04);
@@ -1218,14 +1257,14 @@ TEST(FootprintClearanceCritic, PreservesDirectionInsideSaturatedSoftRisk)
   EXPECT_DOUBLE_EQ(
     critic.scoreUniformPoseSequenceWithApproachRisk(
       {first, middle, last}, &approach_risk),
-    1.0);
+    1.05);
   EXPECT_NEAR(approach_risk, 0.04, 1.0e-12);
 
   approach_risk = -1.0;
   EXPECT_DOUBLE_EQ(
     critic.scoreUniformPoseSequenceWithApproachRisk(
       {last, middle, first}, &approach_risk),
-    1.0);
+    1.05);
   EXPECT_DOUBLE_EQ(approach_risk, 0.0);
 }
 
@@ -1413,7 +1452,7 @@ TEST(FootprintClearanceCritic, ZeroPenaltyBoundPreservesExactPoseScores)
           expected_score = 0.0;
         } else if (std::isfinite(clearance) && clearance > 0.45) {
           expected_score = 0.0;
-        } else if (std::isfinite(clearance) && clearance > 0.0) {
+        } else if (std::isfinite(clearance)) {
           expected_score = std::pow(1.0 - clearance / 0.45, 1.0);
         }
         EXPECT_DOUBLE_EQ(critic.poseScore(pose), expected_score);

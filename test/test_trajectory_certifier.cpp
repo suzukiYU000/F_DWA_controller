@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <memory>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -1364,6 +1365,76 @@ TEST(TrajectoryCertifier, MalformedBroadphaseFallsBackToExactCheck)
   EXPECT_EQ(
     malformed_workspace.failure,
     CertificationFailure::kLethalObstacle);
+}
+
+TEST(TrajectoryCertifier, CachedFailureCannotSurviveMapGeometryChange)
+{
+  nav2_costmap_2d::Costmap2D map(100, 100, 0.05, -2.5, -2.5, 0);
+  const auto footprint = whill_footprint();
+  const std::vector<geometry_msgs::msg::Pose2D> poses(1);
+  unsigned int x, y;
+  ASSERT_TRUE(map.worldToMap(0.3, 0.0, x, y));
+  map.setCost(x, y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(map, workspace));
+  ASSERT_FALSE(certify_pose_sequence(map, footprint, poses, 0.025, &workspace).safe);
+  ASSERT_FALSE(workspace.pose_check_cache.empty());
+  map.resizeMap(100, 100, 0.05, -2.4, -2.5);
+  EXPECT_TRUE(certify_pose_sequence(map, footprint, poses, 0.025, &workspace).safe);
+}
+
+TEST(TrajectoryCertifier, CacheInvalidationAndPolicyChangeRecomputeExactly)
+{
+  nav2_costmap_2d::Costmap2D map(100, 100, 0.05, -2.5, -2.5, 0);
+  const auto footprint = whill_footprint();
+  const std::vector<geometry_msgs::msg::Pose2D> poses(1);
+  unsigned int x, y;
+  ASSERT_TRUE(map.worldToMap(0.3, 0.0, x, y));
+  map.setCost(x, y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(map, workspace));
+  ASSERT_EQ(certify_pose_sequence(map, footprint, poses, 0.025, &workspace).failure,
+    CertificationFailure::kLethalObstacle);
+  ASSERT_TRUE(workspace.pose_check_cache_valid);
+  invalidate_certification_broadphase(workspace);
+  EXPECT_FALSE(workspace.pose_check_cache_valid);
+  map.setCost(x, y, nav2_costmap_2d::NO_INFORMATION);
+  ASSERT_TRUE(prepare_certification_broadphase(map, workspace));
+  EXPECT_FALSE(workspace.pose_check_cache_valid);
+  EXPECT_EQ(certify_pose_sequence(map, footprint, poses, 0.025, &workspace).failure,
+    CertificationFailure::kUnknownSpace);
+  EXPECT_TRUE(certify_pose_sequence(map, footprint, poses, 0.025, &workspace, true).safe);
+  EXPECT_EQ(certify_pose_sequence(map, footprint, poses, 0.025, &workspace).failure,
+    CertificationFailure::kUnknownSpace);
+}
+
+TEST(TrajectoryCertifier, PoseCacheNeverMergesDifferentPosesOrFootprints)
+{
+  nav2_costmap_2d::Costmap2D map(100, 100, 0.025, -1.25, -1.25, 0);
+  auto footprint = whill_footprint();
+  const auto original_footprint = footprint;
+  std::vector<geometry_msgs::msg::Pose2D> poses(1);
+  unsigned int x, y;
+  ASSERT_TRUE(map.worldToMap(0.85, 0.24, x, y));
+  map.setCost(x, y, nav2_costmap_2d::LETHAL_OBSTACLE);
+  CertificationWorkspace workspace;
+  ASSERT_TRUE(prepare_certification_broadphase(map, workspace));
+  for (unsigned int iteration = 0u; iteration < 120u; ++iteration) {
+    // Repeated poses, sub-cell translations, and a single-vertex mutation
+    // must agree with the uncached polygon/cell check, including diagnostics.
+    footprint = original_footprint;
+    poses.front().x = (iteration % 3u) * 0.027;
+    poses.front().theta = (iteration % 5u) * 0.001;
+    if (iteration % 2u == 0u) {
+      footprint[2].x += 0.10;
+    }
+    const auto reference = certify_pose_sequence(map, footprint, poses, 0.025);
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      expect_same_certification(reference,
+        certify_pose_sequence(map, footprint, poses, 0.025, &workspace));
+    }
+    EXPECT_EQ(workspace.pose_check_cache.size(), 1u);
+  }
 }
 
 }  // namespace f_dwa_controller

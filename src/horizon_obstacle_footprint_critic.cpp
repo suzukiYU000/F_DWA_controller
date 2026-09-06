@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -145,6 +146,9 @@ bool HorizonObstacleFootprintCritic::prepare(
   const geometry_msgs::msg::Pose2D & goal,
   const nav_2d_msgs::msg::Path2D & global_plan)
 {
+  raster_footprint_cache_ready_ = false;
+  raster_footprint_cache_.clear();
+  cell_diagnostic_cache_.clear();
   certification_workspace_prepared_ = false;
   invalidate_observation_layer_certification_workspace(
     observation_layer_certification_workspace_);
@@ -192,7 +196,85 @@ bool HorizonObstacleFootprintCritic::prepare(
     throw std::runtime_error{
             "Localization-uncertainty inset collapses the physical footprint"};
   }
-  return std::isfinite(footprint_radius_);
+  raster_footprint_cache_ready_ = std::isfinite(footprint_radius_);
+  return raster_footprint_cache_ready_;
+}
+
+bool HorizonObstacleFootprintCritic::RasterFootprintKey::operator==(
+  const RasterFootprintKey & other) const noexcept
+{
+  if (size != other.size) {
+    return false;
+  }
+  for (std::size_t index = 0u; index < size; ++index) {
+    if (vertices[index].x != other.vertices[index].x ||
+      vertices[index].y != other.vertices[index].y)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::size_t HorizonObstacleFootprintCritic::RasterFootprintHash::operator()(
+  const RasterFootprintKey & key) const noexcept
+{
+  std::size_t hash = key.size;
+  const auto combine = [&hash](const unsigned int value) {
+      hash ^= static_cast<std::size_t>(value) + static_cast<std::size_t>(0x9e3779b9u) +
+        (hash << 6u) + (hash >> 2u);
+    };
+  for (std::size_t index = 0u; index < key.size; ++index) {
+    combine(key.vertices[index].x);
+    combine(key.vertices[index].y);
+  }
+  return hash;
+}
+
+double HorizonObstacleFootprintCritic::scorePose(const geometry_msgs::msg::Pose2D & pose)
+{
+  if (!raster_footprint_cache_ready_ ||
+    footprint_spec_.size() > kMaximumCachedFootprintVertices)
+  {
+    return dwb_critics::ObstacleFootprintCritic::scorePose(pose);
+  }
+  unsigned int center_x, center_y;
+  if (!costmap_->worldToMap(pose.x, pose.y, center_x, center_y)) {
+    return dwb_critics::ObstacleFootprintCritic::scorePose(pose);
+  }
+  // Keep upstream's exact floating-point transform and ordered raster edges.
+  const auto oriented = dwb_critics::getOrientedFootprint(pose, footprint_spec_);
+  RasterFootprintKey key;
+  key.size = oriented.size();
+  for (std::size_t index = 0u; index < oriented.size(); ++index) {
+    if (!costmap_->worldToMap(oriented[index].x, oriented[index].y,
+        key.vertices[index].x, key.vertices[index].y))
+    {
+      // An earlier edge can collide before a later vertex goes off grid.
+      // Preserve upstream's exception ordering in this case.
+      return dwb_critics::ObstacleFootprintCritic::scorePose(pose, oriented);
+    }
+  }
+  const auto found = raster_footprint_cache_.find(key);
+  if (found != raster_footprint_cache_.end()) {
+    if (!found->second.failure.empty()) {
+      throw dwb_core::IllegalTrajectoryException(name_, found->second.failure);
+    }
+    return found->second.cost;
+  }
+  constexpr std::size_t kMaximumCachedRasterFootprints = 4096u;
+  try {
+    const double cost = dwb_critics::ObstacleFootprintCritic::scorePose(pose, oriented);
+    if (raster_footprint_cache_.size() < kMaximumCachedRasterFootprints) {
+      raster_footprint_cache_.emplace(key, RasterFootprintScore{cost, {}});
+    }
+    return cost;
+  } catch (const dwb_core::IllegalTrajectoryException & exception) {
+    if (raster_footprint_cache_.size() < kMaximumCachedRasterFootprints) {
+      raster_footprint_cache_.emplace(key, RasterFootprintScore{0.0, exception.what()});
+    }
+    throw;
+  }
 }
 
 bool HorizonObstacleFootprintCritic::prepareCertificationBroadphaseIfNeeded()
@@ -234,7 +316,20 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
       if (!result.has_failure_cell) {
         return;
       }
-      detail <<
+      CellDiagnosticKey key{{result.failure_cell_x, result.failure_cell_y,
+        result.failure_cell_cost, 0u, 0u}, prefix};
+      static_assert(sizeof(result.failure_cell_world_x) == sizeof(key.first[3]));
+      std::memcpy(&key.first[3], &result.failure_cell_world_x, sizeof(key.first[3]));
+      std::memcpy(&key.first[4], &result.failure_cell_world_y, sizeof(key.first[4]));
+      if (raster_footprint_cache_ready_) {
+        const auto found = cell_diagnostic_cache_.find(key);
+        if (found != cell_diagnostic_cache_.end()) {
+          detail << found->second;
+          return;
+        }
+      }
+      std::ostringstream cell_detail;
+      cell_detail << std::setprecision(17) <<
         ';' << prefix << "cell_x=" << result.failure_cell_x <<
         ';' << prefix << "cell_y=" << result.failure_cell_y <<
         ';' << prefix << "cell_world_x=" << result.failure_cell_world_x <<
@@ -243,6 +338,7 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
         static_cast<unsigned int>(result.failure_cell_cost);
 
       if (!costmap_ros_ || !costmap_ros_->getLayeredCostmap()) {
+        detail << cell_detail.str();
         return;
       }
       const auto plugins = costmap_ros_->getLayeredCostmap()->getPlugins();
@@ -278,11 +374,19 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
         }
       }
       if (!first_layer) {
-        detail << ';' << prefix << "layer_costs=" << layer_costs.str();
+        cell_detail << ';' << prefix << "layer_costs=" << layer_costs.str();
       }
       if (!first_hazard_layer) {
-        detail << ';' << prefix << "hazard_layers=" << hazard_layers.str();
+        cell_detail << ';' << prefix << "hazard_layers=" << hazard_layers.str();
       }
+      const auto message = cell_detail.str();
+      constexpr std::size_t kMaximumCachedCellDiagnostics = 4096u;
+      if (raster_footprint_cache_ready_ &&
+        cell_diagnostic_cache_.size() < kMaximumCachedCellDiagnostics)
+      {
+        cell_diagnostic_cache_.emplace(std::move(key), message);
+      }
+      detail << message;
     };
   const auto score_pose_with_diagnostics =
     [this, &append_certification_diagnostics](
@@ -366,6 +470,12 @@ double HorizonObstacleFootprintCritic::scoreTrajectory(
       if (subdivisions > kMaximumSubdivisions) {
         throw dwb_core::IllegalTrajectoryException(
                 name_, "Trajectory sweep requires too many samples.");
+      }
+      if (subdivisions > 1u && shared_certification_workspace_ && costmap_ &&
+        certification_swept_segment_bounds_are_hazard_free(
+          *costmap_, previous, pose, footprint_radius_, *shared_certification_workspace_))
+      {
+        continue;
       }
       for (std::size_t subdivision = 1u;
         subdivision < subdivisions; ++subdivision)

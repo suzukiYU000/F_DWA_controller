@@ -28,8 +28,9 @@ namespace f_dwa_controller
  * @brief Softly penalize obstacles within bands outside the physical footprint.
  *
  * ObstacleFootprintCritic remains the independent hard collision gate.  This
- * critic never rejects a trajectory: it only gives a bounded [0, 1] cost when
- * a lethal costmap cell lies within the configured clearance margin. The
+ * critic never rejects a trajectory: it gives a nonnegative soft cost when
+ * a lethal costmap cell lies within the configured clearance margin. Values
+ * above one retain the gradient inside the conservative distance allowance. The
  * penalty varies continuously with clearance instead of quantizing candidate
  * differences into the diagnostic footprint bands. prepare() refreshes a
  * linear-time Euclidean distance field from the dynamic lethal source after
@@ -106,12 +107,12 @@ public:
   /**
    * @brief Score a uniformly timed, executable pose sequence.
    *
-   * This uses the same bounded footprint-clearance penalty as the ordinary
+   * This uses the same continuous footprint-clearance penalty as the ordinary
    * trajectory score, but it does not append a soft Path continuation.  It is
    * intended for complete method-native stop sequences sampled at the
    * Controller certification period, so angular and braking inertia are part
    * of the clearance ranking.  The result blends peak exposure with the
-   * time-sample mean and remains in [0, 1].
+   * time-sample mean without saturating conservative near-contact exposure.
    */
   double scoreUniformPoseSequenceWithApproachRisk(
     const std::vector<geometry_msgs::msg::Pose2D> & poses,
@@ -263,7 +264,7 @@ protected:
   bool prepared_pose_penalty_valid_{false};
   double clearance_margin_{0.25};
   // Worst-case translational localization error. Clearance inside this band
-  // receives maximum soft risk, but remains selectable until the independent
+  // receives increasing soft risk, but remains selectable until the independent
   // physical-footprint critic reports an actual collision.
   double localization_uncertainty_margin_{0.0};
   // The hard footprint remains unchanged. This bounded extra soft margin

@@ -42,6 +42,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 # helper as a submodule without creating a second same-named Python target.
 install(
   FILES python/${PROJECT_NAME}/fir_filter_design.py
+    python/${PROJECT_NAME}/sampling_settings.py
   DESTINATION "${PYTHON_INSTALL_DIR}/${PROJECT_NAME}"
 )
 
@@ -70,6 +71,12 @@ add_library(${library_name} SHARED
   src/velocity_response_model.cpp
   src/v_dwb_trajectory_generators.cpp
 )
+
+# Keep strict floating-point semantics and leave FIR/jerk arithmetic untouched.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_property(SOURCE src/trajectory_certifier.cpp APPEND PROPERTY COMPILE_OPTIONS
+    "$<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-O3>")
+endif()
 
 # Keep the wrapper separate from the concrete controller library. If it linked
 # DWB or the F-DWA implementations before its private pluginlib loader runs,
@@ -376,6 +383,37 @@ if(BUILD_TESTING)
       "${nav_2d_utils_path_ops}"
       "${nav_2d_utils_tf_help}"
     )
+    # Explicit opt-in, offline scoring only. Never installed into a live stack.
+    add_executable(benchmark_stationary_snapshot EXCLUDE_FROM_ALL
+      test/benchmark_stationary_snapshot.cpp
+    )
+    target_link_libraries(benchmark_stationary_snapshot ${library_name})
+    ament_target_dependencies(benchmark_stationary_snapshot
+      dwb_msgs nav_2d_utils nav2_util rclcpp
+    )
+    target_link_libraries(benchmark_stationary_snapshot
+      "${nav_2d_utils_conversions}"
+      "${nav_2d_utils_path_ops}"
+      "${nav_2d_utils_tf_help}"
+    )
+    # Profiling-only executable: the two instrumented source files are linked
+    # into the executable so gprof can attribute their work (not into the live DSO).
+    add_executable(benchmark_footprint_profile EXCLUDE_FROM_ALL
+      test/benchmark_stationary_snapshot.cpp
+      src/horizon_obstacle_footprint_critic.cpp
+      src/trajectory_certifier.cpp
+    )
+    target_compile_options(benchmark_footprint_profile PRIVATE -pg)
+    target_link_options(benchmark_footprint_profile PRIVATE -pg)
+    target_link_libraries(benchmark_footprint_profile ${library_name}
+      "${nav_2d_utils_conversions}" "${nav_2d_utils_path_ops}" "${nav_2d_utils_tf_help}")
+    ament_target_dependencies(benchmark_footprint_profile
+      dwb_msgs nav_2d_utils nav2_util rclcpp)
+    add_executable(benchmark_footprint_equivalence EXCLUDE_FROM_ALL
+      test/benchmark_footprint_equivalence.cpp)
+    target_link_libraries(benchmark_footprint_equivalence ${library_name})
+    ament_target_dependencies(benchmark_footprint_equivalence
+      dwb_msgs nav2_util rclcpp)
   endif()
 
   ament_add_gtest(test_terminal_stop_dynamics
@@ -436,6 +474,11 @@ if(BUILD_TESTING)
   ament_add_pytest_test(
     test_fir_filter_design
     test/test_fir_filter_design.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python
+  )
+  ament_add_pytest_test(
+    test_sampling_settings
+    test/test_sampling_settings.py
     APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python
   )
 endif()

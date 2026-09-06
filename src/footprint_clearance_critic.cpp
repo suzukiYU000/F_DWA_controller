@@ -939,9 +939,6 @@ double FootprintClearanceCritic::scorePoseClearance(
   if (directional_clearance) {
     *directional_clearance = std::min(clearance, zero_penalty_margin);
   }
-  if (clearance <= 0.0) {
-    return 1.0;
-  }
   // Extend the continuous risk interval by the configured localization bound.
   // Subtracting the bound and clamping at zero created a flat maximum-cost
   // plateau throughout the last uncertainty band. Once every candidate entered
@@ -952,8 +949,11 @@ double FootprintClearanceCritic::scorePoseClearance(
   if (clearance >= zero_penalty_margin) {
     return 0.0;
   }
-  const double remaining_fraction = std::clamp(
-    1.0 - clearance / zero_penalty_margin, 0.0, 1.0);
+  // This is a conservative distance lower bound, not exact body penetration.
+  // Cell/probe allowances can make it negative before physical contact. Keep
+  // its gradient there too; the separate swept-body gate owns admissibility.
+  const double remaining_fraction = std::max(
+    1.0 - clearance / zero_penalty_margin, 0.0);
   return std::pow(remaining_fraction, penalty_power_);
 }
 
@@ -1330,8 +1330,8 @@ FootprintClearanceCritic::scoreTrajectoryWithPreparedRiskPathAndApproachRisk(
       (previous_penalty + penalty);
     previous_penalty = penalty;
   }
-  const double mean_penalty = std::clamp(
-    exposure_integral / risk_distance_, 0.0, 1.0);
+  const double mean_penalty = std::max(
+    exposure_integral / risk_distance_, 0.0);
   if (approach_risk) {
     // Activation must describe the candidate the Controller can actually
     // dispatch. The fixed-distance score above deliberately continues beyond
@@ -1504,8 +1504,8 @@ double FootprintClearanceCritic::scoreUniformPoseSequenceWithApproachRisk(
   }
   const double mean_penalty = poses.size() == 1u ?
     maximum_penalty :
-    std::clamp(
-    exposure_sum / static_cast<double>(poses.size() - 1u), 0.0, 1.0);
+    std::max(
+    exposure_sum / static_cast<double>(poses.size() - 1u), 0.0);
   return peak_weight_ * maximum_penalty +
          (1.0 - peak_weight_) * mean_penalty;
 }

@@ -66,6 +66,8 @@ public:
     std::size_t canonical_index{0u};
     double linear_native_input{0.0};
     double angular_native_input{0.0};
+    double linear_prediction_input_duration{0.0};
+    double angular_prediction_input_duration{0.0};
     double initial_linear_velocity{0.0};
     double initial_angular_velocity{0.0};
     double initial_linear_acceleration{0.0};
@@ -186,15 +188,21 @@ protected:
     bool valid{false};
   };
 
+  struct AxisStopData
+  {
+    AxisStopCache sequence;
+    AngularPoseIntegrationCache pose_integration;
+  };
+
   struct AxisRollout
   {
+    int prediction_input_steps{0};
     std::vector<AxisState> states;
     std::vector<double> first_fir_history;
     double native_input{0.0};
     bool valid{false};
-    mutable AxisStopCache stop_cache;
+    std::shared_ptr<AxisStopData> stop_data;
     mutable AngularPoseIntegrationCache pose_integration_cache;
-    mutable AngularPoseIntegrationCache stop_pose_integration_cache;
   };
 
   struct Candidate
@@ -232,6 +240,7 @@ private:
   AxisLimits angular_limits() const;
   void reload_runtime_parameters();
   void validate_parameters() const;
+  std::vector<int> prediction_input_step_counts() const;
   const std::vector<AngularPoseIntegrationStep> &
   angular_pose_integration_steps(
     const AxisRollout & angular_rollout,
@@ -278,6 +287,8 @@ private:
   double maximum_angular_raw_input_{1.57};
   double fir_cutoff_frequency_hz_{1.2};
   double fir_prediction_pulse_duration_{0.0};
+  std::vector<double> fir_prediction_pulse_durations_;
+  bool fir_independent_pulse_durations_{false};
   double stop_capture_velocity_{0.01};
   double stop_command_delay_seconds_{0.07};
   int linear_samples_{11};

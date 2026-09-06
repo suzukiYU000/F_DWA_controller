@@ -43,8 +43,13 @@ public:
     std::shared_ptr<const PlanningSnapshot> snapshot);
   void startNewIteration(
     const nav_2d_msgs::msg::Twist2D & current_velocity) override;
+  void reset() override;
+
+protected:
+  void initializeIterator(const nav2_util::LifecycleNode::SharedPtr & node) override;
 
 private:
+  nav2_util::LifecycleNode::WeakPtr sampling_node_;
   std::shared_ptr<const PlanningSnapshot> planning_snapshot_;
 };
 

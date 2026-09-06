@@ -175,6 +175,8 @@ std::string candidate_diagnostic_metadata(
          << "canonical_index=" << value.canonical_index
          << ";linear_native_input=" << value.linear_native_input
          << ";angular_native_input=" << value.angular_native_input
+         << ";linear_prediction_input_duration=" << value.linear_prediction_input_duration
+         << ";angular_prediction_input_duration=" << value.angular_prediction_input_duration
          << ";initial_linear_velocity=" << value.initial_linear_velocity
          << ";initial_angular_velocity=" << value.initial_angular_velocity
          << ";initial_linear_acceleration="
@@ -488,6 +490,10 @@ void CertifiedDWBLocalPlanner::configure(
   nav2_util::declare_parameter_if_not_declared(
     node, name + ".candidate_marker_publish_frequency",
     rclcpp::ParameterValue(5.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".candidate_marker_max_trajectories", rclcpp::ParameterValue(48));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".candidate_marker_max_points", rclcpp::ParameterValue(16));
 
   node->get_parameter(name + ".enable_certification", certification_enabled_);
   node->get_parameter(
@@ -674,6 +680,9 @@ void CertifiedDWBLocalPlanner::configure(
   node->get_parameter(
     name + ".candidate_marker_publish_frequency",
     candidate_marker_publish_frequency_);
+  node->get_parameter(name + ".candidate_marker_max_trajectories",
+      candidate_marker_max_trajectories_);
+  node->get_parameter(name + ".candidate_marker_max_points", candidate_marker_max_points_);
   const std::string command_dispatch_topic =
     node->get_parameter(name + ".command_dispatch_topic").as_string();
   const std::string transport_valid_topic =
@@ -747,7 +756,8 @@ void CertifiedDWBLocalPlanner::configure(
     !std::isfinite(evaluation_publish_frequency_) ||
     evaluation_publish_frequency_ < 0.0 ||
     !std::isfinite(candidate_marker_publish_frequency_) ||
-    candidate_marker_publish_frequency_ < 0.0)
+    candidate_marker_publish_frequency_ < 0.0 ||
+    candidate_marker_max_trajectories_ < 2 || candidate_marker_max_points_ < 2)
   {
     throw nav2_core::ControllerException(
             "Invalid delay-preview or trajectory-certification parameter");
@@ -1837,8 +1847,10 @@ uint64_t CertifiedDWBLocalPlanner::clearance_constraint_bucket(
   const double admissible_risk,
   const double risk_resolution)
 {
+  // A conservative signed distance can produce a soft cost above one.
+  // Preserve that gradient; only the separate approach risk is normalized.
   if (!std::isfinite(clearance_risk) || clearance_risk < 0.0 ||
-    clearance_risk > 1.0 || !std::isfinite(admissible_risk) ||
+    !std::isfinite(admissible_risk) ||
     admissible_risk < 0.0 || admissible_risk > 1.0 ||
     !is_positive_finite(risk_resolution))
   {
@@ -2227,6 +2239,33 @@ bool CertifiedDWBLocalPlanner::receding_horizon_recovery_prefers_candidate(
   }
   if (candidate_path_departure_cost != best_path_departure_cost) {
     return candidate_path_departure_cost < best_path_departure_cost;
+  }
+  return candidate_canonical_index < best_canonical_index;
+}
+
+bool CertifiedDWBLocalPlanner::least_violation_recovery_prefers_candidate(
+  const double candidate_collision_time,
+  const double best_collision_time,
+  const double candidate_residual_weighted_cost,
+  const double best_residual_weighted_cost,
+  const std::size_t candidate_canonical_index,
+  const std::size_t best_canonical_index)
+{
+  if (candidate_canonical_index == std::numeric_limits<std::size_t>::max() ||
+    std::isnan(candidate_collision_time) || candidate_collision_time < 0.0 ||
+    !std::isfinite(candidate_residual_weighted_cost) ||
+    candidate_residual_weighted_cost < 0.0)
+  {
+    return false;
+  }
+  if (best_canonical_index == std::numeric_limits<std::size_t>::max()) {
+    return true;
+  }
+  if (candidate_collision_time != best_collision_time) {
+    return candidate_collision_time > best_collision_time;
+  }
+  if (candidate_residual_weighted_cost != best_residual_weighted_cost) {
+    return candidate_residual_weighted_cost < best_residual_weighted_cost;
   }
   return candidate_canonical_index < best_canonical_index;
 }
@@ -2786,8 +2825,9 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
   valid.color.g = 0.64F;
   valid.color.b = 1.0F;
   valid.color.a = 0.28F;
-  valid.lifetime.sec = 0;
-  valid.lifetime.nanosec = 150000000u;
+  valid.lifetime = rclcpp::Duration::from_seconds(
+    candidate_marker_publish_frequency_ > 0.0 ?
+    std::max(0.15, 1.5 / candidate_marker_publish_frequency_) : 0.15);
 
   visualization_msgs::msg::Marker rejected = valid;
   rejected.ns = "dwb_candidates_rejected";
@@ -2829,10 +2869,46 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
   }
   std::sort(ranked_valid_costs.begin(), ranked_valid_costs.end());
 
+  // Stratify display-only sampling by legality and cost. Preserve the best
+  // trajectory separately; never alter the evaluation used for scoring or bags.
+  std::vector<std::size_t> legal_indices;
+  std::vector<std::size_t> rejected_indices;
+  std::vector<bool> display(evaluation.twists.size(), false);
+  bool has_selected = false;
+  for (std::size_t index = 0u; index < evaluation.twists.size(); ++index) {
+    const auto & score = evaluation.twists[index];
+    if (score.traj.poses.size() < 2u) {continue;}
+    const bool legal = std::isfinite(score.total) && score.total >= 0.0;
+    if (legal && static_cast<int>(index) == best_index) {
+      display[index] = true;
+      has_selected = true;
+    } else {
+      (legal ? legal_indices : rejected_indices).push_back(index);
+    }
+  }
+  std::stable_sort(legal_indices.begin(), legal_indices.end(),
+    [&evaluation](const auto left, const auto right) {
+      return evaluation.twists[left].total < evaluation.twists[right].total;
+    });
+  const auto budget = static_cast<std::size_t>(candidate_marker_max_trajectories_) -
+    (has_selected ? 1u : 0u);
+  std::size_t rejected_budget = std::min(rejected_indices.size(), budget / 2u);
+  const auto legal_budget = std::min(legal_indices.size(), budget - rejected_budget);
+  rejected_budget = std::min(rejected_indices.size(), budget - legal_budget);
+  const auto sample_indices = [&display](const auto & indices, const std::size_t count) {
+      for (std::size_t slot = 0u; slot < count; ++slot) {
+        const auto position = count == 1u ? 0u : slot * (indices.size() - 1u) / (count - 1u);
+        display[indices[position]] = true;
+      }
+    };
+  sample_indices(legal_indices, legal_budget);
+  sample_indices(rejected_indices, rejected_budget);
+
   std::size_t valid_count = 0u;
   std::map<std::string, std::size_t> rejection_counts;
   bool status_position_set = false;
   bool selected_receding_horizon_recovery = false;
+  bool selected_least_violation_recovery = false;
   for (std::size_t index = 0; index < evaluation.twists.size(); ++index) {
     const auto & score = evaluation.twists[index];
     const auto & poses = score.traj.poses;
@@ -2866,6 +2942,14 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
         [](const dwb_msgs::msg::CriticScore & critic_score) {
           return critic_score.name == "RecedingHorizonRecovery";
         });
+      selected_least_violation_recovery = std::any_of(
+        score.scores.begin(), score.scores.end(),
+        [](const dwb_msgs::msg::CriticScore & critic_score) {
+          return critic_score.name == "MethodNativeLeastViolationRecovery";
+        });
+      if (selected_least_violation_recovery && valid_count > 0u) {
+        --valid_count;
+      }
       best.points.reserve(poses.size());
       for (const auto & pose : poses) {
         geometry_msgs::msg::Point point;
@@ -2876,19 +2960,24 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
       }
       continue;
     }
+    if (!display[index]) {continue;}
     auto & points = legal ? valid.points : rejected.points;
     auto * colors = legal ? &valid.colors : nullptr;
     const auto color = legal ?
       weighted_cost_color(
       normalized_cost_rank(score.total, ranked_valid_costs)) :
       std_msgs::msg::ColorRGBA();
-    points.reserve(points.size() + 2u * (poses.size() - 1u));
+    const auto point_count = std::min(
+      poses.size(), static_cast<std::size_t>(candidate_marker_max_points_));
+    points.reserve(points.size() + 2u * (point_count - 1u));
     if (colors) {
-      colors->reserve(colors->size() + 2u * (poses.size() - 1u));
+      colors->reserve(colors->size() + 2u * (point_count - 1u));
     }
-    for (std::size_t pose_index = 1; pose_index < poses.size(); ++pose_index) {
-      const auto & first = poses[pose_index - 1u];
-      const auto & second = poses[pose_index];
+    for (std::size_t point_index = 1u; point_index < point_count; ++point_index) {
+      const auto first_index = (point_index - 1u) * (poses.size() - 1u) / (point_count - 1u);
+      const auto second_index = point_index * (poses.size() - 1u) / (point_count - 1u);
+      const auto & first = poses[first_index];
+      const auto & second = poses[second_index];
       if (std::hypot(second.x - first.x, second.y - first.y) <= 1.0e-5) {
         continue;
       }
@@ -2908,7 +2997,14 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
       }
     }
   }
-  if (selected_receding_horizon_recovery) {
+  if (selected_least_violation_recovery) {
+    best.color.r = 1.0F;
+    best.color.g = 0.42F;
+    best.color.b = 0.10F;
+    status.color = best.color;
+    status.text =
+      "No collision-free trajectory: method-native maximum effort";
+  } else if (selected_receding_horizon_recovery) {
     status.color.r = 1.0F;
     status.color.g = 0.64F;
     status.color.b = 0.10F;
@@ -2931,6 +3027,10 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
     status.color.b = 0.29F;
     status.text = "DWB candidates: " + std::to_string(valid_count) + "/" +
       std::to_string(evaluation.twists.size()) + " valid";
+    const auto shown = legal_budget + rejected_budget + (has_selected ? 1u : 0u);
+    if (shown < evaluation.twists.size()) {
+      status.text += ", shown: " + std::to_string(shown);
+    }
   }
   visualization_msgs::msg::MarkerArray markers;
   markers.markers.reserve(5u);
@@ -3484,14 +3584,12 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
               trajectory_scratch, &footprint_approach_risk);
           }
         }
-        if (!std::isfinite(clearance_risk) || clearance_risk < 0.0 ||
-          clearance_risk > 1.0 + 1.0e-9)
-        {
+        if (!std::isfinite(clearance_risk) || clearance_risk < 0.0) {
           throw dwb_core::IllegalTrajectoryException(
                   "ClearanceConstraint",
-                  "Footprint clearance risk is outside [0, 1]");
+                  "Footprint clearance cost must be finite and nonnegative");
         }
-        precomputed_clearance_risk = std::clamp(clearance_risk, 0.0, 1.0);
+        precomputed_clearance_risk = clearance_risk;
         candidate_clearance_risk_bucket = clearance_constraint_bucket(
           *precomputed_clearance_risk,
           clearance_constraint_admissible_risk_,
@@ -3511,17 +3609,16 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         }
         if (!std::isfinite(configured_trigger_risk) ||
           configured_trigger_risk < 0.0 ||
-          configured_trigger_risk > 1.0 + 1.0e-9 ||
           !std::isfinite(footprint_approach_risk) ||
           footprint_approach_risk < 0.0 ||
           footprint_approach_risk > 1.0 + 1.0e-9)
         {
           throw dwb_core::IllegalTrajectoryException(
                   "ClearanceConstraint",
-                  "Clearance trigger risk is outside [0, 1]");
+                  "Invalid clearance trigger cost or approach risk");
         }
         precomputed_clearance_trigger_risk =
-          std::clamp(configured_trigger_risk, 0.0, 1.0);
+          configured_trigger_risk;
         const double trigger_risk =
           clearance_constraint_trigger_risk_ >= 0.0 ?
           clearance_constraint_trigger_risk_ :
@@ -3576,15 +3673,14 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           }
         }
         if (!std::isfinite(clearance_guard_risk) ||
-          clearance_guard_risk < 0.0 ||
-          clearance_guard_risk > 1.0 + 1.0e-9)
+          clearance_guard_risk < 0.0)
         {
           throw dwb_core::IllegalTrajectoryException(
                   "ClearanceConstraint",
-                  "Clearance guard risk is outside [0, 1]");
+                  "Clearance guard cost must be finite and nonnegative");
         }
         precomputed_clearance_guard_risk =
-          std::clamp(clearance_guard_risk, 0.0, 1.0);
+          clearance_guard_risk;
         candidate_clearance_guard_bucket = clearance_constraint_bucket(
           *precomputed_clearance_guard_risk,
           clearance_constraint_guard_admissible_risk_,
@@ -3769,11 +3865,10 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       }
       (void)candidate_clearance_risk;
       if (std::isfinite(candidate_guard_clearance_risk) &&
-        candidate_guard_clearance_risk >= 0.0 &&
-        candidate_guard_clearance_risk <= 1.0 + 1.0e-9)
+        candidate_guard_clearance_risk >= 0.0)
       {
         candidate_clearance_guard_bucket = clearance_constraint_bucket(
-          std::clamp(candidate_guard_clearance_risk, 0.0, 1.0),
+          candidate_guard_clearance_risk,
           clearance_constraint_guard_admissible_risk_,
           clearance_constraint_guard_risk_resolution_);
       }
@@ -3798,17 +3893,16 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         }
         if (!std::isfinite(full_rollout_guard_risk) ||
           full_rollout_guard_risk < 0.0 ||
-          full_rollout_guard_risk > 1.0 + 1.0e-9 ||
           !std::isfinite(candidate_guard_approach_risk) ||
           candidate_guard_approach_risk < 0.0 ||
           candidate_guard_approach_risk > 1.0 + 1.0e-9)
         {
           throw dwb_core::IllegalTrajectoryException(
                   "ClearanceConstraint",
-                  "Progress rollout clearance risk is outside [0, 1]");
+                  "Invalid progress rollout clearance cost or approach risk");
         }
         candidate_clearance_guard_bucket = clearance_constraint_bucket(
-          std::clamp(full_rollout_guard_risk, 0.0, 1.0),
+          full_rollout_guard_risk,
           clearance_constraint_guard_admissible_risk_,
           clearance_constraint_guard_risk_resolution_);
       }
@@ -3828,18 +3922,17 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         }
         if (!std::isfinite(progress_escape_clearance_risk) ||
           progress_escape_clearance_risk < 0.0 ||
-          progress_escape_clearance_risk > 1.0 + 1.0e-9 ||
           !std::isfinite(progress_escape_approach_risk) ||
           progress_escape_approach_risk < 0.0 ||
           progress_escape_approach_risk > 1.0 + 1.0e-9)
         {
           throw dwb_core::IllegalTrajectoryException(
                   "ClearanceConstraint",
-                  "Progress recovery clearance risk is outside [0, 1]");
+                  "Invalid progress recovery clearance cost or approach risk");
         }
         const uint64_t stop_clearance_guard_bucket =
           clearance_constraint_bucket(
-          std::clamp(progress_escape_clearance_risk, 0.0, 1.0),
+          progress_escape_clearance_risk,
           clearance_constraint_guard_admissible_risk_,
           clearance_constraint_guard_risk_resolution_);
         candidate_clearance_guard_bucket =
@@ -4216,17 +4309,16 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         }
         if (!std::isfinite(stop_clearance_risk) ||
           stop_clearance_risk < 0.0 ||
-          stop_clearance_risk > 1.0 + 1.0e-9 ||
           !std::isfinite(stop_approach_risk) ||
           stop_approach_risk < 0.0 ||
           stop_approach_risk > 1.0 + 1.0e-9)
         {
           throw dwb_core::IllegalTrajectoryException(
                   "ClearanceConstraint",
-                  "Legal avoidance clearance risk is outside [0, 1]");
+                  "Invalid legal avoidance clearance cost or approach risk");
         }
         candidate_clearance_guard_bucket = clearance_constraint_bucket(
-          std::clamp(stop_clearance_risk, 0.0, 1.0),
+          stop_clearance_risk,
           clearance_constraint_guard_admissible_risk_,
           clearance_constraint_guard_risk_resolution_);
         footprint_approach_risk = std::max(
@@ -4417,13 +4509,15 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         critic_score.name = exception.getCriticName();
         critic_score.raw_score = -1.0;
         failed_score.scores.push_back(critic_score);
-        if (record_full_evaluation_details_ && native_generator) {
+        if (record_full_evaluation_details_) {
           dwb_msgs::msg::CriticScore rejection_detail;
           rejection_detail.name =
             std::string{"__rejection_detail__:"} + exception.what();
           rejection_detail.raw_score = 0.0;
           rejection_detail.scale = 0.0;
           failed_score.scores.push_back(std::move(rejection_detail));
+        }
+        if (record_full_evaluation_details_ && native_generator) {
           const auto diagnostics =
             native_generator->active_candidate_diagnostics();
           if (diagnostics) {
@@ -4763,14 +4857,12 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           candidate.guard_clearance_risk.value_or(
           std::numeric_limits<double>::quiet_NaN());
         if (!std::isfinite(guard_risk) || guard_risk < 0.0 ||
-          guard_risk > 1.0 + 1.0e-9 ||
           !std::isfinite(guard_approach_risk) ||
           guard_approach_risk < 0.0 ||
           guard_approach_risk > 1.0 + 1.0e-9)
         {
           continue;
         }
-        guard_risk = std::clamp(guard_risk, 0.0, 1.0);
         guard_approach_risk = std::clamp(guard_approach_risk, 0.0, 1.0);
         double stop_response_initial_clearance =
           std::numeric_limits<double>::quiet_NaN();
@@ -5296,12 +5388,9 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
               clearance_risk = std::max(
               primary_clearance_risk, guard_clearance_risk);
             }
-            if (!std::isfinite(clearance_risk) || clearance_risk < 0.0 ||
-              clearance_risk > 1.0 + 1.0e-9)
-            {
+            if (!std::isfinite(clearance_risk) || clearance_risk < 0.0) {
               return;
             }
-            clearance_risk = std::clamp(clearance_risk, 0.0, 1.0);
           }
           double guard_approach_risk = 0.0;
           double guard_clearance_risk = clearance_risk;
@@ -5315,15 +5404,12 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           }
           if (!std::isfinite(guard_clearance_risk) ||
             guard_clearance_risk < 0.0 ||
-            guard_clearance_risk > 1.0 + 1.0e-9 ||
             !std::isfinite(guard_approach_risk) ||
             guard_approach_risk < 0.0 ||
             guard_approach_risk > 1.0 + 1.0e-9)
           {
             return;
           }
-          guard_clearance_risk = std::clamp(
-            guard_clearance_risk, 0.0, 1.0);
           guard_approach_risk = std::clamp(
             guard_approach_risk, 0.0, 1.0);
           clearance_risk = std::max(clearance_risk, guard_clearance_risk);
@@ -5580,6 +5666,121 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       "certified method-native smooth stop");
     if (direct_stop_score) {
       return *direct_stop_score;
+    }
+  }
+
+  if (best.total < 0.0 && native_generator &&
+    no_valid_control_deceleration_fallback_enabled_ &&
+    !inside_terminal_capture_region &&
+    obstacle_recovery_candidate_is_available)
+  {
+    std::size_t selected_index = std::numeric_limits<std::size_t>::max();
+    double selected_collision_time = 0.0;
+    double selected_residual_weighted_cost = 0.0;
+    dwb_msgs::msg::Trajectory2D selected_trajectory;
+    std::optional<NativeInputTrajectoryGenerator::NativeCommandState>
+    selected_command_state;
+
+    for (const auto & candidate : rejected_recovery_candidates) {
+      if (!candidate.obstacle_footprint_rejection ||
+        !candidate.collision_time)
+      {
+        continue;
+      }
+
+      dwb_msgs::msg::Trajectory2D candidate_trajectory;
+      NativeInputTrajectoryGenerator::NativeCommandState candidate_state;
+      if (!native_generator->materialize_candidate(
+          candidate.canonical_index, pose, candidate_trajectory,
+          candidate_state))
+      {
+        continue;
+      }
+
+      double residual_weighted_cost = 0.0;
+      bool residual_score_is_valid = true;
+      try {
+        for (const auto & critic : critics_) {
+          if (critic->getName() == "ObstacleFootprint") {
+            continue;
+          }
+          const double scale = critic->getScale();
+          if (scale == 0.0) {
+            continue;
+          }
+          if (!std::isfinite(scale) || scale < 0.0) {
+            residual_score_is_valid = false;
+            break;
+          }
+          const double raw_score = critic->scoreTrajectory(
+            candidate_trajectory);
+          const double weighted_score = raw_score * scale;
+          if (!std::isfinite(raw_score) || raw_score < 0.0 ||
+            !std::isfinite(weighted_score) || weighted_score < 0.0 ||
+            !std::isfinite(residual_weighted_cost + weighted_score))
+          {
+            residual_score_is_valid = false;
+            break;
+          }
+          residual_weighted_cost += weighted_score;
+        }
+      } catch (const dwb_core::IllegalTrajectoryException &) {
+        residual_score_is_valid = false;
+      }
+      if (!residual_score_is_valid ||
+        !least_violation_recovery_prefers_candidate(
+          *candidate.collision_time, selected_collision_time,
+          residual_weighted_cost, selected_residual_weighted_cost,
+          candidate.canonical_index, selected_index))
+      {
+        continue;
+      }
+
+      selected_index = candidate.canonical_index;
+      selected_collision_time = *candidate.collision_time;
+      selected_residual_weighted_cost = residual_weighted_cost;
+      selected_trajectory = std::move(candidate_trajectory);
+      selected_command_state = std::move(candidate_state);
+    }
+
+    if (selected_index != std::numeric_limits<std::size_t>::max()) {
+      dwb_msgs::msg::TrajectoryScore recovery_score;
+      recovery_score.total = 0.0;
+      recovery_score.traj = std::move(selected_trajectory);
+      const auto append_recovery_detail =
+        [&recovery_score](const std::string & name, const double raw_score) {
+          dwb_msgs::msg::CriticScore detail;
+          detail.name = name;
+          detail.scale = 0.0;
+          detail.raw_score = raw_score;
+          recovery_score.scores.push_back(std::move(detail));
+        };
+      append_recovery_detail("MethodNativeLeastViolationRecovery", 1.0);
+      append_recovery_detail(
+        "RecoveryPredictedCollisionTime", selected_collision_time);
+      append_recovery_detail(
+        "RecoveryResidualWeightedCost", selected_residual_weighted_cost);
+      append_recovery_detail("RecoveryCollisionCertified", 0.0);
+
+      retained_backup_commands_.clear();
+      retained_backup_states_.clear();
+      terminal_stop_goal_capture_active_ = false;
+      terminal_stop_goal_capture_committed_ = false;
+      native_generator->select_command_for_dispatch(selected_command_state);
+      if (results) {
+        results->twists.push_back(recovery_score);
+        results->best_index = results->twists.size() - 1u;
+      }
+      RCLCPP_WARN_THROTTLE(
+        logger_, *clock_, 1000,
+        "No collision-free native response remained; dispatching the "
+        "least-violating method-native maximum-effort candidate=%zu "
+        "collision_time=%.3f residual_weighted_cost=%.6f. The response "
+        "is not collision-certified; the independent emergency-stop "
+        "boundary remains active",
+        selected_index, selected_collision_time,
+        selected_residual_weighted_cost);
+      return recovery_score;
     }
   }
 

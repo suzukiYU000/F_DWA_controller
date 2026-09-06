@@ -111,16 +111,18 @@ controller_server:
       # value equality so transport corruption cannot masquerade as safety.
       allow_safety_command_reduction: false
       certification_control_period: 0.05
-      # When every complete prediction is invalid, reevaluate this method's
-      # current native candidates and dispatch only the first native response.
-      # Its physical footprint must stay strictly collision-free for the 50 ms
-      # planning deadline plus one 50 ms command-hold interval. Prefer later
-      # predicted collision, then lower fused-clearance risk and weighted
-      # PathDeviation cost, and replan on the next cycle. This exceptional
-      # one-step viability action is used only when no complete stop-admissible
-      # rollout exists; it is never promoted to a legal full trajectory. The
-      # legacy parameter name is retained for launch/API compatibility;
-      # ordinary deceleration suffixes are no longer retained.
+      # When every complete prediction is invalid, first try a revalidated
+      # method-native stop or a response whose physical footprint is safe
+      # through the planning deadline and one command-hold interval. If the
+      # common ObstacleFootprint gate rejects every response even at that
+      # boundary, issue one of the method's original native candidates for one
+      # cycle instead of allowing Controller Server to inject an unrelated
+      # zero. Maximize predicted collision time; break ties with the ordinary
+      # weighted objective excluding only the already-failed obstacle gate.
+      # J-DWA therefore keeps its jerk state and F-DWA keeps its FIR state.
+      # This last response is explicitly not collision-certified; independent
+      # emergency stopping remains active. The legacy parameter name is kept
+      # for launch/API compatibility.
       enable_no_valid_control_deceleration_fallback: true
       # Standard Dynamic Window admissibility: a candidate may be selected
       # only when issuing it now and then applying that method's native
@@ -307,10 +309,11 @@ controller_server:
       # separate candidate-animation diagnostic mode is explicitly enabled.
       publish_evaluation: true
       evaluation_publish_frequency: 0.2
-      # Rendering every 20 Hz control cycle adds no control information but
-      # forces RViz to rebuild all 165 trajectory markers each time. Keep the
-      # live fan responsive while limiting diagnostic CPU/GPU and DDS load.
-      candidate_marker_publish_frequency: 5.0
+      # Bound RViz geometry only; scoring and full recorded evaluations stay intact.
+      # The selected trajectory is always shown at its original resolution.
+      candidate_marker_publish_frequency: 10.0
+      candidate_marker_max_trajectories: 48
+      candidate_marker_max_points: 16
       publish_trajectories: false
       stateful: true
       critics:

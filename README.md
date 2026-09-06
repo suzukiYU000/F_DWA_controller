@@ -104,6 +104,101 @@ Setting
 `fir_prediction_pulse_duration: 0.0` restores the former full-horizon held
 input as an explicit ablation.
 
+### Input-duration sampling (opt-in F-DWA ablation)
+
+`FollowPath.fir_prediction_pulse_durations` optionally appends durations in
+seconds to the scalar `fir_prediction_pulse_duration` baseline. Its default
+is an empty double array, preserving the original candidate set and order.
+For example, with the scalar at `0.10`, `[0.20, 0.40]` evaluates three pulse
+durations: up to `11 * 15 * 3 = 495` candidates. Twelve durations give up to
+1980 candidates without replacing the existing amplitude grid. Actual counts
+can be smaller when the horizon-feasible input interval is empty/collapsed.
+
+- By default each duration is shared by the linear and angular input.
+  `fir_independent_pulse_durations: true` additionally pairs different
+  durations on the two axes: three durations give up to `11 * 15 * 3 * 3 =
+  1485` candidates, from the same 78 axis responses as synchronized pairing.
+  This permits, for example, continuing acceleration while ending the turn
+  input earlier. Synchronized candidates remain first in canonical order.
+  The prediction horizon is identical for all candidates. Zero means the full
+  horizon, not a stop command.
+- Durations round up to controller ticks. Duplicate tick counts are removed;
+  negative, non-finite, or longer-than-horizon values are rejected.
+- Each duration has its own horizon-feasible amplitude interval. Axis
+  responses are computed `D * (Nv + Nw)` times and shared across `D * Nv * Nw`
+  pose rollouts (`D * D * Nv * Nw` for independent pairing).
+  Footprint/critic evaluation still scales with the pose-rollout count.
+- Equal first native inputs share complete-stop axis responses and angular
+  integration caches within one planning iteration, even if their nominal
+  durations differ. Cache keys use exact input equality, separate axes, and
+  the existing stop-policy arguments; caches do not cross state updates.
+- A raw input is zero after its pulse but the FIR history continues normally.
+  Only the first filtered command is dispatched, followed by replanning.
+  Equal first commands with different future trajectories are not duplicates.
+- The parameter is adopted at initialization or the stopped trial-reset
+  boundary. Jerk constraints, V/A/J generation, emergency stops, and the
+  independent complete-stop certificate are unchanged. Candidate metadata
+  records the effective `linear_prediction_input_duration` and
+  `angular_prediction_input_duration`.
+
+Long pulses can overpredict a turn that repeated replanning defers. This option
+therefore remains disabled in the default experiment configuration until
+closed-loop tests establish progress, clearance, and timing. Treat it as a
+separate F-DWA sampling ablation, not an unlabelled V/A/J/F comparison.
+
+The opt-in `DISABLED_FirSamplingBenchmark` gtest compares the baseline,
+495-duration, 1767-amplitude, 1827-hybrid, 1485/2079-independent, and
+1980-duration candidate sets at a 2.5 s
+horizon and 20 Hz. Supply comma-separated taps from
+`design_fir_coefficients_for_cutoff` in `F_DWA_BENCHMARK_COEFFICIENTS` and run
+with `--gtest_also_run_disabled_tests --gtest_filter=*FirSamplingBenchmark`.
+It measures axis preparation, nominal pose integration, and complete-stop
+generation separately, using five warmups and thirty measured iterations.
+It does **not** measure costmap/critics, ROS transport, rendering, or
+closed-loop navigation success.
+
+Measured on 2026-09-05 in the ROS Jazzy development container, using the
+Python-designed 0.8 Hz / 46-tap filter, initial `(v, w) = (0.4, 0.1)`, zero
+FIR history, velocity limits `(0.8, 0.8)`, acceleration/raw-input limits
+`(1.2, 1.57)`, 0.05 s steps, and a 2.5 s horizon:
+
+| Sampling | Candidates | Generation + stop p50 [ms] | p95 [ms] |
+|---|---:|---:|---:|
+| 11 x 15, scalar 0.10 s (unchanged default) | 165 | 1.165 | 1.372 |
+| 11 x 15, three synchronized durations | 495 | 2.070 | 2.424 |
+| 31 x 57, scalar 0.10 s | 1767 | 5.001 | 5.801 |
+| 21 x 29, three synchronized durations | 1827 | 4.387 | 5.056 |
+| 11 x 15, three independent durations | 1485 | 2.553 | 2.879 |
+| 11 x 21, three independent durations | 2079 | 3.063 | 3.865 |
+| 11 x 15, twelve synchronized durations | 1980 | 12.141 | 13.243 |
+
+Three durations are `[0.10, 0.20, 0.40]`. Independent pairing is the preferred
+next closed-loop ablation: it increases temporal diversity without computing
+many separate duration responses. The 2079 case uses 96 axis responses,
+compared with 312 for twelve synchronized durations. These are microbenchmark
+times, not complete Controller Server deadlines or evidence of navigation
+success. No real run or AMCL/Gazebo completion is established by these tests.
+Defaults and the running real controller are not switched to these profiles.
+
+The candidate regression suite passes 80 tests, including scalar/bank
+trajectory and stop equivalence at rest, moving, and near saturation;
+independent-duration FIR convolution at every prediction point; pulse tick
+deduplication; and atomic stopped-boundary parameter reload.
+
+Run from the ROS workspace in the development container after building the
+test target. Point the loader at the build library to avoid mixing new C++
+headers/tests with an older experiment-install library:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=92
+export LD_LIBRARY_PATH="$PWD/build/f_dwa_controller:$LD_LIBRARY_PATH"
+export F_DWA_BENCHMARK_COEFFICIENTS=$(PYTHONPATH="$PWD/src/third_party/F_DWA_controller/python" python3 -c 'from f_dwa_controller.fir_filter_design import design_fir_coefficients_for_cutoff; print(",".join(map(str, design_fir_coefficients_for_cutoff(0.8))))')
+build/f_dwa_controller/test_native_input_trajectory_generator \
+  --gtest_also_run_disabled_tests --gtest_filter='*FirSamplingBenchmark'
+```
+
 The design registry in `python/f_dwa_controller/fir_filter_design.py` owns the
 tap count, design sample frequency, cutoff or attenuation bands, window, and
 minimum-phase conversion. F-8 retains its historical 20 Hz design frequency,
@@ -182,6 +277,64 @@ shares must not be summed. `certificate_rejections`
 separates terminal-stop infeasibility from invalid-input, off-costmap,
 lethal-obstacle, and unknown-space failures. Trial reset emits the final run
 summary before clearing these metrics.
+
+With `enable_no_valid_control_deceleration_fallback`, an all-invalid obstacle
+cycle remains inside the selected V/A/J/F-DWA dynamics. The planner first uses
+only collision-certified stop or short-horizon recovery responses. If the live
+obstacle already makes every native response invalid at the next control step,
+it dispatches for one cycle the original native candidate with the latest
+predicted collision, breaking ties by the ordinary weighted objective with the
+failed `ObstacleFootprint` gate omitted. This prevents Controller Server from
+injecting an algorithm-external zero while preserving J-DWA jerk history and
+F-DWA FIR history. The final response is tagged
+`MethodNativeLeastViolationRecovery` and is not collision-certified;
+independent emergency stopping remains authoritative.
+
+## Exact footprint evaluation reuse
+
+`HorizonObstacleFootprintCritic` reuses Nav2 edge scores when the complete
+ordered list of footprint vertices maps to identical Costmap cells. It uses
+the original Nav2 transform, rasterizer, numeric costs, and failure ordering.
+This is not pose quantization: the continuous polygon/cell and swept-body
+certificates still use their original coordinates and interpolation samples.
+
+Repeated cell/layer diagnostic text is reused for identical cell indices,
+cost, bit-identical world coordinates, and diagnostic prefix. Pose diagnostics
+and margin recovery still run separately for each complete candidate. Both caches are cleared in every
+`prepare()` under the planner's locked Costmap snapshot, including failed
+preparations. Each holds at most 4096 entries. Cache misses, capacity limits,
+off-grid vertices, and footprints exceeding the raster key capacity use the
+unchanged checks. No cost weight, safety margin, FIR history, jerk bound,
+sampling interval, or command dispatch rule is changed.
+
+Intermediate nominal-footprint checks can also be omitted when the existing
+hazard-prefix grid proves that the full swept segment's enclosing AABB is free
+of both lethal and unknown cells. The bound uses the maximum vertex radius,
+so it includes rear-corner rotation, with outward rounding and an extra cell
+of padding. Unknown/off-grid/inconclusive regions use the original checks;
+finite-input validation and subdivision limits remain unchanged.
+
+Continuous polygon/cell certification also reuses the immediately preceding
+pose result when the complete local footprint, pose coordinates, and obstacle
+policy are exactly equal. This skips repeated transforms in FIR stop tails
+without hashing or accumulating a large per-cycle table. One entry is allocated
+lazily per workspace and invalidated with the locked Costmap snapshot. Changed
+map geometry or unknown-space policy disables reuse; overlap-depth requests
+always run the original depth calculation. Larger footprints use the uncached
+path. No neighboring poses are merged.
+
+Separating-axis preparation is deferred until an actual hazard cell overlaps
+the polygon's exact continuous AABB. Axis normalization and overlap-depth
+division are omitted only when the caller does not request a depth; the
+original intersection inequalities are unchanged. Release builds use `-O3`
+only for `trajectory_certifier.cpp`, without fast-math or native-CPU flags.
+FIR and jerk arithmetic keep their existing compilation options.
+
+The opt-in offline benchmarks include an 8100-case narrow-corridor corpus and
+isolated Footprint scoring of saved candidate messages. Comparisons preserve
+full scores, rejection diagnostics, swept-body certificates, and margin recovery
+results. ROS message fields are compared directly, including floating-point
+bits; unused serialization padding is not treated as controller output.
 
 ## Planned hierarchy
 

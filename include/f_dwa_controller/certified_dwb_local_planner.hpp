@@ -242,6 +242,13 @@ protected:
     double best_path_departure_cost,
     std::size_t candidate_canonical_index,
     std::size_t best_canonical_index);
+  static bool least_violation_recovery_prefers_candidate(
+    double candidate_collision_time,
+    double best_collision_time,
+    double candidate_residual_weighted_cost,
+    double best_residual_weighted_cost,
+    std::size_t candidate_canonical_index,
+    std::size_t best_canonical_index);
   static bool recovery_candidate_preserves_uncertainty_reserve(
     double collision_time,
     uint64_t clearance_guard_bucket,
@@ -498,6 +505,8 @@ private:
   bool record_full_evaluation_details_{false};
   double evaluation_publish_frequency_{0.0};
   double candidate_marker_publish_frequency_{5.0};
+  int candidate_marker_max_trajectories_{48};
+  int candidate_marker_max_points_{16};
   rclcpp::Time last_evaluation_publish_time_{0, 0, RCL_ROS_TIME};
   bool has_evaluation_publish_time_{false};
   rclcpp::Time last_candidate_marker_publish_time_{0, 0, RCL_ROS_TIME};

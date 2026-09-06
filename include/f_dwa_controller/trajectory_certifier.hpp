@@ -24,7 +24,6 @@
 #include <array>
 #include <cstddef>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "geometry_msgs/msg/point.hpp"
@@ -94,20 +93,24 @@ struct PoseCheckCacheEntry
 {
   std::array<
     CachedFootprintPoint,
-    kMaximumCachedFootprintVertices> world_footprint{};
+    kMaximumCachedFootprintVertices> local_footprint{};
+  geometry_msgs::msg::Pose2D pose;
   std::size_t vertex_count{0u};
   bool allow_lethal{false};
   bool allow_unknown_space{false};
   bool lethal_overlap{false};
-  CertificationResult result;
+  bool safe{false};
+  CertificationFailure failure{CertificationFailure::kInvalidInput};
+  bool has_failure_cell{false};
+  unsigned int failure_cell_x{0u};
+  unsigned int failure_cell_y{0u};
+  unsigned char failure_cell_cost{0u};
 };
 
 struct CertificationWorkspace
 {
   std::vector<geometry_msgs::msg::Point> world_footprint;
   std::vector<PreparedFootprintAxis> footprint_axes;
-  std::vector<nav2_costmap_2d::MapLocation> map_footprint;
-  std::vector<nav2_costmap_2d::MapLocation> footprint_cells;
   std::vector<std::size_t> hazard_prefix_sum;
   // Lethal and unknown cells in row-major order. Row offsets let the exact
   // continuous-footprint test visit only hazards inside its map AABB instead
@@ -121,11 +124,11 @@ struct CertificationWorkspace
   double hazard_resolution{0.0};
   bool hazard_unknown_space_is_hazard{true};
   bool hazard_prefix_valid{false};
-  // F-DWA's long filtered stop tails often revisit an exact continuous
-  // footprint. Cache that result without merging different sub-cell poses,
-  // because occupied cells are checked as complete squares.
+  // One lazily allocated entry for repeated FIR stop-tail poses. Compare the
+  // entire local footprint, continuous pose, and policy before reusing it.
+  // No quantization: a different sub-cell pose always requires a new check.
   std::vector<PoseCheckCacheEntry> pose_check_cache;
-  std::unordered_multimap<std::size_t, std::size_t> pose_check_cache_index;
+  bool pose_check_cache_valid{false};
 };
 
 struct ObservationLayerCertificationWorkspaceEntry
@@ -165,6 +168,15 @@ bool certification_footprint_bounds_are_hazard_free(
   const nav2_costmap_2d::Costmap2D & costmap,
   const std::vector<geometry_msgs::msg::Point> & footprint,
   const geometry_msgs::msg::Pose2D & pose,
+  const CertificationWorkspace & workspace);
+
+// A circle enclosing every footprint vertex bounds the whole swept segment,
+// including rear-corner rotation. False requires the original detailed check.
+bool certification_swept_segment_bounds_are_hazard_free(
+  const nav2_costmap_2d::Costmap2D & costmap,
+  const geometry_msgs::msg::Pose2D & first,
+  const geometry_msgs::msg::Pose2D & second,
+  double maximum_footprint_radius,
   const CertificationWorkspace & workspace);
 
 CertificationResult certify_pose_sequence(

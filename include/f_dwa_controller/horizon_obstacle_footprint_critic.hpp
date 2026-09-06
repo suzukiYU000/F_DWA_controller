@@ -9,6 +9,11 @@
 #define F_DWA_CONTROLLER__HORIZON_OBSTACLE_FOOTPRINT_CRITIC_HPP_
 
 #include <cstddef>
+#include <array>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "dwb_critics/obstacle_footprint.hpp"
@@ -39,12 +44,40 @@ public:
     const nav_2d_msgs::msg::Path2D & global_plan) override;
   double scoreTrajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory) override;
+  using dwb_critics::ObstacleFootprintCritic::scorePose;
+  double scorePose(const geometry_msgs::msg::Pose2D & pose) override;
   void setDetailedFailureDiagnostics(bool enabled) noexcept;
   void setSharedCertificationWorkspace(
     CertificationWorkspace * workspace) noexcept;
 
 protected:
   bool prepareCertificationBroadphaseIfNeeded();
+
+  struct RasterFootprintKey
+  {
+    std::array<nav2_costmap_2d::MapLocation, kMaximumCachedFootprintVertices> vertices{};
+    std::size_t size{0u};
+    bool operator==(const RasterFootprintKey & other) const noexcept;
+  };
+  struct RasterFootprintHash
+  {
+    std::size_t operator()(const RasterFootprintKey & key) const noexcept;
+  };
+  struct RasterFootprintScore
+  {
+    double cost{0.0};
+    std::string failure;
+  };
+  // Only Nav2's integer-cell edge rasterization is memoized, not continuous
+  // polygon certification. prepare() bounds the cache to one locked snapshot.
+  std::unordered_map<RasterFootprintKey, RasterFootprintScore, RasterFootprintHash>
+  raster_footprint_cache_;
+  bool raster_footprint_cache_ready_{false};
+
+  using CellDiagnosticKey = std::pair<std::array<std::uint64_t, 5>, std::string>;
+  // Only cell/layer text is shared. Pose diagnostics and continuous geometry
+  // are evaluated independently, including different poses in the same cell.
+  std::map<CellDiagnosticKey, std::string> cell_diagnostic_cache_;
 
   // Deprecated compatibility parameter. It has no scoring or gating effect.
   double score_time_horizon_{1.25};
