@@ -59,6 +59,9 @@ protected:
   double distanceToPath(
     const geometry_msgs::msg::Pose2D & pose,
     std::size_t & segment_hint) const;
+  double distanceToPath(
+    const geometry_msgs::msg::Pose2D & pose,
+    std::size_t & segment_hint, double sufficient_distance) const;
 
   nav_2d_msgs::msg::Path2D reference_path_;
   std::vector<PathSegment> path_segments_;

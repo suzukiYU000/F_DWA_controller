@@ -197,12 +197,6 @@ protected:
     double capture_distance,
     const nav_2d_msgs::msg::Twist2D & velocity,
     double stop_velocity_threshold);
-  static bool terminal_goal_resume_is_applicable(
-    const geometry_msgs::msg::Pose2D & pose,
-    const geometry_msgs::msg::Pose2D & goal_pose,
-    double capture_distance,
-    const nav_2d_msgs::msg::Twist2D & velocity,
-    double stop_velocity_threshold);
   static bool clearance_constraint_prefers_candidate(
     bool candidate_has_meaningful_progress,
     bool best_has_meaningful_progress,
@@ -532,7 +526,6 @@ private:
   std::vector<nav_2d_msgs::msg::Twist2D> retained_backup_commands_;
   std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
   retained_backup_states_;
-  bool terminal_stop_goal_capture_active_{false};
   bool terminal_stop_goal_capture_committed_{false};
   std::vector<geometry_msgs::msg::Point> certified_footprint_;
   std::vector<geometry_msgs::msg::Point> initial_overlap_core_footprint_;

@@ -533,6 +533,14 @@ public:
     return coreScoringAlgorithm(pose, velocity, results);
   }
 
+  dwb_msgs::msg::TrajectoryScore run_terminal_core(
+    const geometry_msgs::msg::Pose2D & pose,
+    const nav_2d_msgs::msg::Twist2D & velocity,
+    std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> & results)
+  {
+    return coreScoringAlgorithm(pose, velocity, results);
+  }
+
   dwb_msgs::msg::TrajectoryScore reference_score(
     const dwb_msgs::msg::Trajectory2D & trajectory,
     const double best_score)
@@ -710,18 +718,6 @@ public:
     const double stop_velocity_threshold)
   {
     return terminal_goal_hold_is_applicable(
-      pose, goal_pose, capture_distance, velocity,
-      stop_velocity_threshold);
-  }
-
-  static bool terminal_goal_resume(
-    const geometry_msgs::msg::Pose2D & pose,
-    const geometry_msgs::msg::Pose2D & goal_pose,
-    const double capture_distance,
-    const nav_2d_msgs::msg::Twist2D & velocity,
-    const double stop_velocity_threshold)
-  {
-    return terminal_goal_resume_is_applicable(
       pose, goal_pose, capture_distance, velocity,
       stop_velocity_threshold);
   }
@@ -2017,6 +2013,32 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
+  PositionOnlyGoalCaptureAcceptsRecordedYawErrorsAndOppositeHeading)
+{
+  geometry_msgs::msg::Pose2D goal;
+  std::vector<geometry_msgs::msg::Pose2D> stop_poses(1u);
+  stop_poses.back().x = 0.0561;
+  for (const double yaw : {-M_PI, -0.4308, -0.2950, 0.0, M_PI}) {
+    stop_poses.back().theta = yaw;
+    const auto assessment = ScorePlannerAdapter::terminal_stop_assessment(
+      stop_poses, goal, 0.0, 0.25, M_PI, 0.25);
+    ASSERT_TRUE(assessment.available);
+    EXPECT_TRUE(assessment.captures_goal) << "yaw=" << yaw;
+  }
+  for (const double radius : {0.1, 0.25, 0.4}) {
+    stop_poses.back().x = radius;
+    auto assessment = ScorePlannerAdapter::terminal_stop_assessment(
+      stop_poses, goal, 0.0, radius, M_PI, radius);
+    EXPECT_TRUE(assessment.captures_goal);
+    stop_poses.back().x = radius + 0.001;
+    assessment = ScorePlannerAdapter::terminal_stop_assessment(
+      stop_poses, goal, 0.0, radius, M_PI, radius);
+    EXPECT_FALSE(assessment.captures_goal);
+  }
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
   TerminalPlanFallbackAppliesOnlyInsideGoalPositionTolerance)
 {
   geometry_msgs::msg::Pose2D terminal_pose;
@@ -2063,30 +2085,6 @@ TEST_F(
 
 TEST_F(
   NativeInputTrajectoryGeneratorTest,
-  TerminalGoalResumeRequiresClearedMotionOutsideTolerance)
-{
-  geometry_msgs::msg::Pose2D goal_pose;
-  goal_pose.x = 5.0;
-  geometry_msgs::msg::Pose2D stopped_pose = goal_pose;
-  stopped_pose.x -= 0.250001;
-  nav_2d_msgs::msg::Twist2D velocity;
-
-  EXPECT_TRUE(ScorePlannerAdapter::terminal_goal_resume(
-      stopped_pose, goal_pose, 0.25, velocity, 0.01));
-  stopped_pose.x = goal_pose.x - 0.25;
-  EXPECT_FALSE(ScorePlannerAdapter::terminal_goal_resume(
-      stopped_pose, goal_pose, 0.25, velocity, 0.01));
-  stopped_pose.x = goal_pose.x - 0.250001;
-  velocity.x = 0.010001;
-  EXPECT_FALSE(ScorePlannerAdapter::terminal_goal_resume(
-      stopped_pose, goal_pose, 0.25, velocity, 0.01));
-  velocity.x = 0.0;
-  EXPECT_FALSE(ScorePlannerAdapter::terminal_goal_resume(
-      stopped_pose, goal_pose, 0.0, velocity, 0.01));
-}
-
-TEST_F(
-  NativeInputTrajectoryGeneratorTest,
   TerminalGoalCaptureOutranksWeightedScoreWithoutChangingWeights)
 {
   EXPECT_TRUE(ScorePlannerAdapter::terminal_prefers_candidate(
@@ -2097,6 +2095,97 @@ TEST_F(
       true, true, 99.0, 100.0, 10u, 9u));
   EXPECT_TRUE(ScorePlannerAdapter::terminal_prefers_candidate(
       false, false, 100.0, 100.0, 8u, 9u));
+}
+
+TEST_F(
+  NativeInputTrajectoryGeneratorTest,
+  MovingFirTerminalStopKeepsReplanningWithStableAndCorrectedLocalization)
+{
+  for (const double correction : {0.0, -0.6}) {
+    SCOPED_TRACE(correction);
+    const auto node = make_node(
+    "fir_terminal_replan_test", true, true, false, 0.1, 1.0, 1.0, 0.05);
+    node->declare_parameter("publish_zero_velocity", true);
+    node->declare_parameter(
+      "FollowPath.trajectory_generator_name", "dwb_plugins::StandardTrajectoryGenerator");
+    node->declare_parameter("FollowPath.critics", std::vector<std::string>{"GoalDist"});
+    node->declare_parameter("FollowPath.terminal_stop_goal_capture_distance", 0.3);
+    node->declare_parameter("FollowPath.terminal_stop_goal_capture_yaw_tolerance", M_PI);
+
+    rclcpp::NodeOptions options;
+    options.use_global_arguments(false).parameter_overrides({
+        {"global_frame", "odom"}, {"plugins", std::vector<std::string>{}},
+        {"filters", std::vector<std::string>{}}, {"track_unknown_space", false}});
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(options);
+    ASSERT_EQ(costmap->on_configure(rclcpp_lifecycle::State()), nav2_util::CallbackReturn::SUCCESS);
+    costmap->getLayeredCostmap()->resizeMap(200u, 200u, 0.05, -5.0, -5.0);
+    auto tf = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.frame_id = "map";
+    transform.child_frame_id = "odom";
+    transform.transform.rotation.w = 1.0;
+    ASSERT_TRUE(tf->setTransform(transform, "terminal_replan_test", true));
+
+    ScorePlannerAdapter planner;
+    planner.configure(node, kPluginName, tf, costmap);
+    // This test isolates terminal commitment from weighted critic selection.
+    auto generator = std::make_shared<FirTrajectoryGenerator>();
+    generator->initialize(node, kPluginName);
+    planner.set_test_components(generator, {});
+    nav_msgs::msg::Path path;
+    path.header.frame_id = "map";
+    geometry_msgs::msg::PoseStamped goal;
+    goal.pose.position.x = 0.3;
+    goal.pose.orientation.w = 1.0;
+    path.poses.push_back(goal);
+    planner.setPlan(path);
+    auto snapshot = make_observable_zero_snapshot(node->now());
+    snapshot.current_state.velocity.x = 0.4;
+    snapshot.current_state.linear_fir_history = {-0.1, -0.1};
+    snapshot.current_state.angular_fir_history = {0.0, 0.0};
+    snapshot.activation_state = snapshot.current_state;
+    generator->set_planning_snapshot(std::make_shared<const PlanningSnapshot>(snapshot));
+    geometry_msgs::msg::Pose2D pose;
+    auto results = std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+    const auto first = planner.run_terminal_core(pose, snapshot.current_state.velocity, results);
+    ASSERT_GT(first.traj.velocity.x, 0.01);
+    ASSERT_GT(results->twists.size(), 1u);
+
+    const rclcpp::Time issued(1, 0, RCL_ROS_TIME);
+    generator->commit_selected_command(first.traj.velocity, issued);
+    f_dwa_controller::msg::CommandDispatch applied;
+    applied.header.stamp = rclcpp::Time(1, 10000000, RCL_ROS_TIME);
+    applied.has_sequence = true;
+    applied.command.linear.x = first.traj.velocity.x;
+    applied.command.angular.z = first.traj.velocity.theta;
+    generator->observe_command_dispatch(applied);
+    auto next = make_observable_zero_snapshot(rclcpp::Time(1, 50000000, RCL_ROS_TIME));
+    next.current_state.velocity = first.traj.velocity;
+    next.activation_state = next.current_state;
+    generator->enrich_planning_snapshot(next);
+    ASSERT_TRUE(next.valid);
+    const auto history = next.activation_state.linear_fir_history;
+    ASSERT_TRUE(std::any_of(history.begin(), history.end(), [](double x) {return x != 0.0;}));
+    generator->set_planning_snapshot(std::make_shared<const PlanningSnapshot>(next));
+    pose.x += first.traj.velocity.x * 0.05;
+    pose.theta += first.traj.velocity.theta * 0.05;
+
+    transform.transform.translation.x = correction;
+    ASSERT_TRUE(tf->setTransform(transform, "terminal_replan_test", true));
+    results = std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+    const auto replanned = planner.run_terminal_core(pose, next.activation_state.velocity, results);
+    EXPECT_GT(results->twists.size(), 1u);
+    EXPECT_GT(replanned.traj.velocity.x, 0.01);
+    EXPECT_FALSE(std::any_of(replanned.scores.begin(), replanned.scores.end(),
+      [](const auto & score) {return score.name == "RetainedTerminalStop";}));
+  // Replanning must not clear the actually dispatched FIR state.
+    auto observed = make_observable_zero_snapshot(node->now());
+    generator->enrich_planning_snapshot(observed);
+    EXPECT_TRUE(observed.valid);
+    EXPECT_EQ(observed.current_state.linear_fir_history, history);
+    planner.cleanup();
+    costmap->on_cleanup(rclcpp_lifecycle::State());
+  }
 }
 
 TEST_F(

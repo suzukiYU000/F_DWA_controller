@@ -913,7 +913,6 @@ void CertifiedDWBLocalPlanner::cleanup()
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
-  terminal_stop_goal_capture_active_ = false;
   terminal_stop_goal_capture_committed_ = false;
   planning_snapshot_.reset();
   {
@@ -2075,31 +2074,6 @@ bool CertifiedDWBLocalPlanner::terminal_goal_hold_is_applicable(
          std::abs(velocity.theta) <= stop_velocity_threshold;
 }
 
-bool CertifiedDWBLocalPlanner::terminal_goal_resume_is_applicable(
-  const geometry_msgs::msg::Pose2D & pose,
-  const geometry_msgs::msg::Pose2D & goal_pose,
-  const double capture_distance,
-  const nav_2d_msgs::msg::Twist2D & velocity,
-  const double stop_velocity_threshold)
-{
-  if (!std::isfinite(pose.x) || !std::isfinite(pose.y) ||
-    !std::isfinite(goal_pose.x) || !std::isfinite(goal_pose.y) ||
-    !std::isfinite(capture_distance) || capture_distance <= 0.0 ||
-    !is_positive_finite(stop_velocity_threshold) ||
-    !std::isfinite(velocity.x) || !std::isfinite(velocity.y) ||
-    !std::isfinite(velocity.theta))
-  {
-    return false;
-  }
-  const bool measured_motion_is_stopped =
-    std::abs(velocity.x) <= stop_velocity_threshold &&
-    std::abs(velocity.y) <= stop_velocity_threshold &&
-    std::abs(velocity.theta) <= stop_velocity_threshold;
-  return measured_motion_is_stopped &&
-         std::hypot(pose.x - goal_pose.x, pose.y - goal_pose.y) >
-         capture_distance + 1.0e-12;
-}
-
 bool CertifiedDWBLocalPlanner::clearance_constraint_prefers_candidate(
   const bool candidate_has_meaningful_progress,
   const bool best_has_meaningful_progress,
@@ -3047,7 +3021,6 @@ void CertifiedDWBLocalPlanner::setPlan(const nav_msgs::msg::Path & path)
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
-  terminal_stop_goal_capture_active_ = false;
   terminal_stop_goal_capture_committed_ = false;
   has_evaluation_publish_time_ = false;
   has_candidate_marker_publish_time_ = false;
@@ -3117,7 +3090,6 @@ void CertifiedDWBLocalPlanner::reset()
   std::lock_guard<std::mutex> lock(controller_state_mutex_);
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
-  terminal_stop_goal_capture_active_ = false;
   terminal_stop_goal_capture_committed_ = false;
   planning_snapshot_.reset();
   has_evaluation_publish_time_ = false;
@@ -3273,73 +3245,8 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   // omit CriticScore payloads; delegating to base DWB would allocate the full
   // diagnostic graph merely because RViz subscribes to candidate markers.
 
-  // A feasible stop that has entered the goal capture set is a committed
-  // policy. Ordinary recovery dispatches only one verified native response
-  // and therefore always replans from fresh obstacle data on the next cycle.
-  if (terminal_stop_goal_capture_active_) {
-    dwb_msgs::msg::TrajectoryScore backup_score;
-    if (build_revalidated_backup(pose, backup_score)) {
-      // The native stop generators append an exact zero command with cleared
-      // acceleration/FIR state. Keep revalidating and dispatching that final
-      // state until StoppedGoalChecker observes the delayed plant at rest.
-      // Releasing it after one tick lets ordinary planning restart while odom
-      // is still moving, and Controller Server's result zero can then violate
-      // J-DWA jerk continuity or bypass F-DWA's drained FIR state.
-      const bool hold_cleared_terminal_state =
-        retained_backup_commands_.size() == 1u &&
-        std::abs(retained_backup_commands_.front().x) <= 1.0e-12 &&
-        std::abs(retained_backup_commands_.front().y) <= 1.0e-12 &&
-        std::abs(retained_backup_commands_.front().theta) <= 1.0e-12;
-      const bool resume_after_short_terminal_stop =
-        hold_cleared_terminal_state && current_goal_pose_valid_ &&
-        terminal_goal_resume_is_applicable(
-        pose, current_goal_pose_, terminal_stop_goal_capture_distance_,
-        velocity, terminal_stop_velocity_threshold_);
-      if (resume_after_short_terminal_stop) {
-        // The model-native stop has fully drained, so restarting ordinary
-        // planning preserves J-DWA jerk continuity and F-DWA FIR continuity.
-        // A retained zero must not become a permanent hold when localization
-        // or plant/model mismatch leaves the measured pose outside the capture
-        // set used by StoppedGoalChecker.
-        retained_backup_commands_.clear();
-        retained_backup_states_.clear();
-        terminal_stop_goal_capture_active_ = false;
-        terminal_stop_goal_capture_committed_ = false;
-        RCLCPP_INFO_THROTTLE(
-          logger_, *clock_, 1000,
-          "Terminal native stop settled %.3f m from Goal, outside the "
-          "%.3f m capture set; resuming method-native planning from the "
-          "cleared state",
-          std::hypot(
-            pose.x - current_goal_pose_.x,
-            pose.y - current_goal_pose_.y),
-          terminal_stop_goal_capture_distance_);
-      } else {
-        if (results) {
-          results->twists.push_back(backup_score);
-          results->best_index = results->twists.size() - 1u;
-        }
-      }
-      if (!resume_after_short_terminal_stop &&
-        !hold_cleared_terminal_state)
-      {
-        retained_backup_commands_.erase(
-          retained_backup_commands_.begin());
-        if (!retained_backup_states_.empty()) {
-          retained_backup_states_.erase(retained_backup_states_.begin());
-        }
-      }
-      if (retained_backup_commands_.empty()) {
-        terminal_stop_goal_capture_active_ = false;
-      }
-      if (!resume_after_short_terminal_stop) {
-        return backup_score;
-      }
-    }
-    terminal_stop_goal_capture_active_ = false;
-    terminal_stop_goal_capture_committed_ = false;
-  }
-
+  // Goal proximity never commits a braking suffix. Moving cycles always
+  // sample and score again from the observed method-native state below.
   if (terminal_stop_policy_enabled && current_goal_pose_valid_ &&
     terminal_goal_hold_is_applicable(
       pose, current_goal_pose_, terminal_stop_goal_capture_distance_,
@@ -4593,7 +4500,6 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       retained_backup_states_.assign(
         std::make_move_iterator(direct_stop_states.begin() + 1),
         std::make_move_iterator(direct_stop_states.end()));
-      terminal_stop_goal_capture_active_ = false;
       terminal_stop_goal_capture_committed_ = false;
       if (results) {
         results->twists.push_back(direct_stop_score);
@@ -4637,7 +4543,6 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       // checker decide the action outcome on subsequent cycles.
       retained_backup_commands_.clear();
       retained_backup_states_.clear();
-      terminal_stop_goal_capture_active_ = false;
       terminal_stop_goal_capture_committed_ = true;
       dwb_msgs::msg::TrajectoryScore hold_score;
       hold_score.total = 0.0;
@@ -5627,7 +5532,6 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         stationary_obstacle_deadlock ? 1.0 : 0.0);
       retained_backup_commands_.clear();
       retained_backup_states_.clear();
-      terminal_stop_goal_capture_active_ = false;
       terminal_stop_goal_capture_committed_ = false;
       if (native_generator) {
         native_generator->select_command_for_dispatch(
@@ -5764,7 +5668,6 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
 
       retained_backup_commands_.clear();
       retained_backup_states_.clear();
-      terminal_stop_goal_capture_active_ = false;
       terminal_stop_goal_capture_committed_ = false;
       native_generator->select_command_for_dispatch(selected_command_state);
       if (results) {
@@ -5820,7 +5723,6 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
     {
       retained_backup_commands_.clear();
       retained_backup_states_.clear();
-      terminal_stop_goal_capture_active_ = false;
       terminal_stop_goal_capture_committed_ = false;
       if (native_generator) {
         native_generator->select_command_for_dispatch(best_command_state);
@@ -5841,7 +5743,6 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       }
       retained_backup_commands_.clear();
       retained_backup_states_.clear();
-      terminal_stop_goal_capture_active_ = false;
       terminal_stop_goal_capture_committed_ = false;
       if (native_generator) {
         native_generator->select_command_for_dispatch(best_command_state);
@@ -5858,9 +5759,9 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           best_stop_states.front());
       }
     }
-    terminal_stop_goal_capture_active_ = false;
+    terminal_stop_goal_capture_committed_ = false;
     if (terminal_endpoint_policy_enabled) {
-      terminal_stop_goal_capture_active_ = best_captures_goal;
+      terminal_stop_goal_capture_committed_ = best_captures_goal;
     } else {
       if (
         terminal_stop_goal_capture_distance_ > 0.0 &&
@@ -5880,12 +5781,10 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           position_error <= terminal_stop_goal_capture_distance_ &&
           yaw_error <= terminal_stop_goal_capture_yaw_tolerance_)
         {
-          terminal_stop_goal_capture_active_ = true;
+          terminal_stop_goal_capture_committed_ = true;
         }
       }
     }
-    terminal_stop_goal_capture_committed_ =
-      terminal_stop_goal_capture_active_;
     // Every accepted native candidate already carries a fully certified stop
     // sequence. Retain only its not-yet-issued suffix so a later sensor update
     // can trigger one revalidated braking command instead of Controller
@@ -6696,7 +6595,9 @@ void CertifiedDWBLocalPlanner::reload_motion_limits()
       dwb_plugin_name_ + ".min_vel_x", dwb_plugin_name_ + ".max_vel_x",
       dwb_plugin_name_ + ".max_vel_theta", dwb_plugin_name_ + ".acc_lim_x",
       dwb_plugin_name_ + ".decel_lim_x", dwb_plugin_name_ + ".acc_lim_theta",
-      dwb_plugin_name_ + ".decel_lim_theta"});
+      dwb_plugin_name_ + ".decel_lim_theta",
+      dwb_plugin_name_ + ".terminal_stop_goal_capture_distance",
+      dwb_plugin_name_ + ".terminal_stop_goal_capture_yaw_tolerance"});
   std::vector<double> values;
   for (const auto & parameter : parameters) {
     const double value = parameter.as_double();
@@ -6710,6 +6611,9 @@ void CertifiedDWBLocalPlanner::reload_motion_limits()
   {
     throw std::invalid_argument("Invalid Controller velocity or acceleration limits");
   }
+  if (values[7] < 0.0 || values[8] < 0.0) {
+    throw std::invalid_argument("Invalid Controller terminal goal tolerances");
+  }
   // Commit together at the stopped trial boundary, not during a rollout.
   minimum_linear_velocity_ = values[0];
   maximum_linear_velocity_ = values[1];
@@ -6718,10 +6622,14 @@ void CertifiedDWBLocalPlanner::reload_motion_limits()
   maximum_linear_deceleration_ = values[4];
   maximum_angular_acceleration_ = values[5];
   maximum_angular_deceleration_ = values[6];
+  terminal_stop_goal_capture_distance_ = values[7];
+  terminal_stop_goal_capture_yaw_tolerance_ = values[8];
   RCLCPP_INFO(
-    logger_, "%s internal motion limits reloaded: v=%.6f w=%.6f a=%.6f aw=%.6f",
+    logger_, "%s internal motion limits reloaded: v=%.6f w=%.6f a=%.6f aw=%.6f "
+    "goal_radius=%.6f goal_yaw=%.6f",
     dwb_plugin_name_.c_str(), maximum_linear_velocity_, maximum_angular_velocity_,
-    maximum_linear_acceleration_, maximum_angular_acceleration_);
+    maximum_linear_acceleration_, maximum_angular_acceleration_,
+    terminal_stop_goal_capture_distance_, terminal_stop_goal_capture_yaw_tolerance_);
 }
 
 void CertifiedDWBLocalPlanner::reset_trial_callback(
@@ -6758,7 +6666,6 @@ void CertifiedDWBLocalPlanner::reset_trial_callback(
   }
   retained_backup_commands_.clear();
   retained_backup_states_.clear();
-  terminal_stop_goal_capture_active_ = false;
   terminal_stop_goal_capture_committed_ = false;
   global_plan_.poses.clear();
   terminal_reference_plan_.poses.clear();

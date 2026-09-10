@@ -729,6 +729,64 @@ TEST(MeanPathDistCritic, AveragesEveryPredictedPose)
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(trajectory), 2.0);
 }
 
+TEST(PathDeviationCritic, BoundedSearchMatchesFullSearchOnCurvedAndRepeatedSegments)
+{
+  class ReferenceCritic : public f_dwa_controller::PathDeviationCritic
+  {
+public:
+    double fullSearchScore(const dwb_msgs::msg::Trajectory2D & trajectory)
+    {
+      std::size_t hint = 0u;
+      double excess_sum = 0.0;
+      double terminal_distance = 0.0;
+      for (const auto & pose : trajectory.poses) {
+        terminal_distance = distanceToPath(pose, hint);
+        excess_sum += std::max(0.0, terminal_distance - maximum_path_distance_);
+      }
+      auto probe = trajectory.poses.back();
+      probe.x += heading_recovery_lookahead_distance_ * std::cos(probe.theta);
+      probe.y += heading_recovery_lookahead_distance_ * std::sin(probe.theta);
+      const double probe_distance = distanceToPath(probe, hint);
+      const double activation = std::clamp(
+        (probe_distance - heading_recovery_activation_distance_) /
+        (maximum_path_distance_ - heading_recovery_activation_distance_), 0.0, 1.0);
+      return (excess_sum > 0.0 ? deviation_penalty_ +
+             excess_distance_scale_ * excess_sum / trajectory.poses.size() : 0.0) +
+             heading_recovery_scale_ * activation *
+             std::max(0.0, probe_distance - terminal_distance);
+    }
+  } critic;
+  nav_2d_msgs::msg::Path2D plan;
+  for (int index = 0; index <= 160; ++index) {
+    geometry_msgs::msg::Pose2D point;
+    point.x = 0.05 * index;
+    point.y = std::sin(point.x);
+    plan.poses.push_back(point);
+    if (index % 20 == 0) {
+      plan.poses.push_back(point);
+    }
+  }
+  geometry_msgs::msg::Pose2D pose;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(pose, velocity, pose, plan));
+  for (int ix = -4; ix <= 20; ++ix) {
+    for (int iy = -10; iy <= 10; ++iy) {
+      for (int heading = -4; heading <= 4; ++heading) {
+        auto trajectory = trajectory_to(0.5 * ix, 1.0);
+        trajectory.poses.front().x = 0.5 * ix - 0.3;
+        trajectory.poses.front().y = 0.3 * iy + 0.2;
+        trajectory.poses.back().y = 0.3 * iy;
+        trajectory.poses.back().theta = 0.25 * M_PI * heading;
+        EXPECT_NEAR(critic.scoreTrajectory(trajectory), critic.fullSearchScore(trajectory),
+          1.0e-10);
+      }
+    }
+  }
+  auto invalid = trajectory_to(1.0, 1.0);
+  invalid.poses.front().x = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_DOUBLE_EQ(critic.scoreTrajectory(invalid), 1000.0);
+}
+
 TEST(PathDeviationCritic, IsNeutralAtOrInsideMaximumDistance)
 {
   f_dwa_controller::PathDeviationCritic critic;

@@ -212,16 +212,12 @@ controller_server:
       terminal_stop_goal_distance_scale: 0.0
       terminal_stop_distance_target: path_progress
       terminal_stop_path_lookahead_distance: 1.5
-      # Once a method-native predicted stop ends inside the GoalChecker's
-      # position window, retain and revalidate that deceleration suffix. This
-      # prevents a fast trajectory from crossing and pruning away the final
-      # Path point before the stopped GoalChecker can accept it.
-      # Match the complete 0.20 m GoalChecker window. A narrower 0.19 m latch
-      # lets StoppedGoalChecker accept a low-speed command before J-DWA has
-      # drained acceleration or F-DWA has drained FIR history, after which
-      # Controller Server's normal result zero breaks method continuity.
+      # Match GoalChecker's position window for stop-endpoint assessment and
+      # observed-stop acknowledgement. Moving cycles continue normal native
+      # candidate generation/scoring; reaching a predicted endpoint never
+      # latches the braking suffix. The GUI overrides both radii together.
       terminal_stop_goal_capture_distance: 0.20
-      # Ignore terminal yaw when retaining a certified stop. The periodic yaw
+      # Ignore terminal yaw when assessing a certified stop. The periodic yaw
       # error is at most pi, matching the position-and-speed GoalChecker.
       terminal_stop_goal_capture_yaw_tolerance: 3.141592653589793
       stop_capture_velocity: 0.01
