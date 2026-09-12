@@ -20,6 +20,10 @@
 
 """Python helpers used to prepare F-DWA controller parameters."""
 
+from pkgutil import extend_path
+
+__path__ = extend_path(__path__, __name__)
+
 from .fir_filter_design import (
     coefficient_fingerprint,
     design_fir_coefficients,

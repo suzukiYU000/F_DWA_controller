@@ -815,10 +815,16 @@ double FootprintClearanceCritic::minimumFootprintClearance(
   const double origin_x = costmap_->getOriginX();
   const double origin_y = costmap_->getOriginY();
   const unsigned int size_x = costmap_->getSizeInCellsX();
+  const unsigned int size_y = costmap_->getSizeInCellsY();
   const double maximum_x = origin_x +
     static_cast<double>(size_x) * resolution;
   const double maximum_y = origin_y +
-    static_cast<double>(costmap_->getSizeInCellsY()) * resolution;
+    static_cast<double>(size_y) * resolution;
+  const double maximum_corner_offset = std::sqrt(2.0) * resolution;
+  const double interpolation_rounding_guard =
+    64.0 * std::numeric_limits<double>::epsilon() *
+    (1.0 + std::abs(origin_x) + std::abs(origin_y) +
+    std::abs(maximum_x) + std::abs(maximum_y));
   const double cosine = std::cos(pose.theta);
   const double sine = std::sin(pose.theta);
   double minimum_clearance = std::numeric_limits<double>::infinity();
@@ -837,27 +843,69 @@ double FootprintClearanceCritic::minimumFootprintClearance(
     }
     unsigned int cell_x = 0u;
     unsigned int cell_y = 0u;
-    if (!costmap_->worldToMap(world_x, world_y, cell_x, cell_y)) {
+    // Strict interior points already passed the map-boundary test above.
+    // Retain worldToMap at the outer cell where division can round to size.
+    if (std::min({world_x - origin_x, maximum_x - world_x,
+        world_y - origin_y, maximum_y - world_y}) <= resolution &&
+      !costmap_->worldToMap(world_x, world_y, cell_x, cell_y))
+    {
       return 0.0;
     }
-    const std::size_t field_index =
-      static_cast<std::size_t>(cell_y) * size_x + cell_x;
-    const double cell_centre_distance = obstacle_distance_field_[field_index];
-    if (!std::isfinite(cell_centre_distance)) {
-      continue;
+    // Interpolate conservative bounds, not the EDT alone. Each corner's
+    // D(c) - |p-c| is a lower bound at p by the 1-Lipschitz property. Their
+    // convex combination stays conservative and is continuous across cell
+    // boundaries, unlike choosing only the cell containing p.
+    const double grid_x = std::clamp(
+      (world_x - origin_x) / resolution - 0.5,
+      0.0, static_cast<double>(size_x - 1u));
+    const double grid_y = std::clamp(
+      (world_y - origin_y) / resolution - 0.5,
+      0.0, static_cast<double>(size_y - 1u));
+    const unsigned int x0 = static_cast<unsigned int>(std::floor(grid_x));
+    const unsigned int y0 = static_cast<unsigned int>(std::floor(grid_y));
+    const unsigned int x1 = std::min(x0 + 1u, size_x - 1u);
+    const unsigned int y1 = std::min(y0 + 1u, size_y - 1u);
+    const std::size_t rows[2] = {static_cast<std::size_t>(y0) * size_x,
+      static_cast<std::size_t>(y1) * size_x};
+    const double minimum_corner_distance = std::min({
+        obstacle_distance_field_[rows[0] + x0], obstacle_distance_field_[rows[0] + x1],
+        obstacle_distance_field_[rows[1] + x0], obstacle_distance_field_[rows[1] + x1]});
+    // Every positive-weight corner is at most one cell diagonal from the
+    // probe, including clamped border interpolation. Its convex combination
+    // is therefore >= min(D_corners) - cell_diagonal. If even that bound is
+    // above the current minimum, the four square roots cannot change it.
+    // This uses stored distances directly and does not assume a Lipschitz
+    // property for the rounded float distance field.
+    const double probe_lower_bound = minimum_corner_distance - maximum_corner_offset -
+      obstacle_cell_radius - probe_gap_radius - interpolation_rounding_guard -
+      64.0 * std::numeric_limits<double>::epsilon() * std::abs(minimum_corner_distance);
+    if (probe_lower_bound >= minimum_clearance) {continue;}
+    const double fraction_x = grid_x - static_cast<double>(x0);
+    const double fraction_y = grid_y - static_cast<double>(y0);
+    // The four corner offsets and row addresses are shared by both terms
+    // in their row/column. Preserve corner order and the original arithmetic.
+    const double centre_x0 = origin_x + (static_cast<double>(x0) + 0.5) * resolution;
+    const double centre_x1 = origin_x + (static_cast<double>(x1) + 0.5) * resolution;
+    const double centre_y0 = origin_y + (static_cast<double>(y0) + 0.5) * resolution;
+    const double centre_y1 = origin_y + (static_cast<double>(y1) + 0.5) * resolution;
+    const double dx0 = world_x - centre_x0, dx1 = world_x - centre_x1;
+    const double dy0 = world_y - centre_y0, dy1 = world_y - centre_y1;
+    const double squared_x[2] = {dx0 * dx0, dx1 * dx1};
+    const double squared_y[2] = {dy0 * dy0, dy1 * dy1};
+    const double weights_x[2] = {1.0 - fraction_x, fraction_x};
+    const double weights_y[2] = {1.0 - fraction_y, fraction_y};
+    const unsigned int columns[2] = {x0, x1};
+    double interpolated_lower_bound = 0.0;
+    for (unsigned int row = 0u; row < 2u; ++row) {
+      for (unsigned int column = 0u; column < 2u; ++column) {
+        const double weight = weights_x[column] * weights_y[row];
+        if (weight <= 0.0) {continue;}
+        interpolated_lower_bound += weight *
+          (obstacle_distance_field_[rows[row] + columns[column]] -
+          std::sqrt(squared_x[column] + squared_y[row]));
+      }
     }
-    const double cell_centre_x =
-      origin_x + (static_cast<double>(cell_x) + 0.5) * resolution;
-    const double cell_centre_y =
-      origin_y + (static_cast<double>(cell_y) + 0.5) * resolution;
-    // The cell-centre distance transform is 1-Lipschitz.  Subtracting the
-    // query-to-cell-centre offset gives a lower bound at the exact probe.
-    // The other two terms conservatively cover the occupied cell's square
-    // area and the unsampled interval between adjacent footprint probes.
-    const double centre_dx = world_x - cell_centre_x;
-    const double centre_dy = world_y - cell_centre_y;
-    const double conservative_clearance = cell_centre_distance -
-      std::sqrt(centre_dx * centre_dx + centre_dy * centre_dy) -
+    const double conservative_clearance = interpolated_lower_bound -
       obstacle_cell_radius - probe_gap_radius;
     minimum_clearance = std::min(minimum_clearance, conservative_clearance);
   }

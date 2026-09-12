@@ -72,6 +72,9 @@ public:
     double initial_angular_velocity{0.0};
     double initial_linear_acceleration{0.0};
     double initial_angular_acceleration{0.0};
+    bool uses_recovery{false};
+    double linear_recovery_input{0.0};
+    double angular_recovery_input{0.0};
     NativeCommandState first_command_state;
   };
 
@@ -196,6 +199,8 @@ protected:
 
   struct AxisRollout
   {
+    bool uses_recovery{false};
+    double recovery_input{0.0};
     int prediction_input_steps{0};
     std::vector<AxisState> states;
     std::vector<double> first_fir_history;
@@ -289,6 +294,8 @@ private:
   double fir_prediction_pulse_duration_{0.0};
   std::vector<double> fir_prediction_pulse_durations_;
   bool fir_independent_pulse_durations_{false};
+  bool native_input_recovery_{false};
+  double native_input_pulse_duration_{0.0};
   double stop_capture_velocity_{0.01};
   double stop_command_delay_seconds_{0.07};
   int linear_samples_{11};

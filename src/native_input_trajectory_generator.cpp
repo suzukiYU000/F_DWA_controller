@@ -1,3 +1,4 @@
+#include "f_dwa_controller/saturation_input_dynamics.hpp"
 // Copyright (c) 2026 suzukiYU000
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -89,6 +90,15 @@ void NativeInputTrajectoryGenerator::initialize(
 {
   dwb_plugins::StandardTrajectoryGenerator::initialize(node, plugin_name);
   node_ = node;
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".native_input_recovery", rclcpp::ParameterValue(false));
+  node->get_parameter(plugin_name + ".native_input_recovery", native_input_recovery_);
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".native_input_pulse_duration", rclcpp::ParameterValue(0.0));
+  node->get_parameter(plugin_name + ".native_input_pulse_duration", native_input_pulse_duration_);
+  if (!std::isfinite(native_input_pulse_duration_) || native_input_pulse_duration_ < 0.0) {
+    throw std::invalid_argument("native_input_pulse_duration must be finite and nonnegative");
+  }
   plugin_name_ = plugin_name;
 
   nav2_util::declare_parameter_if_not_declared(
@@ -115,6 +125,10 @@ void NativeInputTrajectoryGenerator::initialize(
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".fir_cutoff_frequency_hz",
     rclcpp::ParameterValue(1.2));
+  // Zero preserves coefficient-only callers. Generated GUI profiles provide
+  // the explicit effective count, which must agree with the executed filter.
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".fir_effective_taps", rclcpp::ParameterValue(0));
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".fir_prediction_pulse_duration",
     rclcpp::ParameterValue(0.0));
@@ -237,6 +251,14 @@ void NativeInputTrajectoryGenerator::validate_parameters() const
             plugin_name_ + " jerk limits must be finite and positive");
   }
   if (input_order_ == NativeInputOrder::kFir) {
+    const auto node = node_.lock();
+    if (!node) {throw std::runtime_error("FIR Controller node is unavailable");}
+    const auto effective_taps = node->get_parameter(plugin_name_ + ".fir_effective_taps").as_int();
+    if (effective_taps < 0 || (effective_taps > 0 &&
+      static_cast<std::size_t>(effective_taps) != fir_coefficients_.size()))
+    {
+      throw std::invalid_argument(plugin_name_ + ".fir_effective_taps must match fir_coefficients");
+    }
     const double coefficient_sum =
       std::accumulate(
       fir_coefficients_.begin(), fir_coefficients_.end(), 0.0);
@@ -279,6 +301,10 @@ std::vector<int> NativeInputTrajectoryGenerator::prediction_input_step_counts() 
 {
   const int horizon_steps = static_cast<int>(fixed_time_steps_.size());
   if (input_order_ != NativeInputOrder::kFir) {
+    if (input_order_ == NativeInputOrder::kJerk && native_input_pulse_duration_ > 0.0) {
+      return {std::min(horizon_steps, std::max(1,
+        static_cast<int>(std::ceil(native_input_pulse_duration_ / control_period_ - 1.0e-12))))};
+    }
     return {horizon_steps};
   }
   std::vector<int> step_counts;
@@ -345,6 +371,8 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   int updated_linear_samples = linear_samples_;
   int updated_angular_samples = angular_samples_;
   double updated_sim_time = sim_time_;
+  bool updated_native_input_recovery = native_input_recovery_;
+  double updated_native_input_pulse_duration = native_input_pulse_duration_;
   double updated_pulse_duration = fir_prediction_pulse_duration_;
   std::vector<double> updated_pulse_durations = fir_prediction_pulse_durations_;
   bool updated_independent_durations = fir_independent_pulse_durations_;
@@ -358,6 +386,12 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   node->get_parameter(plugin_name_ + ".sim_time", updated_sim_time);
   node->get_parameter(plugin_name_ + ".vx_samples", updated_linear_samples);
   node->get_parameter(plugin_name_ + ".vtheta_samples", updated_angular_samples);
+  node->get_parameter(
+    plugin_name_ + ".native_input_recovery",
+    updated_native_input_recovery);
+  node->get_parameter(
+    plugin_name_ + ".native_input_pulse_duration",
+    updated_native_input_pulse_duration);
   if (input_order_ == NativeInputOrder::kFir) {
     node->get_parameter(
       plugin_name_ + ".fir_coefficients", updated_coefficients);
@@ -383,6 +417,9 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   const int previous_linear_samples = linear_samples_;
   const int previous_angular_samples = angular_samples_;
   const double previous_sim_time = sim_time_;
+  const bool previous_native_input_recovery = native_input_recovery_;
+  const double previous_native_input_pulse_duration =
+    native_input_pulse_duration_;
   const double previous_pulse_duration = fir_prediction_pulse_duration_;
   const std::vector<double> previous_pulse_durations = fir_prediction_pulse_durations_;
   const bool previous_independent_durations = fir_independent_pulse_durations_;
@@ -398,6 +435,8 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   linear_samples_ = updated_linear_samples;
   angular_samples_ = updated_angular_samples;
   sim_time_ = updated_sim_time;
+  native_input_recovery_ = updated_native_input_recovery;
+  native_input_pulse_duration_ = updated_native_input_pulse_duration;
   fir_prediction_pulse_duration_ = updated_pulse_duration;
   fir_prediction_pulse_durations_ = std::move(updated_pulse_durations);
   fir_independent_pulse_durations_ = updated_independent_durations;
@@ -405,6 +444,12 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   fir_coefficients_generated_ = updated_coefficients_generated;
   fir_coefficients_ = std::move(updated_coefficients);
   try {
+    if (!std::isfinite(native_input_pulse_duration_) ||
+      native_input_pulse_duration_ < 0.0)
+    {
+      throw std::invalid_argument(
+              "native_input_pulse_duration must be finite and nonnegative");
+    }
     validate_parameters();
     fixed_time_steps_ = getTimeSteps(nav_2d_msgs::msg::Twist2D());
     if (input_order_ == NativeInputOrder::kFir) {
@@ -423,6 +468,8 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
     linear_samples_ = previous_linear_samples;
     angular_samples_ = previous_angular_samples;
     sim_time_ = previous_sim_time;
+    native_input_recovery_ = previous_native_input_recovery;
+    native_input_pulse_duration_ = previous_native_input_pulse_duration;
     fir_prediction_pulse_duration_ = previous_pulse_duration;
     fir_prediction_pulse_durations_ = previous_pulse_durations;
     fir_independent_pulse_durations_ = previous_independent_durations;
@@ -645,6 +692,10 @@ NativeInputTrajectoryGenerator::active_candidate_diagnostics() const
   }
   ActiveCandidateDiagnostics diagnostics;
   diagnostics.canonical_index = active_candidate_->canonical_index;
+  diagnostics.uses_recovery = active_candidate_->linear_rollout->uses_recovery ||
+    active_candidate_->angular_rollout->uses_recovery;
+  diagnostics.linear_recovery_input = active_candidate_->linear_rollout->recovery_input;
+  diagnostics.angular_recovery_input = active_candidate_->angular_rollout->recovery_input;
   diagnostics.linear_prediction_input_duration =
     active_candidate_->linear_rollout->prediction_input_steps * control_period_;
   diagnostics.angular_prediction_input_duration =
@@ -933,22 +984,68 @@ void NativeInputTrajectoryGenerator::startNewIteration(
   std::map<double, std::shared_ptr<AxisStopData>> angular_stop_data;
   std::vector<std::vector<std::shared_ptr<const AxisRollout>>> linear_banks;
   std::vector<std::vector<std::shared_ptr<const AxisRollout>>> angular_banks;
-  for (const int active_input_steps : prediction_input_step_counts()) {
+  const bool recovery = native_input_recovery_;
+  const auto periods = recovery ? std::vector<int>{1} : prediction_input_step_counts();
+  for (const int active_input_steps : periods) {
+    ZeroFirResponse linear_recovery_response, angular_recovery_response;
+    std::vector<FeasibleInterval> linear_recovery_intervals, angular_recovery_intervals;
     HeldFirAffineResponse linear_fir_response;
     HeldFirAffineResponse angular_fir_response;
     FeasibleInterval linear_interval;
     FeasibleInterval angular_interval;
-    if (input_order_ == NativeInputOrder::kFir) {
+    if (recovery) {
+      if (input_order_ == NativeInputOrder::kAcceleration) {
+        linear_recovery_intervals = {acceleration_input_interval(
+          linear_state, linear_axis_limits, control_period_)};
+        angular_recovery_intervals = {acceleration_input_interval(
+          angular_state, angular_axis_limits, control_period_)};
+      } else if (input_order_ == NativeInputOrder::kJerk) {
+        linear_recovery_intervals = jerk_switch_input_intervals(
+          linear_state, linear_axis_limits, control_period_, rollout_step_count);
+        angular_recovery_intervals = jerk_switch_input_intervals(
+          angular_state, angular_axis_limits, control_period_, rollout_step_count);
+      } else {
+        linear_recovery_response = prepare_zero_fir_response(linear_state, linear_axis_limits,
+          fir_coefficients_, initial_linear_fir_history, control_period_, rollout_step_count);
+        angular_recovery_response = prepare_zero_fir_response(angular_state, angular_axis_limits,
+          fir_coefficients_, initial_angular_fir_history, control_period_, rollout_step_count);
+        linear_recovery_intervals = linear_recovery_response.input_intervals;
+        angular_recovery_intervals = angular_recovery_response.input_intervals;
+      }
+    } else if (input_order_ == NativeInputOrder::kFir) {
+      // A finite pulse explicitly specifies zero raw input after its last
+      // tick. Constrain the complete FIR tail, while retaining only the
+      // nominal horizon for poses and critic scoring. A zero duration means
+      // the legacy held-input action, whose post-horizon input is unspecified.
+      const auto is_configured_fir_pulse = [this, active_input_steps, rollout_step_count](
+        const double duration)
+        {
+          if (duration <= 0.0) {return false;}
+          const int steps = std::min(rollout_step_count, std::max(
+            1, static_cast<int>(std::ceil(duration / control_period_ - 1.0e-12))));
+          return steps == active_input_steps;
+        };
+      const bool check_fir_tail = is_configured_fir_pulse(fir_prediction_pulse_duration_) ||
+        std::any_of(fir_prediction_pulse_durations_.begin(),
+        fir_prediction_pulse_durations_.end(), is_configured_fir_pulse);
+      const int constraint_step_count = check_fir_tail ? std::max(
+        rollout_step_count, active_input_steps + static_cast<int>(fir_coefficients_.size()) - 1) :
+        rollout_step_count;
       linear_fir_response = prepare_pulsed_fir_affine_response(
         linear_state, linear_axis_limits, fir_coefficients_,
-        initial_linear_fir_history, control_period_, rollout_step_count,
+        initial_linear_fir_history, control_period_, constraint_step_count,
         active_input_steps);
       angular_fir_response = prepare_pulsed_fir_affine_response(
         angular_state, angular_axis_limits, fir_coefficients_,
-        initial_angular_fir_history, control_period_, rollout_step_count,
+        initial_angular_fir_history, control_period_, constraint_step_count,
         active_input_steps);
       linear_interval = linear_fir_response.input_interval;
       angular_interval = angular_fir_response.input_interval;
+    } else if (input_order_ == NativeInputOrder::kJerk && active_input_steps < rollout_step_count) {
+      linear_interval = pulsed_jerk_input_interval(linear_state, linear_axis_limits,
+        control_period_, rollout_step_count, active_input_steps);
+      angular_interval = pulsed_jerk_input_interval(angular_state, angular_axis_limits,
+        control_period_, rollout_step_count, active_input_steps);
     } else {
       // A/J apply one constant native input over the complete nominal horizon.
       // Sample that exact feasible interval directly. Sampling the wider
@@ -964,16 +1061,19 @@ void NativeInputTrajectoryGenerator::startNewIteration(
         rollout_step_count);
     }
     const std::vector<double> linear_inputs =
+      recovery ? sample_input_intervals(linear_recovery_intervals, linear_samples_) :
       uniform_samples(linear_interval, linear_samples_);
     const std::vector<double> angular_inputs =
+      recovery ? sample_input_intervals(angular_recovery_intervals, angular_samples_) :
       uniform_samples(angular_interval, angular_samples_);
     const auto build_axis_rollouts =
-      [this, rollout_step_count, active_input_steps](
+      [this, rollout_step_count, active_input_steps, recovery](
       const std::vector<double> & inputs,
       const AxisState & initial_state,
       const AxisLimits & limits,
       const std::vector<double> & initial_fir_history,
       const HeldFirAffineResponse * fir_response,
+      const ZeroFirResponse & recovery_response,
       std::map<double, std::shared_ptr<AxisStopData>> & stop_data)
       {
         std::vector<std::shared_ptr<const AxisRollout>> rollouts;
@@ -982,15 +1082,42 @@ void NativeInputTrajectoryGenerator::startNewIteration(
           auto rollout = std::make_shared<AxisRollout>();
           rollout->prediction_input_steps = active_input_steps;
           rollout->native_input = input;
-          if (input_order_ == NativeInputOrder::kFir) {
+          if (recovery) {
+            auto recovered = input_order_ == NativeInputOrder::kAcceleration ?
+              longest_acceleration_input(initial_state, limits, input, control_period_, rollout_step_count) :
+              input_order_ == NativeInputOrder::kJerk ?
+              longest_jerk_recovery(initial_state, limits, input, control_period_, rollout_step_count) :
+              longest_zero_fir_input(recovery_response, limits, input);
+            if (!recovered.valid) {continue;}
+            rollout->prediction_input_steps = recovered.active_input_steps;
+            rollout->uses_recovery = true;
+            rollout->recovery_input = recovered.recovery_input;
+            rollout->states = std::move(recovered.states);
+            if (input_order_ == NativeInputOrder::kFir) {
+              rollout->first_fir_history = initial_fir_history;
+              push_fir_input(rollout->first_fir_history, input);
+            }
+          } else if (input_order_ == NativeInputOrder::kFir) {
             if (fir_response == nullptr ||
               !sample_held_fir_affine_response(
                 *fir_response, limits, input, rollout->states))
             {
               continue;
             }
+            // The affine response may include the FIR tail solely for the
+            // motion-constraint interval. Do not extend critic geometry or
+            // the published candidate beyond the nominal prediction horizon.
+            rollout->states.resize(static_cast<std::size_t>(rollout_step_count));
             rollout->first_fir_history = initial_fir_history;
             push_fir_input(rollout->first_fir_history, input);
+          } else if (input_order_ == NativeInputOrder::kJerk && active_input_steps < rollout_step_count) {
+            AxisState state = initial_state;
+            for (int k = 0; k < rollout_step_count; ++k) {
+              state.acceleration += (k < active_input_steps ? input : 0.0) * control_period_;
+              state.velocity += state.acceleration * control_period_;
+              if (!recovery_state_valid(state, limits)) {break;}
+              rollout->states.push_back(state);
+            }
           } else {
             rollout->states.reserve(
               static_cast<std::size_t>(rollout_step_count));
@@ -1032,11 +1159,11 @@ void NativeInputTrajectoryGenerator::startNewIteration(
     const auto linear_rollouts =
       build_axis_rollouts(
       linear_inputs, linear_state, linear_axis_limits,
-      initial_linear_fir_history, linear_fir_response_pointer, linear_stop_data);
+      initial_linear_fir_history, linear_fir_response_pointer, linear_recovery_response, linear_stop_data);
     const auto angular_rollouts =
       build_axis_rollouts(
       angular_inputs, angular_state, angular_axis_limits,
-      initial_angular_fir_history, angular_fir_response_pointer, angular_stop_data);
+      initial_angular_fir_history, angular_fir_response_pointer, angular_recovery_response, angular_stop_data);
 
     linear_banks.push_back(linear_rollouts);
     angular_banks.push_back(angular_rollouts);
@@ -1073,7 +1200,7 @@ void NativeInputTrajectoryGenerator::startNewIteration(
   for (std::size_t index = 0u; index < linear_banks.size(); ++index) {
     append_candidates(linear_banks[index], angular_banks[index]);
   }
-  if (input_order_ == NativeInputOrder::kFir && fir_independent_pulse_durations_) {
+  if (!recovery && input_order_ == NativeInputOrder::kFir && fir_independent_pulse_durations_) {
     for (std::size_t linear = 0u; linear < linear_banks.size(); ++linear) {
       for (std::size_t angular = 0u; angular < angular_banks.size(); ++angular) {
         if (linear != angular) {
@@ -1550,7 +1677,23 @@ NativeInputTrajectoryGenerator::get_axis_stop_cache(
     step_index < command_delay_steps; ++step_index)
   {
     bool feasible = false;
-    if (input_order_ == NativeInputOrder::kFir) {
+    if (rollout.uses_recovery && input_order_ == NativeInputOrder::kAcceleration) {
+      const auto step = project_acceleration_step(state, limits, rollout.native_input, control_period_);
+      feasible = step.feasible &&
+        std::abs(step.applied_native_input - rollout.native_input) <= 1.0e-9;
+      state = step.state;
+    } else if ((rollout.uses_recovery || native_input_pulse_duration_ > 0.0) &&
+      input_order_ == NativeInputOrder::kJerk) {
+      const auto step = project_jerk_step(state, limits, rollout.native_input, control_period_);
+      feasible = step.feasible &&
+        std::abs(step.applied_native_input - rollout.native_input) <= 1.0e-9;
+      state = step.state;
+    } else if (rollout.uses_recovery && input_order_ == NativeInputOrder::kFir) {
+      const double acceleration = fir_acceleration(fir_coefficients_, fir_history, rollout.native_input);
+      state = {state.velocity + acceleration * control_period_, acceleration};
+      feasible = recovery_state_valid(state, limits);
+      push_fir_input(fir_history, rollout.native_input);
+    } else if (input_order_ == NativeInputOrder::kFir) {
       feasible = apply_projected_fir_step_in_place(
         state, limits, fir_coefficients_, fir_history,
         rollout.native_input, control_period_);

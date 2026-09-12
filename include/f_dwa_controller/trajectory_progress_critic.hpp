@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "dwb_core/trajectory_critic.hpp"
+#include "f_dwa_controller/path_segment_bounds.hpp"
 
 namespace f_dwa_controller
 {
@@ -69,6 +70,7 @@ protected:
   nav_2d_msgs::msg::Path2D path_;
   std::vector<double> cumulative_distance_;
   std::vector<PathSegment> path_segments_;
+  std::vector<PathSegmentBounds> path_segment_bounds_;
   std::size_t current_segment_hint_{0u};
   double current_progress_{0.0};
   double current_cross_track_distance_{0.0};

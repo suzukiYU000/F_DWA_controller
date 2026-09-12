@@ -5,10 +5,10 @@ controller_server:
       primary_controller_type: "f_dwa_controller::ADwaController"
       trajectory_generator_name: "f_dwa_controller::AccelerationTrajectoryGenerator"
       enable_certification: false
+      native_input_recovery: true
       native_input_control_period: 0.05
       require_applied_command_state: false
       # The prediction horizon is inherited from the common comparison file.
-      # Direct full-horizon sampling prevents duplicate clamped rollouts, so
-      # retain the common physical angular-acceleration limit. The
-      # velocity-feasible interval itself limits the held input.
+      # Hold acceleration only while the complete velocity response stays
+      # admissible, then coast; keep the shared angular acceleration bound.
       acc_lim_theta: 1.57

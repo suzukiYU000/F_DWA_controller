@@ -202,20 +202,26 @@ def design_fir_coefficients(profile_name: str) -> list[float]:
     return design_fir_coefficients_from_spec(design)
 
 
-def lowpass_design_for_cutoff(cutoff_hz: float) -> FirFilterDesign:
-    """Return the established 20 Hz/91-tap design at a numeric cutoff."""
+def lowpass_design_for_cutoff(
+    cutoff_hz: float, effective_taps: int = 46,
+) -> FirFilterDesign:
+    """Design a 20 Hz minimum-phase filter with the requested output length."""
+    if isinstance(effective_taps, bool) or not isinstance(effective_taps, int) or effective_taps < 2:
+        raise ValueError('fir_effective_taps must be an integer of at least 2')
     return FirFilterDesign(
-        num_taps=91,
+        num_taps=2 * effective_taps - 1,
         sample_frequency_hz=20.0,
         mode='lowpass',
         cutoff_hz=float(cutoff_hz),
     )
 
 
-def design_fir_coefficients_for_cutoff(cutoff_hz: float) -> list[float]:
+def design_fir_coefficients_for_cutoff(
+    cutoff_hz: float, effective_taps: int = 46,
+) -> list[float]:
     """Generate the F-DWA FIR from an operator-provided cutoff in Hz."""
     return design_fir_coefficients_from_spec(
-        lowpass_design_for_cutoff(cutoff_hz)
+        lowpass_design_for_cutoff(cutoff_hz, effective_taps)
     )
 
 
@@ -264,8 +270,9 @@ def inject_fir_coefficients(
     uses_fir = generator_name.endswith('FirTrajectoryGenerator')
     profile_name = plugin_parameters.pop('fir_design_profile', None)
     cutoff_hz = plugin_parameters.get('fir_cutoff_frequency_hz')
+    effective_taps = plugin_parameters.get('fir_effective_taps', 46)
     if not uses_fir:
-        if profile_name is not None or cutoff_hz is not None:
+        if profile_name is not None or cutoff_hz is not None or 'fir_effective_taps' in plugin_parameters:
             raise ValueError(
                 'FIR design parameters are only valid for '
                 'FirTrajectoryGenerator'
@@ -289,7 +296,7 @@ def inject_fir_coefficients(
             raise ValueError(
                 'fir_cutoff_frequency_hz must be a number'
             ) from error
-        design = lowpass_design_for_cutoff(cutoff_hz)
+        design = lowpass_design_for_cutoff(cutoff_hz, effective_taps)
         coefficients = design_fir_coefficients_from_spec(design)
         profile_name = f'cutoff_{cutoff_hz:g}_hz'
     else:
@@ -299,6 +306,8 @@ def inject_fir_coefficients(
             )
         coefficients = design_fir_coefficients(profile_name)
         design = FIR_FILTER_DESIGNS[profile_name]
+        if effective_taps != len(coefficients):
+            raise ValueError('legacy FIR profiles have a fixed effective tap count')
     (
         step_response_rise_time_seconds,
         step_response_overshoot_percent,
@@ -307,6 +316,7 @@ def inject_fir_coefficients(
         design.sample_frequency_hz,
     )
     plugin_parameters['fir_coefficients'] = coefficients
+    plugin_parameters['fir_effective_taps'] = len(coefficients)
     plugin_parameters['fir_coefficients_generated'] = True
     return DesignReport(
         profile_name=profile_name,

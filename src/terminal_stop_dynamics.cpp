@@ -190,10 +190,11 @@ public:
         static_cast<std::size_t>(step_index);
       const double free_acceleration =
         zero_input_accelerations_[index];
-      const double unit_acceleration =
-        (*held_unit_accelerations_)[index];
+      // Only the next input is committed. Check its exact FIR impulse tail,
+      // then choose the following input from the updated history next tick.
+      const double unit_acceleration = coefficients_[index];
       free_velocity += time_step * free_acceleration;
-      unit_velocity = (*held_unit_velocities_)[index];
+      unit_velocity = time_step * (*held_unit_accelerations_)[index];
       zero_input_feasible =
         zero_input_feasible &&
         free_acceleration >=

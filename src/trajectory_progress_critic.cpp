@@ -57,6 +57,7 @@ bool TrajectoryProgressCritic::prepare(
   path_ = global_plan;
   cumulative_distance_.assign(path_.poses.size(), 0.0);
   path_segments_.clear();
+  path_segment_bounds_.clear();
   current_segment_hint_ = 0u;
   if (path_.poses.size() < 2u) {
     current_progress_ = 0.0;
@@ -91,6 +92,7 @@ bool TrajectoryProgressCritic::prepare(
     desired_progress_ = 0.0;
     return true;
   }
+  prepare_path_segment_bounds(path_segments_, path_segment_bounds_);
   const auto current_projection = projectOntoPath(
     pose, current_segment_hint_);
   current_progress_ = current_projection.progress;
@@ -154,9 +156,19 @@ TrajectoryProgressCritic::projectOntoPath(
 
   segment_hint = std::min(segment_hint, path_segments_.size() - 1u);
   consider_segment(segment_hint);
-  for (std::size_t index = 0u; index < path_segments_.size(); ++index) {
-    if (index != segment_hint) {
-      consider_segment(index);
+  for (std::size_t first = 0u; first < path_segments_.size();) {
+    const auto & block = path_segment_bounds_[first / kPathSegmentBlockSize];
+    const double lower_bound = block.squaredDistance(pose.x, pose.y);
+    if (lower_bound > nearest_squared_distance ||
+      (lower_bound == nearest_squared_distance && first >= nearest_segment))
+    {
+      first = block.end;
+      continue;
+    }
+    for (; first < block.end; ++first) {
+      if (first != segment_hint) {
+        consider_segment(first);
+      }
     }
   }
   segment_hint = nearest_segment;

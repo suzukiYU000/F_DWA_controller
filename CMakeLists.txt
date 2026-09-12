@@ -42,6 +42,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 # helper as a submodule without creating a second same-named Python target.
 install(
   FILES python/${PROJECT_NAME}/fir_filter_design.py
+    python/${PROJECT_NAME}/goal_tolerance.py
+    python/${PROJECT_NAME}/common_scoring.py
     python/${PROJECT_NAME}/sampling_settings.py
   DESTINATION "${PYTHON_INSTALL_DIR}/${PROJECT_NAME}"
 )

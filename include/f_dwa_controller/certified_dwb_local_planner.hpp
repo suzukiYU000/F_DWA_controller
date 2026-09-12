@@ -511,6 +511,10 @@ private:
   double maximum_planning_duration_seconds_{0.0};
   uint64_t shared_clearance_risk_path_candidate_count_{0};
   uint64_t independent_clearance_risk_path_candidate_count_{0};
+  DurationCounter controller_lock_timing_;
+  DurationCounter costmap_lock_timing_;
+  DurationCounter planning_snapshot_timing_;
+  DurationCounter dwb_call_timing_;
   DurationCounter core_scoring_timing_;
   DurationCounter candidate_evaluation_timing_;
   DurationCounter trajectory_generation_timing_;

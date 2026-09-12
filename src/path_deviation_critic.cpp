@@ -38,6 +38,10 @@ void PathDeviationCritic::onInit()
     node, prefix + "excess_distance_scale",
     rclcpp::ParameterValue(1000.0));
   nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "path_distance_scale", rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, prefix + "path_distance_tolerance", rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
     node, prefix + "heading_recovery_activation_distance",
     rclcpp::ParameterValue(1.05));
   nav2_util::declare_parameter_if_not_declared(
@@ -51,6 +55,8 @@ void PathDeviationCritic::onInit()
   node->get_parameter(prefix + "deviation_penalty", deviation_penalty_);
   node->get_parameter(
     prefix + "excess_distance_scale", excess_distance_scale_);
+  node->get_parameter(prefix + "path_distance_scale", path_distance_scale_);
+  node->get_parameter(prefix + "path_distance_tolerance", path_distance_tolerance_);
   node->get_parameter(
     prefix + "heading_recovery_activation_distance",
     heading_recovery_activation_distance_);
@@ -69,6 +75,9 @@ void PathDeviationCritic::validateParameters() const
     maximum_path_distance_ < 0.0 ||
     !std::isfinite(deviation_penalty_) || deviation_penalty_ < 0.0 ||
     !std::isfinite(excess_distance_scale_) || excess_distance_scale_ < 0.0 ||
+    !std::isfinite(path_distance_scale_) || path_distance_scale_ < 0.0 ||
+    !std::isfinite(path_distance_tolerance_) || path_distance_tolerance_ < 0.0 ||
+    path_distance_tolerance_ > maximum_path_distance_ ||
     !std::isfinite(heading_recovery_activation_distance_) ||
     heading_recovery_activation_distance_ < 0.0 ||
     heading_recovery_activation_distance_ > maximum_path_distance_ ||
@@ -93,6 +102,7 @@ bool PathDeviationCritic::prepare(
   reference_path_valid_ = project_pose_onto_path(
     reference_path_, pose, projection);
   path_segments_.clear();
+  path_segment_bounds_.clear();
   if (!reference_path_valid_) {
     return false;
   }
@@ -118,7 +128,44 @@ bool PathDeviationCritic::prepare(
         point.x, point.y, 0.0, 0.0, 0.0,
         point.x, point.x, point.y, point.y});
   }
+  prepare_path_segment_bounds(path_segments_, path_segment_bounds_);
   return reference_path_valid_;
+}
+
+bool PathDeviationCritic::beyondPathEndWithinCorridor(
+  const geometry_msgs::msg::Pose2D & pose,
+  const geometry_msgs::msg::Pose2D & endpoint,
+  const double terminal_heading, const double maximum_overshoot) const
+{
+  if (!reference_path_valid_ || reference_path_.poses.empty() ||
+    path_segments_.empty() || !std::isfinite(pose.x) || !std::isfinite(pose.y) ||
+    !std::isfinite(endpoint.x) || !std::isfinite(endpoint.y) ||
+    !std::isfinite(terminal_heading) || !std::isfinite(maximum_overshoot) ||
+    maximum_overshoot < 0.0)
+  {
+    return false;
+  }
+  const auto & path_end = reference_path_.poses.back();
+  // A transformed/pruned local plan may end before the global goal. It must
+  // not establish a terminal boundary at that temporary local endpoint.
+  if (std::hypot(path_end.x - endpoint.x, path_end.y - endpoint.y) > 1.0e-6) {
+    return false;
+  }
+  const double delta_x = pose.x - endpoint.x;
+  const double delta_y = pose.y - endpoint.y;
+  const double cosine = std::cos(terminal_heading), sine = std::sin(terminal_heading);
+  if (delta_x * cosine + delta_y * sine <= maximum_overshoot + 1.0e-12 ||
+    std::abs(-delta_x * sine + delta_y * cosine) > maximum_path_distance_ + 1.0e-12)
+  {
+    return false;
+  }
+  // The capture circle is narrower than the allowed Path corridor. Cover
+  // lateral stopping endpoints too, but only if the true endpoint is their
+  // nearest Path point. An earlier leg of a returning path stays unaffected.
+  std::size_t hint = path_segments_.size() - 1u;
+  const double endpoint_distance = std::hypot(delta_x, delta_y);
+  return distanceToPath(pose, hint) >= endpoint_distance -
+         1.0e-9 * std::max(1.0, endpoint_distance);
 }
 
 double PathDeviationCritic::distanceToPath(
@@ -172,17 +219,21 @@ double PathDeviationCritic::distanceToPath(
   consider_segment(segment_hint);
   const double sufficient_squared_distance =
     sufficient_distance * sufficient_distance;
-  for (std::size_t index = segment_hint + 1u;
-    index < path_segments_.size() &&
-    minimum_squared_distance > sufficient_squared_distance; ++index)
-  {
-    consider_segment(index);
-  }
-  for (std::size_t index = 0u; index < segment_hint &&
-    minimum_squared_distance > sufficient_squared_distance; ++index)
-  {
-    consider_segment(index);
-  }
+  const auto search_range = [&](std::size_t first, std::size_t last) {
+      while (first < last && minimum_squared_distance > sufficient_squared_distance) {
+        const auto & block = path_segment_bounds_[first / kPathSegmentBlockSize];
+        const std::size_t end = std::min(last, block.end);
+        if (block.squaredDistance(pose.x, pose.y) >= minimum_squared_distance) {
+          first = end;
+          continue;
+        }
+        for (; first < end && minimum_squared_distance > sufficient_squared_distance; ++first) {
+          consider_segment(first);
+        }
+      }
+    };
+  search_range(segment_hint + 1u, path_segments_.size());
+  search_range(0u, segment_hint);
   segment_hint = nearest_segment;
   return std::sqrt(minimum_squared_distance);
 }
@@ -197,17 +248,20 @@ double PathDeviationCritic::scoreTrajectory(
   std::size_t segment_hint = 0u;
   bool outside_corridor = false;
   double excess_distance_sum = 0.0;
+  double path_distance_sum = 0.0;
   for (const auto & pose : trajectory.poses) {
     // Any segment inside the corridor proves zero excess; only an outside
     // pose needs the exact nearest distance and the complete search.
     const double distance = distanceToPath(
-      pose, segment_hint, maximum_path_distance_);
+      pose, segment_hint,
+      path_distance_scale_ > 0.0 ? path_distance_tolerance_ : maximum_path_distance_);
     if (!std::isfinite(distance)) {
       return deviation_penalty_;
     }
     const double excess = std::max(0.0, distance - maximum_path_distance_);
     outside_corridor = outside_corridor || excess > 0.0;
     excess_distance_sum += excess;
+    path_distance_sum += std::max(0.0, distance - path_distance_tolerance_);
   }
 
   double heading_recovery_cost = 0.0;
@@ -251,7 +305,8 @@ double PathDeviationCritic::scoreTrajectory(
     boundary_cost = deviation_penalty_ +
       excess_distance_scale_ * mean_excess_distance;
   }
-  return boundary_cost + heading_recovery_cost;
+  return boundary_cost + heading_recovery_cost + path_distance_scale_ *
+         path_distance_sum / static_cast<double>(trajectory.poses.size());
 }
 
 }  // namespace f_dwa_controller

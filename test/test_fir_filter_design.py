@@ -160,6 +160,25 @@ def test_numeric_cutoff_matches_legacy_f8_coefficients():
     )
 
 
+@pytest.mark.parametrize('cutoff', [0.33, 0.66, 1.0, 1.5, 2.0, 2.5, 3.0])
+def test_double_effective_taps_are_regenerated_with_unit_dc_gain(cutoff):
+    parameters = _load_f_dwa_parameters()
+    active = parameters['controller_server']['ros__parameters']['FollowPath']
+    active.update(fir_cutoff_frequency_hz=cutoff, fir_effective_taps=92)
+    report = inject_fir_coefficients(parameters)
+    assert report.requested_taps == 183
+    assert report.effective_taps == active['fir_effective_taps'] == 92
+    assert len(active['fir_coefficients']) == 92
+    assert sum(active['fir_coefficients']) == pytest.approx(1.0, abs=1e-12)
+    assert report.fingerprint != coefficient_fingerprint(design_fir_coefficients_for_cutoff(cutoff))
+
+
+@pytest.mark.parametrize('taps', [0, 1, -46, 46.5, '92', True])
+def test_invalid_effective_tap_count_is_rejected(taps):
+    with pytest.raises(ValueError, match='fir_effective_taps'):
+        design_fir_coefficients_for_cutoff(1.0, taps)
+
+
 def test_direct_yaml_coefficients_are_rejected():
     parameters = _load_f_dwa_parameters()
     invalid_parameters = deepcopy(parameters)

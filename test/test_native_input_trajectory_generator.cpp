@@ -41,6 +41,7 @@
 #include "dwb_core/trajectory_critic.hpp"
 #include "dwb_core/trajectory_generator.hpp"
 #include "f_dwa_controller/certified_dwb_local_planner.hpp"
+#include "f_dwa_controller/mean_speed_critic.hpp"
 #include "f_dwa_controller/native_input_trajectory_generator.hpp"
 #include "f_dwa_controller/v_dwb_trajectory_generators.hpp"
 #include "nav2_util/lifecycle_node.hpp"
@@ -928,6 +929,31 @@ protected:
   }
 };
 
+TEST_F(NativeInputTrajectoryGeneratorTest, MeanSpeedTargetRefreshesAtStoppedTrialReset)
+{
+  const auto node = make_node("mean_speed_target_reset_test");
+  MeanSpeedCritic critic;
+  critic.initialize(node, "MeanSpeed", kPluginName, nullptr);
+  geometry_msgs::msg::Pose2D pose;
+  nav_2d_msgs::msg::Twist2D velocity;
+  nav_2d_msgs::msg::Path2D path;
+  ASSERT_TRUE(critic.prepare(pose, velocity, pose, path));
+  dwb_msgs::msg::Trajectory2D trajectory;
+  trajectory.poses.resize(2u);
+  trajectory.poses.back().x = 0.4;
+  trajectory.time_offsets.emplace_back();
+  trajectory.time_offsets.back().sec = 1;
+  EXPECT_NEAR(critic.scoreTrajectory(trajectory), 0.8, 1.0e-12);
+  for (const double target : {0.5, 1.5}) {
+    const double previous_cost = critic.scoreTrajectory(trajectory);
+    ASSERT_TRUE(node->set_parameter(rclcpp::Parameter(
+        "FollowPath.MeanSpeed.target_speed", target)).successful);
+    EXPECT_DOUBLE_EQ(critic.scoreTrajectory(trajectory), previous_cost);
+    critic.reset();
+    EXPECT_NEAR(critic.scoreTrajectory(trajectory), target - 0.4, 1.0e-12);
+  }
+}
+
 TEST_F(NativeInputTrajectoryGeneratorTest, AccelerationGeneratorRollsOut165Candidates)
 {
   const auto node = make_node("acceleration_generator_test");
@@ -946,6 +972,18 @@ TEST_F(NativeInputTrajectoryGeneratorTest, JerkGeneratorRollsOut165Candidates)
   generator.initialize(node, kPluginName);
 
   expect_finite_trajectory(generator);
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, ExplicitFirTapCountMatchesExecutedCoefficients)
+{
+  auto node = make_node("explicit_fir_taps");
+  node->declare_parameter("FollowPath.fir_effective_taps", 3);
+  FirTrajectoryGenerator generator;
+  EXPECT_NO_THROW(generator.initialize(node, kPluginName));
+  node->set_parameter(rclcpp::Parameter("FollowPath.fir_effective_taps", 92));
+  EXPECT_THROW(generator.reset_trial_state(), std::invalid_argument);
+  node->set_parameter(rclcpp::Parameter("FollowPath.fir_effective_taps", 3));
+  EXPECT_NO_THROW(generator.reset_trial_state());
 }
 
 TEST_F(
@@ -3311,6 +3349,55 @@ TEST_F(NativeInputTrajectoryGeneratorTest, TrialResetReloadsSamplingAndRejectsIn
   EXPECT_EQ(generator.candidate_count(), 494u);
 }
 
+TEST_F(NativeInputTrajectoryGeneratorTest, TrialResetReloadsPredictionInputMode)
+{
+  const auto node = make_node(
+    "runtime_prediction_input_test", true, false, false, 0.0,
+    0.8, 0.8, 0.05);
+  JerkTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+
+  generator.startNewIteration(nav_2d_msgs::msg::Twist2D());
+  ASSERT_TRUE(generator.hasMoreTwists());
+  static_cast<void>(generator.nextTwist());
+  ASSERT_TRUE(generator.active_candidate_diagnostics().has_value());
+  EXPECT_FALSE(generator.active_candidate_diagnostics()->uses_recovery);
+
+  ASSERT_TRUE(node->set_parameter(
+      rclcpp::Parameter("FollowPath.native_input_recovery", true)).successful);
+  generator.reset_trial_state();
+  generator.startNewIteration(nav_2d_msgs::msg::Twist2D());
+  ASSERT_TRUE(generator.hasMoreTwists());
+  static_cast<void>(generator.nextTwist());
+  ASSERT_TRUE(generator.active_candidate_diagnostics().has_value());
+  EXPECT_TRUE(generator.active_candidate_diagnostics()->uses_recovery);
+
+  ASSERT_TRUE(node->set_parameters_atomically({
+      rclcpp::Parameter("FollowPath.native_input_recovery", false),
+      rclcpp::Parameter("FollowPath.native_input_pulse_duration", 0.2),
+    }).successful);
+  generator.reset_trial_state();
+  generator.startNewIteration(nav_2d_msgs::msg::Twist2D());
+  ASSERT_TRUE(generator.hasMoreTwists());
+  static_cast<void>(generator.nextTwist());
+  ASSERT_TRUE(generator.active_candidate_diagnostics().has_value());
+  EXPECT_FALSE(generator.active_candidate_diagnostics()->uses_recovery);
+  EXPECT_DOUBLE_EQ(
+    generator.active_candidate_diagnostics()->linear_prediction_input_duration,
+    0.2);
+
+  ASSERT_TRUE(node->set_parameter(rclcpp::Parameter(
+      "FollowPath.native_input_pulse_duration", -0.1)).successful);
+  EXPECT_THROW(generator.reset_trial_state(), std::invalid_argument);
+  generator.startNewIteration(nav_2d_msgs::msg::Twist2D());
+  ASSERT_TRUE(generator.hasMoreTwists());
+  static_cast<void>(generator.nextTwist());
+  ASSERT_TRUE(generator.active_candidate_diagnostics().has_value());
+  EXPECT_DOUBLE_EQ(
+    generator.active_candidate_diagnostics()->linear_prediction_input_duration,
+    0.2);
+}
+
 TEST_F(NativeInputTrajectoryGeneratorTest, ExpandedFirBankMatchesScalarRolloutsWhileMoving)
 {
   const auto bank_node = make_node("expanded_fir_bank", true, false, false, 0.10,
@@ -4782,6 +4869,875 @@ TEST_F(
   EXPECT_NE(status->text.find("maximum effort"), std::string::npos);
   EXPECT_GT(status->color.r, status->color.g);
   EXPECT_GT(status->color.g, status->color.b);
+}
+
+}  // namespace f_dwa_controller
+
+namespace f_dwa_controller
+{
+TEST_F(NativeInputTrajectoryGeneratorTest, VelocityGoalStopRequiresSafeObservedAndPredictedCapture)
+{
+  struct Case {
+    double x; double v; double w; bool blocked; bool expected_stop;
+    double command_v{std::numeric_limits<double>::quiet_NaN()};
+    double command_w{std::numeric_limits<double>::quiet_NaN()};
+  };
+  for (const auto & example : std::vector<Case>{
+      {0.12, 0.074, 0.4, false, true}, {0.35, 0.074, 0.4, false, false},
+      {0.27, 0.5, 0.0, false, false}, {0.12, 0.074, 0.4, true, false},
+      {0.12, 0.0, 0.0, false, true},
+      {0.12, 0.04, 0.03, false, true, 0.20, 0.30},
+      {0.12, 0.30, 0.40, false, true, 0.08, -0.12}})
+  {
+    SCOPED_TRACE(example.x);
+    SCOPED_TRACE(example.blocked);
+    const auto node = make_node("goal_velocity_stop_regression");
+    node->declare_parameter("publish_zero_velocity", true);
+    node->declare_parameter("FollowPath.trajectory_generator_name",
+      "dwb_plugins::StandardTrajectoryGenerator");
+    node->declare_parameter("FollowPath.critics", std::vector<std::string>{"GoalDist"});
+    node->declare_parameter("FollowPath.terminal_stop_goal_capture_distance", 0.3);
+    node->declare_parameter("FollowPath.terminal_stop_goal_capture_yaw_tolerance", M_PI);
+    rclcpp::NodeOptions options;
+    options.use_global_arguments(false).parameter_overrides({
+        {"global_frame", "odom"}, {"plugins", std::vector<std::string>{}},
+        {"filters", std::vector<std::string>{}}, {"track_unknown_space", false}});
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(options);
+    ASSERT_EQ(costmap->on_configure(rclcpp_lifecycle::State()), nav2_util::CallbackReturn::SUCCESS);
+    costmap->getLayeredCostmap()->resizeMap(200u, 200u, 0.05, -5.0, -5.0);
+    if (example.blocked) {
+      unsigned int mx = 0u, my = 0u;
+      ASSERT_TRUE(costmap->getCostmap()->worldToMap(example.x, 0., mx, my));
+      costmap->getCostmap()->setCost(mx, my, nav2_costmap_2d::LETHAL_OBSTACLE);
+    }
+    auto tf = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.frame_id = "map";
+    transform.child_frame_id = "odom";
+    transform.transform.rotation.w = 1.0;
+    ASSERT_TRUE(tf->setTransform(transform, "goal_velocity_stop_regression", true));
+    ScorePlannerAdapter planner;
+    planner.configure(node, kPluginName, tf, costmap);
+    auto generator = std::make_shared<VLimitedAccelTrajectoryGenerator>();
+    generator->initialize(node, kPluginName);
+    planner.set_test_components(generator, {});
+    nav_msgs::msg::Path path;
+    path.header.frame_id = "map";
+    geometry_msgs::msg::PoseStamped goal;
+    goal.pose.orientation.w = 1.0;
+    path.poses.push_back(goal);
+    planner.setPlan(path);
+    nav_2d_msgs::msg::Twist2D velocity;
+    velocity.x = example.v;
+    velocity.theta = example.w;
+    auto command = velocity;
+    if (std::isfinite(example.command_v)) {
+      command.x = example.command_v;
+      command.theta = example.command_w;
+      auto snapshot = make_observable_zero_snapshot(node->now());
+      snapshot.activation_state.velocity = velocity;
+      snapshot.activation_state.native_command_velocity = command;
+      snapshot.activation_state.native_command_velocity_valid = true;
+      generator->set_planning_snapshot(std::make_shared<const PlanningSnapshot>(snapshot));
+    }
+    geometry_msgs::msg::Pose2D pose;
+    pose.x = example.x;
+    auto results = std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+    dwb_msgs::msg::TrajectoryScore selected;
+    try {
+      selected = planner.run_terminal_core(pose, velocity, results);
+    } catch (const dwb_core::NoLegalTrajectoriesException &) {
+      EXPECT_FALSE(example.expected_stop);
+      planner.cleanup();
+      costmap->on_cleanup(rclcpp_lifecycle::State());
+      continue;
+    }
+    const bool selected_goal_stop = std::any_of(selected.scores.begin(), selected.scores.end(),
+      [](const auto & score) {return score.name == "TerminalGoalVelocityStop";});
+    EXPECT_EQ(selected_goal_stop, example.expected_stop);
+    if (example.expected_stop) {
+      EXPECT_LE(std::abs(selected.traj.velocity.x), std::abs(command.x));
+      EXPECT_LE(std::abs(selected.traj.velocity.theta), std::abs(command.theta));
+      EXPECT_LE(std::abs(selected.traj.velocity.x-command.x), 1.2*0.03+1e-9);
+      EXPECT_LE(std::abs(selected.traj.velocity.theta-command.theta), 1.57*0.03+1e-9);
+      if (command.x > 0.) {
+        EXPECT_LT(selected.traj.velocity.x, command.x);
+      }
+      ASSERT_FALSE(selected.traj.poses.empty());
+      const auto & terminal = selected.traj.poses.back();
+      EXPECT_LE(std::hypot(terminal.x, terminal.y), 0.3);
+    }
+    planner.cleanup();
+    costmap->on_cleanup(rclcpp_lifecycle::State());
+  }
+}
+}  // namespace f_dwa_controller
+
+
+namespace f_dwa_controller
+{
+TEST_F(NativeInputTrajectoryGeneratorTest, MovingGoalStopRequiresObservedAndPredictedCapture)
+{
+  struct Case {double x; double v; double w; bool expected_stop;};
+  for (const auto & example : std::vector<Case>{
+      {0.12, 0.074, 0.632, true}, {0.35, 0.074, 0.632, false},
+      {0.27, 0.5, 0.0, false}})
+  {
+    SCOPED_TRACE(example.x);
+    const auto node = make_node("goal_native_stop_regression");
+    node->declare_parameter("publish_zero_velocity", true);
+    node->declare_parameter("FollowPath.trajectory_generator_name",
+      "dwb_plugins::StandardTrajectoryGenerator");
+    node->declare_parameter("FollowPath.critics", std::vector<std::string>{"GoalDist"});
+    node->declare_parameter("FollowPath.terminal_stop_goal_capture_distance", 0.3);
+    node->declare_parameter("FollowPath.terminal_stop_goal_capture_yaw_tolerance", M_PI);
+    rclcpp::NodeOptions options;
+    options.use_global_arguments(false).parameter_overrides({
+        {"global_frame", "odom"}, {"plugins", std::vector<std::string>{}},
+        {"filters", std::vector<std::string>{}}, {"track_unknown_space", false}});
+    auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(options);
+    ASSERT_EQ(costmap->on_configure(rclcpp_lifecycle::State()), nav2_util::CallbackReturn::SUCCESS);
+    costmap->getLayeredCostmap()->resizeMap(200u, 200u, 0.05, -5.0, -5.0);
+    auto tf = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.frame_id = "map";
+    transform.child_frame_id = "odom";
+    transform.transform.rotation.w = 1.0;
+    ASSERT_TRUE(tf->setTransform(transform, "goal_stop_regression", true));
+    ScorePlannerAdapter planner;
+    planner.configure(node, kPluginName, tf, costmap);
+    auto generator = std::make_shared<AccelerationTrajectoryGenerator>();
+    generator->initialize(node, kPluginName);
+    planner.set_test_components(generator, {});
+    nav_msgs::msg::Path path;
+    path.header.frame_id = "map";
+    geometry_msgs::msg::PoseStamped goal;
+    goal.pose.orientation.w = 1.0;
+    path.poses.push_back(goal);
+    planner.setPlan(path);
+    auto snapshot = make_observable_zero_snapshot(node->now());
+    snapshot.current_state.velocity.x = example.v;
+    snapshot.current_state.velocity.theta = example.w;
+    snapshot.activation_state = snapshot.current_state;
+    generator->set_planning_snapshot(std::make_shared<const PlanningSnapshot>(snapshot));
+    geometry_msgs::msg::Pose2D pose;
+    pose.x = example.x;
+    auto results = std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+    dwb_msgs::msg::TrajectoryScore selected;
+    try {
+      selected = planner.run_terminal_core(pose, snapshot.current_state.velocity, results);
+    } catch (const dwb_core::NoLegalTrajectoriesException &) {
+      EXPECT_FALSE(example.expected_stop);
+      planner.cleanup();
+      costmap->on_cleanup(rclcpp_lifecycle::State());
+      continue;
+    }
+    const bool selected_goal_stop = std::any_of(selected.scores.begin(), selected.scores.end(),
+      [](const auto & score) {return score.name == "TerminalGoalNativeDirectStop";});
+    EXPECT_EQ(selected_goal_stop, example.expected_stop);
+    if (example.expected_stop) {
+      EXPECT_LT(std::abs(selected.traj.velocity.x), example.v);
+      EXPECT_LT(std::abs(selected.traj.velocity.theta), example.w);
+      ASSERT_FALSE(selected.traj.poses.empty());
+      const auto & terminal = selected.traj.poses.back();
+      EXPECT_LE(std::hypot(terminal.x, terminal.y), 0.3);
+    }
+    planner.cleanup();
+    costmap->on_cleanup(rclcpp_lifecycle::State());
+  }
+}
+}  // namespace f_dwa_controller
+
+// Included after the normal native-generator tests in the private F7 build.
+#include "f_dwa_controller/recovery_input_dynamics.hpp"
+#include "f_dwa_controller/saturation_input_dynamics.hpp"
+
+namespace f_dwa_controller
+{
+
+const std::vector<double> & saturation_test_coefficients()
+{
+  static const std::vector<double> coefficients{0.03350785471347518, 0.03880895409775884, 0.050673824029058304, 0.06384786914847601, 0.07690688669506258, 0.08879254829473235, 0.09838470216854145, 0.10476117964444213, 0.10718835907294214, 0.10526061702166864, 0.0988754486043874, 0.08836452826447266, 0.0743921284996216, 0.057916281901727665, 0.040067975848862604, 0.022120653081306618, 0.005308757788266448, -0.00927664974561404, -0.020804194540549305, -0.02872030625781599, -0.03282552684232682, -0.03325297309064127, -0.030450040432456568, -0.025097748543612516, -0.018060132851524392, -0.010256142160916025, -0.0025694893836071156, 0.004238749681463807, 0.009567441213462018, 0.013048185465411855, 0.014559908920583887, 0.014219717639262417, 0.01232848704832304, 0.00933407371742618, 0.005754862291016337, 0.0021132149070524696, -0.0011325292557404195, -0.00362954735748322, -0.005180194851508673, -0.005747253546242862, -0.005430583942718357, -0.004427296616422495, -0.003006002105302255, -0.001459087670380678, -4.8955061136223235e-05, 0.0010314444971943957};
+  return coefficients;
+}
+
+TEST(InputRecovery, JerkUsesNewAccelerationAndCompletesWithinHorizon)
+{
+  const AxisLimits limits{0., 1., -1., 1., -.5, .5};
+  const auto result = minimum_jerk_recovery({0., 0.}, limits, .5, .05, 50);
+  ASSERT_TRUE(result.valid);
+  EXPECT_NEAR(result.states.front().acceleration, .025, 1e-12);
+  EXPECT_EQ(result.recovery_steps, 49);
+  EXPECT_NEAR(result.recovery_input, -.025 / (49 * .05), 1e-12);
+  EXPECT_NEAR(result.states.back().velocity, .03125, 1e-12);
+  EXPECT_NEAR(result.states.back().acceleration, 0., 1e-12);
+  AxisState previous{0., 0.};
+  for (const auto & state : result.states) {
+    EXPECT_TRUE(recovery_state_valid(state, limits));
+    EXPECT_LE(std::abs((state.acceleration - previous.acceleration) / .05), .5 + 1e-12);
+    EXPECT_NEAR(state.velocity - previous.velocity, state.acceleration * .05, 1e-12);
+    previous = state;
+  }
+}
+
+TEST(InputRecovery, JerkRejectsClippedFirstInputAndImpossibleConstantRecovery)
+{
+  const AxisLimits limits{0., 1., -1., 1., -1., 1.};
+  EXPECT_FALSE(minimum_jerk_recovery({0., 0.}, limits, 2., .05, 50).valid);
+  // q=0 first yields v=.9985,a=.075; no constant integer recovery is feasible.
+  EXPECT_FALSE(minimum_jerk_recovery({.99475, .075}, limits, 0., .05, 50).valid);
+  EXPECT_FALSE(minimum_jerk_recovery({0., 0.}, limits, .5, .05, 1).valid);
+}
+
+TEST(InputRecovery, JerkHandlesNegativeAccelerationAndZeroWithoutDivision)
+{
+  const AxisLimits limits{-1., 1., -1., 1., -.5, .5};
+  const auto positive = minimum_jerk_recovery({.2, .1}, limits, .3, .05, 50);
+  const auto negative = minimum_jerk_recovery({-.2, -.1}, limits, -.3, .05, 50);
+  ASSERT_TRUE(positive.valid); ASSERT_TRUE(negative.valid);
+  EXPECT_NEAR(positive.recovery_input, -negative.recovery_input, 1e-12);
+  EXPECT_TRUE(minimum_jerk_recovery({1., 0.}, limits, 0., .05, 50).valid);
+}
+
+TEST(InputRecovery, FirMinimumMatchesDirectNativeConvolutionAndPreservesInput)
+{
+  const AxisLimits limits{0., 1., -1., 1., -1.2, 1.2};
+  const std::vector<double> coefficients(10, .1), initial_memory(9, 0.);
+  const AxisState initial{.95, 0.};
+  const auto response = prepare_recovery_fir_response(
+    initial, coefficients, initial_memory, .05, 50, 2, 4);
+  const auto result = minimum_fir_recovery(response, limits, 1.2);
+  ASSERT_TRUE(result.valid);
+  EXPECT_LT(result.recovery_input, 0.);
+  EXPECT_GT(result.recovery_input, -1.2);
+  auto memory = initial_memory;
+  double v = initial.velocity;
+  for (std::size_t k = 0; k < response.free_states.size(); ++k) {
+    double input = k < 2 ? 1.2 : (k < 6 ? result.recovery_input : 0.);
+    const double a = fir_acceleration(coefficients, memory, input);
+    v += .05 * a;
+    EXPECT_TRUE(recovery_state_valid({v, a}, limits));
+    if (k < result.states.size()) {
+      EXPECT_NEAR(result.states[k].velocity, v, 1e-12);
+      EXPECT_NEAR(result.states[k].acceleration, a, 1e-12);
+    }
+    push_fir_input(memory, input);
+  }
+  // Moving the optimum even slightly toward zero must violate a bound.
+  bool violation = false;
+  for (std::size_t k = 0; k < response.free_states.size(); ++k) {
+    const auto & f = response.free_states[k]; const auto & q = response.candidate_states[k];
+    const auto & r = response.recovery_states[k];
+    violation |= !recovery_state_valid({f.velocity + 1.2*q.velocity +
+      (result.recovery_input + 1e-5)*r.velocity, f.acceleration + 1.2*q.acceleration +
+      (result.recovery_input + 1e-5)*r.acceleration}, limits);
+  }
+  EXPECT_TRUE(violation);
+}
+
+TEST(InputRecovery, FirChecksTailBeyondNominalHorizonAndZeroNegativeGains)
+{
+  double lower = -1., upper = 1.;
+  EXPECT_FALSE(intersect_recovery_bound(2., 0., 0., 1., lower, upper));
+  EXPECT_TRUE(intersect_recovery_bound(.5, -1., 0., 1., lower, upper));
+  EXPECT_DOUBLE_EQ(lower, -.5); EXPECT_DOUBLE_EQ(upper, .5);
+  // The response includes all taps after the last recovery input.
+  const auto response = prepare_recovery_fir_response({.97, 0.}, {.1, .1, .8},
+    {0., 0.}, .05, 2, 1, 1);
+  ASSERT_TRUE(response.valid);
+  EXPECT_EQ(response.free_states.size(), 4u);
+  const AxisLimits limits{0., 1., -1., 1., 0., 1.};
+  EXPECT_FALSE(minimum_fir_recovery(response, limits, 1.).valid);
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, AllSixInputConditionsHaveExactly150Candidates)
+{
+  for (bool fir : {false, true}) {
+    for (int mode = 0; mode < 3; ++mode) {
+      auto node = make_node("fixed_150_" + std::to_string(fir) + "_" + std::to_string(mode),
+        true, false, false, mode == 2 ? .2 : 0., 1., 1., .05);
+      node->declare_parameter("FollowPath.vx_samples", 10);
+      node->set_parameter(rclcpp::Parameter("FollowPath.vx_samples", 10));
+      node->declare_parameter("FollowPath.vtheta_samples", 15);
+      node->set_parameter(rclcpp::Parameter("FollowPath.vtheta_samples", 15));
+      node->declare_parameter("FollowPath.native_input_recovery", mode == 1);
+      node->declare_parameter("FollowPath.native_input_pulse_duration", !fir && mode == 2 ? .2 : 0.);
+      NativeInputTrajectoryGenerator generator(fir ? NativeInputOrder::kFir : NativeInputOrder::kJerk);
+      generator.initialize(node, kPluginName);
+      for (double initial_velocity : {0., .4, .95}) {
+        auto snapshot = make_observable_zero_snapshot(node->now());
+        snapshot.activation_state.velocity.x = initial_velocity;
+        snapshot.activation_state.native_command_velocity.x = initial_velocity;
+        snapshot.activation_state.linear_fir_history.assign(2, 0.);
+        snapshot.activation_state.angular_fir_history.assign(2, 0.);
+        generator.set_planning_snapshot(std::make_shared<const PlanningSnapshot>(snapshot));
+        generator.startNewIteration({});
+        ASSERT_EQ(generator.candidate_count(), 150u) << fir << "/" << mode << "/" << initial_velocity;
+        std::set<double> linear, angular;
+        while (generator.hasMoreTwists()) {
+          generator.nextTwist();
+          const auto d = generator.active_candidate_diagnostics();
+          ASSERT_TRUE(d.has_value());
+          EXPECT_EQ(d->uses_recovery, mode == 1);
+          if (mode == 1) {
+            EXPECT_GE(d->linear_prediction_input_duration, .05 - 1e-12);
+            EXPECT_LE(d->linear_prediction_input_duration, 2.4 + 1e-12);
+            if (fir) {EXPECT_DOUBLE_EQ(d->linear_recovery_input, 0.);}
+          } else {
+            EXPECT_NEAR(d->linear_prediction_input_duration, mode == 0 ? 2.4 : .2, 1e-12);
+          }
+          linear.insert(d->linear_native_input); angular.insert(d->angular_native_input);
+        }
+        EXPECT_EQ(linear.size(), 10u); EXPECT_EQ(angular.size(), 15u);
+      }
+    }
+  }
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, FirFixedPulseConstrainsResidualTailWithoutExtendingTrajectory)
+{
+  const auto & coefficients = saturation_test_coefficients();
+  auto node = make_node("fir_fixed_pulse_residual_tail", true, false, false, .2, 1., 1., .05);
+  node->declare_parameter("FollowPath.sim_time", .2);
+  node->declare_parameter("FollowPath.time_granularity", .05);
+  node->declare_parameter("FollowPath.acc_lim_x", .3);
+  node->declare_parameter("FollowPath.decel_lim_x", -.3);
+  node->declare_parameter("FollowPath.vx_samples", 10);
+  node->declare_parameter("FollowPath.vtheta_samples", 15);
+  node->declare_parameter("FollowPath.fir_coefficients", coefficients);
+  ASSERT_TRUE(node->set_parameters_atomically({
+      rclcpp::Parameter("FollowPath.sim_time", .2),
+      rclcpp::Parameter("FollowPath.time_granularity", .05),
+      rclcpp::Parameter("FollowPath.acc_lim_x", .3),
+      rclcpp::Parameter("FollowPath.decel_lim_x", -.3),
+      rclcpp::Parameter("FollowPath.vx_samples", 10),
+      rclcpp::Parameter("FollowPath.vtheta_samples", 15),
+      rclcpp::Parameter("FollowPath.fir_coefficients", coefficients)}).successful);
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+
+  auto snapshot = make_observable_zero_snapshot(node->now());
+  snapshot.activation_state.linear_fir_history.assign(coefficients.size() - 1u, 0.);
+  snapshot.activation_state.angular_fir_history.assign(coefficients.size() - 1u, 0.);
+  generator.set_planning_snapshot(std::make_shared<const PlanningSnapshot>(snapshot));
+  generator.startNewIteration(snapshot.activation_state.velocity);
+
+  ASSERT_EQ(generator.candidate_count(), 150u);
+  std::set<double> linear_inputs;
+  while (generator.hasMoreTwists()) {
+    static_cast<void>(generator.nextTwist());
+    const auto diagnostics = generator.active_candidate_diagnostics();
+    ASSERT_TRUE(diagnostics.has_value());
+    EXPECT_NEAR(diagnostics->linear_prediction_input_duration, .2, 1.0e-12);
+    linear_inputs.insert(diagnostics->linear_native_input);
+  }
+  ASSERT_EQ(linear_inputs.size(), 10u);
+  EXPECT_GT(*linear_inputs.rbegin(), .70);
+  EXPECT_LT(*linear_inputs.rbegin(), .73);
+
+  const AxisLimits limits{0., 1., -.3, .3, -1.2, 1.2};
+  for (const double input : linear_inputs) {
+    auto history = std::vector<double>(coefficients.size() - 1u, 0.);
+    double velocity = 0.;
+    for (int step = 0; step < 4 + static_cast<int>(coefficients.size()) - 1; ++step) {
+      const double acceleration = fir_acceleration(
+        coefficients, history, step < 4 ? input : 0.);
+      velocity += .05 * acceleration;
+      EXPECT_TRUE(recovery_state_valid({velocity, acceleration}, limits));
+      push_fir_input(history, step < 4 ? input : 0.);
+    }
+  }
+}
+
+TEST(InputRecovery, JerkRecoveryIntervalMatchesIndependentIntegerDurationSearch)
+{
+  const AxisLimits limits{0., 1., -1., 1., -.5, .5};
+  for (const AxisState initial : std::vector<AxisState>{{0., 0.}, {.4, .2}, {.99475, .075}, {.01, -.1}}) {
+    const auto interval = jerk_recovery_input_interval(initial, limits, .05, 50);
+    for (int i = 0; i <= 1000; ++i) {
+      const double q = -.5 + i * .001;
+      bool feasible = false;
+      for (int m = 1; m < 50 && !feasible; ++m) {
+        AxisState state{initial.velocity, initial.acceleration};
+        state.acceleration += q * .05; state.velocity += state.acceleration * .05;
+        if (!recovery_state_valid(state, limits)) {continue;}
+        const double r = -state.acceleration / (m * .05);
+        if (r < -.5 - 1e-12 || r > .5 + 1e-12) {continue;}
+        bool valid = true;
+        for (int k = 1; k < 50; ++k) {
+          state.acceleration += (k <= m ? r : 0.) * .05;
+          state.velocity += state.acceleration * .05;
+          valid &= recovery_state_valid(state, limits);
+        }
+        feasible = valid;
+      }
+      const bool projected = interval.feasible && q >= interval.lower - 1e-10 && q <= interval.upper + 1e-10;
+      EXPECT_EQ(projected, feasible) << initial.velocity << "/" << initial.acceleration << "/" << q;
+      if (projected) {EXPECT_TRUE(minimum_jerk_recovery(initial, limits, q, .05, 50).valid);}
+    }
+  }
+}
+
+TEST(InputRecovery, FirProjectedIntervalSamplesRemainFeasibleIncludingEndpoints)
+{
+  const AxisLimits limits{0., 1., -1., 1., -1.2, 1.2};
+  for (double velocity : {0., .4, .95, 1.}) {
+    const auto response = prepare_recovery_fir_response({velocity, 0.},
+      {.5, .3, .2}, {0., 0.}, .05, 50, 1, 4);
+    const auto interval = fir_recovery_input_interval(response, limits);
+    ASSERT_TRUE(interval.feasible);
+    for (double q : uniform_samples(interval, 15)) {
+      const auto recovered = minimum_fir_recovery(response, limits, q);
+      ASSERT_TRUE(recovered.valid) << velocity << "/" << q;
+      auto history = std::vector<double>{0., 0.};
+      double v = velocity;
+      for (int k = 0; k < 50; ++k) {
+        const double input = k == 0 ? q : (k < 5 ? recovered.recovery_input : 0.);
+        const double a = fir_acceleration({.5, .3, .2}, history, input);
+        v += a * .05;
+        EXPECT_TRUE(recovery_state_valid({v, a}, limits));
+        EXPECT_NEAR(recovered.states[k].velocity, v, 1e-12);
+        push_fir_input(history, input);
+      }
+    }
+  }
+}
+
+TEST(InputRecovery, RecordedOneHertzFirRecoveryKeepsFullHistoryAndTailWithinBounds)
+{
+  // 20 Hz / 1 Hz production design, including its negative coefficient lobes.
+  const auto & coefficients = saturation_test_coefficients();
+  const AxisLimits limits{0., 1., -1., 1., -1.2, 1.2};
+  for (double velocity : {.3, .7}) {
+    for (double prior_input : {-.12, 0., .12}) {
+      const std::vector<double> memory(coefficients.size() - 1, prior_input);
+      const auto response = prepare_recovery_fir_response({velocity, prior_input},
+        coefficients, memory, .05, 50, 1, 4);
+      const auto interval = fir_recovery_input_interval(response, limits);
+      ASSERT_TRUE(interval.feasible);
+      for (double q : uniform_samples(interval, 15)) {
+        const auto recovered = minimum_fir_recovery(response, limits, q);
+        ASSERT_TRUE(recovered.valid) << velocity << "/" << prior_input << "/" << q;
+        auto history = memory;
+        double v = velocity;
+        for (std::size_t k = 0; k < response.free_states.size(); ++k) {
+          const double raw = k == 0 ? q : (k < 5 ? recovered.recovery_input : 0.);
+          const double a = fir_acceleration(coefficients, history, raw);
+          v += a * .05;
+          EXPECT_TRUE(recovery_state_valid({v, a}, limits));
+          if (k < recovered.states.size()) {
+            EXPECT_NEAR(recovered.states[k].velocity, v, 1e-12);
+            EXPECT_NEAR(recovered.states[k].acceleration, a, 1e-12);
+          }
+          push_fir_input(history, raw);
+        }
+      }
+    }
+  }
+}
+
+TEST(InputRecovery, JerkPulseEndsAtFourCyclesWithoutResettingAcceleration)
+{
+  const AxisLimits limits{0., 1., -1., 1., -.5, .5};
+  const AxisState initial{.4, .05};
+  const auto interval = pulsed_jerk_input_interval(initial, limits, .05, 50, 4);
+  ASSERT_TRUE(interval.feasible);
+  for (double q : uniform_samples(interval, 10)) {
+    AxisState state = initial;
+    for (int k = 0; k < 50; ++k) {
+      state.acceleration += (k < 4 ? q : 0.) * .05;
+      state.velocity += state.acceleration * .05;
+      EXPECT_TRUE(recovery_state_valid(state, limits));
+      if (k >= 3) {EXPECT_NEAR(state.acceleration, initial.acceleration + .2 * q, 1e-12);}
+    }
+  }
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, InputRecoveryFirCommitsOnlyExecutedInputToHistory)
+{
+  auto node = make_node("recovery_fir_memory", true, false, false, .06, 1.0);
+  node->declare_parameter("FollowPath.native_input_recovery", true);
+  node->declare_parameter("FollowPath.fir_coefficients", std::vector<double>{});
+  node->set_parameter(rclcpp::Parameter("FollowPath.fir_coefficients", std::vector<double>(10, .1)));
+  FirTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  auto snapshot = make_observable_zero_snapshot(node->now());
+  snapshot.activation_state.velocity.x = .95;
+  snapshot.activation_state.native_command_velocity.x = .95;
+  snapshot.activation_state.linear_fir_history.assign(9, 0.);
+  snapshot.activation_state.angular_fir_history.assign(9, 0.);
+  generator.set_planning_snapshot(std::make_shared<const PlanningSnapshot>(snapshot));
+  generator.startNewIteration({});
+  ASSERT_GT(generator.candidate_count(), 0u);
+  geometry_msgs::msg::Pose2D pose;
+  bool recovered = false;
+  for (std::size_t k = 0; k < generator.candidate_count(); ++k) {
+    generator.nextTwist();
+    dwb_msgs::msg::Trajectory2D trajectory;
+    NativeInputTrajectoryGenerator::NativeCommandState state;
+    ASSERT_TRUE(generator.materialize_candidate(k, pose, trajectory, state));
+    const auto diagnostics = generator.active_candidate_diagnostics();
+    ASSERT_TRUE(diagnostics.has_value());
+    recovered |= diagnostics->uses_recovery;
+    ASSERT_EQ(state.linear_fir_history.size(), 9u);
+    EXPECT_DOUBLE_EQ(state.linear_fir_history[0], diagnostics->linear_native_input);
+    EXPECT_DOUBLE_EQ(state.linear_fir_history[1], 0.);
+  }
+  EXPECT_TRUE(recovered);
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, InputRecoveryStopCertificateKeepsExactFirstCommand)
+{
+  for (const bool fir : {false, true}) {
+    auto node = make_node(fir ? "recovery_fir_stop" : "recovery_j_stop",
+      true, false, false, .06, 1.0);
+    node->declare_parameter("FollowPath.native_input_recovery", true);
+    node->declare_parameter("FollowPath.fir_coefficients", std::vector<double>{});
+    node->set_parameter(rclcpp::Parameter("FollowPath.fir_coefficients", std::vector<double>(10, .1)));
+    NativeInputTrajectoryGenerator generator(fir ? NativeInputOrder::kFir : NativeInputOrder::kJerk);
+    generator.initialize(node, kPluginName);
+    auto snapshot = make_observable_zero_snapshot(node->now());
+    snapshot.activation_state.velocity.x = fir ? .95 : .55;
+    snapshot.activation_state.linear_acceleration = fir ? 0.0 : .25;
+    snapshot.activation_state.linear_fir_history.assign(9, 0.);
+    snapshot.activation_state.angular_fir_history.assign(9, 0.);
+    generator.set_planning_snapshot(std::make_shared<const PlanningSnapshot>(snapshot));
+    generator.startNewIteration(snapshot.activation_state.velocity);
+    std::size_t recovered_certificates = 0;
+    while (generator.hasMoreTwists()) {
+      const auto command = generator.nextTwist();
+      const auto diagnostic = generator.active_candidate_diagnostics();
+      ASSERT_TRUE(diagnostic.has_value());
+      if (!diagnostic->uses_recovery) {continue;}
+      std::vector<geometry_msgs::msg::Pose2D> poses;
+      std::vector<nav_2d_msgs::msg::Twist2D> velocities;
+      std::vector<NativeInputTrajectoryGenerator::NativeCommandState> states;
+      geometry_msgs::msg::Pose2D start;
+      if (!generator.generate_stop_trajectory(start, 1000, .01, poses, velocities, &states)) {
+        continue;
+      }
+      ++recovered_certificates;
+      ASSERT_FALSE(states.empty());
+      EXPECT_NEAR(states.front().command_velocity.x, command.x, 1e-12);
+      EXPECT_NEAR(states.front().command_velocity.theta, command.theta, 1e-12);
+      EXPECT_NEAR(states.front().linear_state.acceleration,
+        diagnostic->first_command_state.linear_state.acceleration, 1e-12);
+      if (fir) {
+        EXPECT_NEAR(states.front().linear_fir_history.front(), diagnostic->linear_native_input, 1e-12);
+      }
+    }
+    EXPECT_GT(recovered_certificates, 0u);
+  }
+}
+
+TEST(SaturationInput, AccelerationHoldsLongestAdmissibleInputThenCoasts)
+{
+  for (const double maximum : {0.5, 1.0, 1.5}) {
+    const AxisLimits limits{-maximum, maximum, -1.5, 1.5, -1.5, 1.5};
+    for (const double velocity : {-maximum, -0.3, 0.0, 0.3, maximum}) {
+      const AxisState initial{velocity, 0.0};
+      const auto interval = acceleration_input_interval(initial, limits, 0.05);
+      for (const double input : uniform_samples(interval, 15)) {
+        const auto result = longest_acceleration_input(initial, limits, input, 0.05, 50);
+        ASSERT_TRUE(result.valid);
+        ASSERT_EQ(result.states.size(), 50u);
+        EXPECT_DOUBLE_EQ(result.recovery_input, 0.0);
+        EXPECT_NEAR(result.states.front().velocity, velocity + input * 0.05, 1.0e-12);
+        auto previous = initial;
+        for (std::size_t k = 0u; k < result.states.size(); ++k) {
+          const auto & state = result.states[k];
+          const double acceleration = k < static_cast<std::size_t>(result.active_input_steps) ? input : 0.0;
+          EXPECT_DOUBLE_EQ(state.acceleration, acceleration);
+          EXPECT_NEAR(state.velocity, previous.velocity + acceleration * 0.05, 1.0e-12);
+          EXPECT_TRUE(recovery_state_valid(state, limits));
+          previous = state;
+        }
+        if (result.active_input_steps < 50) {
+          // One more nonzero tick would violate the bound; no duration search
+          // or Cartesian product is hidden in the fixed candidate bank.
+          EXPECT_FALSE(recovery_state_valid(
+            {previous.velocity + input * 0.05, input}, limits));
+        }
+      }
+    }
+    EXPECT_FALSE(longest_acceleration_input({0.0, 0.0}, limits, 2.0, 0.05, 50).valid);
+    EXPECT_FALSE(longest_acceleration_input({0.0, 0.0}, limits, 0.1, 0.0, 50).valid);
+    EXPECT_FALSE(longest_acceleration_input({0.0, 0.0}, limits, 0.1, 0.05, 0).valid);
+  }
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, AccelerationSaturationHas150InputsAndExactFirstStopCommand)
+{
+  auto node = make_node("acceleration_saturation_150", true, false, false, 0.0, 1.5, 1.5, 0.05);
+  node->declare_parameter("FollowPath.vx_samples", 10);
+  node->declare_parameter("FollowPath.vtheta_samples", 15);
+  node->set_parameter(rclcpp::Parameter("FollowPath.vx_samples", 10));
+  node->set_parameter(rclcpp::Parameter("FollowPath.vtheta_samples", 15));
+  node->declare_parameter("FollowPath.native_input_recovery", true);
+  AccelerationTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  for (const double initial : {0.0, 0.7, 1.49, 1.5}) {
+    auto snapshot = make_observable_zero_snapshot(node->now());
+    snapshot.activation_state.velocity.x = initial;
+    snapshot.activation_state.native_command_velocity.x = initial;
+    generator.set_planning_snapshot(std::make_shared<const PlanningSnapshot>(snapshot));
+    generator.startNewIteration(snapshot.activation_state.velocity);
+    ASSERT_EQ(generator.candidate_count(), 150u);
+    std::set<double> linear, angular;
+    std::size_t certificates = 0u;
+    while (generator.hasMoreTwists()) {
+      const auto command = generator.nextTwist();
+      const auto diagnostic = generator.active_candidate_diagnostics();
+      ASSERT_TRUE(diagnostic.has_value());
+      EXPECT_TRUE(diagnostic->uses_recovery);
+      EXPECT_DOUBLE_EQ(diagnostic->linear_recovery_input, 0.0);
+      EXPECT_DOUBLE_EQ(diagnostic->angular_recovery_input, 0.0);
+      EXPECT_NEAR(command.x, initial + diagnostic->linear_native_input * 0.05, 1.0e-12);
+      linear.insert(diagnostic->linear_native_input);
+      angular.insert(diagnostic->angular_native_input);
+      std::vector<geometry_msgs::msg::Pose2D> poses;
+      std::vector<nav_2d_msgs::msg::Twist2D> velocities;
+      std::vector<NativeInputTrajectoryGenerator::NativeCommandState> states;
+      if (generator.generate_stop_trajectory(geometry_msgs::msg::Pose2D(),
+          1000, 0.01, poses, velocities, &states))
+      {
+        ++certificates;
+        ASSERT_FALSE(states.empty());
+        EXPECT_NEAR(states.front().command_velocity.x, command.x, 1.0e-12);
+        EXPECT_NEAR(states.front().command_velocity.theta, command.theta, 1.0e-12);
+      }
+    }
+    EXPECT_EQ(linear.size(), 10u);
+    EXPECT_EQ(angular.size(), 15u);
+    EXPECT_GT(certificates, 0u);
+  }
+}
+
+TEST(SaturationInput, JerkSelectsLatestHoldAndLeastRecoveryWithinAllLimits)
+{
+  const AxisLimits limits{0., 1., -1., 1., -.5, .5};
+  for (const auto initial : std::vector<AxisState>{{0., 0.}, {.4, .2}, {.95, .05}, {.1, -.2}}) {
+    const int horizon = 20;
+    const auto intervals = jerk_switch_input_intervals(initial, limits, .05, horizon);
+    for (int sample = 0; sample <= 40; ++sample) {
+      const double input = -.5 + sample * .025;
+      int longest = 0, most_recovery_steps = 0;
+      double least_recovery = 0.;
+      for (int p = 1; p <= horizon; ++p) {
+        for (int m = 0; m <= horizon - p; ++m) {
+          AxisState state = initial;
+          bool valid = true;
+          for (int k = 0; k < p; ++k) {
+            state.acceleration += input * .05;
+            state.velocity += state.acceleration * .05;
+            valid &= recovery_state_valid(state, limits);
+          }
+          if (m == 0 && std::abs(state.acceleration) > 1e-12) {continue;}
+          const double recovery = m == 0 ? 0. : -state.acceleration / (m * .05);
+          if (std::abs(recovery) > .5 + 1e-12) {continue;}
+          for (int k = p; k < horizon; ++k) {
+            state.acceleration += (k < p + m ? recovery : 0.) * .05;
+            state.velocity += state.acceleration * .05;
+            valid &= recovery_state_valid(state, limits);
+          }
+          if (valid && std::abs(state.acceleration) <= 1e-9) {
+            longest = p;
+            most_recovery_steps = m;
+            least_recovery = recovery;
+          }
+        }
+      }
+      const auto result = longest_jerk_recovery(initial, limits, input, .05, horizon);
+      EXPECT_EQ(result.valid, longest > 0) << initial.velocity << "/" << initial.acceleration << "/" << input;
+      const bool in_domain = std::any_of(intervals.begin(), intervals.end(), [input](const auto & interval) {
+        return input >= interval.lower - 1e-10 && input <= interval.upper + 1e-10;
+      });
+      EXPECT_EQ(in_domain, longest > 0);
+      if (result.valid) {
+        EXPECT_EQ(result.active_input_steps, longest);
+        EXPECT_NEAR(result.recovery_input, least_recovery, 1e-10);
+        if (std::abs(least_recovery) > 1e-10) {EXPECT_EQ(result.recovery_steps, most_recovery_steps);}
+        EXPECT_NEAR(result.states.front().acceleration, initial.acceleration + input * .05, 1e-12);
+      }
+    }
+    for (double input : sample_input_intervals(intervals, 15)) {
+      EXPECT_TRUE(longest_jerk_recovery(initial, limits, input, .05, horizon).valid);
+    }
+  }
+  const auto from_rest = longest_jerk_recovery({0., 0.}, limits, .5, .05, 50);
+  ASSERT_TRUE(from_rest.valid);
+  EXPECT_EQ(from_rest.active_input_steps, 25);
+  EXPECT_EQ(from_rest.recovery_steps, 25);
+  EXPECT_NEAR(from_rest.recovery_input, -.5, 1e-12);
+  EXPECT_NEAR(from_rest.states.back().velocity, .78125, 1e-12);
+}
+
+TEST(SaturationInput, FirAnalyticVelocityAndAccelerationDomainMatchDirectConvolution)
+{
+  const auto & coefficients = saturation_test_coefficients();
+  const AxisLimits limits{0., 1., -1., 1., -1.2, 1.2};
+  for (double velocity : {0., .5, .95}) {
+    for (double previous : {-.1, 0., .1}) {
+      const std::vector<double> memory(coefficients.size() - 1, previous);
+      const auto response = prepare_zero_fir_response({velocity, previous}, limits, coefficients, memory, .05, 50);
+      ASSERT_TRUE(response.valid);
+      ASSERT_TRUE(response.monotone_integral);
+      EXPECT_EQ(response.free_states.size(), 95u);
+      for (double input : {-1.2, -.6, 0., .6, 1.2}) {
+        const auto steps = zero_fir_velocity_steps(response, limits, input);
+        int longest = 0;
+        for (int n = 1; n <= 50; ++n) {
+          auto history = memory;
+          double v = velocity;
+          bool velocity_valid = true, acceleration_valid = true;
+          for (int k = 0; k < 95; ++k) {
+            const double raw = k < n ? input : 0.;
+            const double a = fir_acceleration(coefficients, history, raw);
+            v += a * .05;
+            velocity_valid &= v >= -1e-10 && v <= 1. + 1e-10;
+            acceleration_valid &= a >= -1. - 1e-10 && a <= 1. + 1e-10;
+            push_fir_input(history, raw);
+          }
+          EXPECT_EQ(n >= steps.lower && n <= steps.upper, velocity_valid);
+          const auto & domain = response.duration_intervals[n];
+          const bool projected = domain.feasible && input >= domain.lower - 1e-10 && input <= domain.upper + 1e-10;
+          EXPECT_EQ(projected, velocity_valid && acceleration_valid);
+          if (velocity_valid && acceleration_valid) {longest = n;}
+        }
+        const auto result = longest_zero_fir_input(response, limits, input);
+        EXPECT_EQ(result.valid, longest > 0);
+        if (!result.valid) {continue;}
+        EXPECT_EQ(result.active_input_steps, longest);
+        EXPECT_DOUBLE_EQ(result.recovery_input, 0.);
+        auto history = memory;
+        double v = velocity;
+        for (int k = 0; k < 50; ++k) {
+          const double raw = k < longest ? input : 0.;
+          const double a = fir_acceleration(coefficients, history, raw);
+          v += a * .05;
+          EXPECT_NEAR(result.states[k].velocity, v, 1e-11);
+          EXPECT_NEAR(result.states[k].acceleration, a, 1e-11);
+          push_fir_input(history, raw);
+        }
+      }
+      for (double input : sample_input_intervals(response.input_intervals, 15)) {
+        EXPECT_TRUE(longest_zero_fir_input(response, limits, input).valid);
+      }
+    }
+  }
+}
+
+TEST(SaturationInput, FirAccelerationCanLimitDurationBeforeVelocityAndNeverAddsReverseInput)
+{
+  const auto & coefficients = saturation_test_coefficients();
+  const std::vector<double> memory(coefficients.size() - 1, 0.);
+  const AxisLimits limits{0., 1., -1., 1., -1.2, 1.2};
+  const auto from_rest = prepare_zero_fir_response({0., 0.}, limits, coefficients, memory, .05, 50);
+  EXPECT_EQ(zero_fir_velocity_steps(from_rest, limits, 1.2).upper, 15);
+  const auto limited = longest_zero_fir_input(from_rest, limits, 1.2);
+  ASSERT_TRUE(limited.valid);
+  EXPECT_EQ(limited.active_input_steps, 8);
+  EXPECT_EQ(limited.recovery_steps, 0);
+  EXPECT_DOUBLE_EQ(limited.recovery_input, 0.);
+  const auto cruising = prepare_zero_fir_response({.5, 0.}, limits, coefficients, memory, .05, 50);
+  EXPECT_EQ(longest_zero_fir_input(cruising, limits, 1.2).active_input_steps, 7);
+  const auto near_limit = prepare_zero_fir_response({.95, 0.}, limits, coefficients, memory, .05, 50);
+  EXPECT_FALSE(longest_zero_fir_input(near_limit, limits, 1.2).valid);
+}
+
+TEST(SaturationInput, NonmonotoneFirUsesExactDomainsAndSeparatedInputIntervalsKeepTheirGaps)
+{
+  const AxisLimits limits{-1., 1., -1., 1., -1., 1.};
+  const auto response = prepare_zero_fir_response({0., 0.}, limits, {-.1, 1.1}, {0.}, .05, 10);
+  ASSERT_TRUE(response.valid);
+  EXPECT_FALSE(response.monotone_integral);
+  const auto result = longest_zero_fir_input(response, limits, .5);
+  ASSERT_TRUE(result.valid);
+  EXPECT_EQ(result.active_input_steps, 10);
+  const auto intervals = merge_input_intervals({{-1., -.5, true}, {.5, 1., true}});
+  const auto inputs = sample_input_intervals(intervals, 15);
+  EXPECT_EQ(inputs.size(), 15u);
+  EXPECT_DOUBLE_EQ(inputs.front(), -1.);
+  EXPECT_DOUBLE_EQ(inputs.back(), 1.);
+  for (double input : inputs) {EXPECT_TRUE(input <= -.5 || input >= .5);}
+}
+
+}  // namespace f_dwa_controller
+
+// Included after the normal generator suite in the private simulation build.
+#include <set>
+
+namespace f_dwa_controller
+{
+
+TEST_F(NativeInputTrajectoryGeneratorTest, VdwaKeeps150UniqueCandidatesAcrossZero)
+{
+  const auto node = make_node("v_fixed_count_test", true, false, false, 0.0, 1.0, 1.0, 0.05);
+  VLimitedAccelTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  ASSERT_TRUE(node->set_parameters_atomically({
+      rclcpp::Parameter("FollowPath.vx_samples", 10),
+      rclcpp::Parameter("FollowPath.vtheta_samples", 15),
+      rclcpp::Parameter("FollowPath.acc_lim_x", 1.0),
+      rclcpp::Parameter("FollowPath.decel_lim_x", -1.0),
+      rclcpp::Parameter("FollowPath.acc_lim_theta", 1.0),
+      rclcpp::Parameter("FollowPath.decel_lim_theta", -1.0)}).successful);
+  generator.reset();
+  for (const auto & state : std::vector<std::pair<double, double>>{
+      {0.0, 0.0}, {0.3, 0.0}, {0.3, 0.012}, {0.3, -0.032},
+      {0.96, 0.95}, {0.001, -1e-14}, {1.0, -1.0}})
+  {
+    nav_2d_msgs::msg::Twist2D velocity;
+    velocity.x = state.first;
+    velocity.theta = state.second;
+    generator.startNewIteration(velocity);
+    std::set<std::pair<double, double>> commands;
+    std::set<double> linear, angular;
+    std::size_t count = 0u;
+    while (generator.hasMoreTwists()) {
+      const auto command = generator.nextTwist();
+      EXPECT_GE(command.x, std::max(0.0, velocity.x - 0.05) - 1e-12);
+      EXPECT_LE(command.x, std::min(1.0, velocity.x + 0.05) + 1e-12);
+      EXPECT_GE(command.theta, std::max(-1.0, velocity.theta - 0.05) - 1e-12);
+      EXPECT_LE(command.theta, std::min(1.0, velocity.theta + 0.05) + 1e-12);
+      EXPECT_DOUBLE_EQ(command.y, 0.0);
+      commands.insert({command.x, command.theta});
+      linear.insert(command.x);
+      angular.insert(command.theta);
+      ++count;
+    }
+    EXPECT_EQ(count, 150u);
+    EXPECT_EQ(commands.size(), 150u);
+    EXPECT_EQ(linear.size(), 10u);
+    EXPECT_EQ(angular.size(), 15u);
+    if (std::abs(velocity.theta) <= 0.05) {
+      EXPECT_EQ(angular.count(0.0), 1u);
+    }
+    if (velocity.x <= 0.05 && std::abs(velocity.theta) <= 0.05) {
+      EXPECT_EQ(commands.count({0.0, 0.0}), 1u);
+    }
+  }
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, StandardVdwaAlsoKeepsZeroInsideTheBudget)
+{
+  const auto node = make_node("v_standard_count_test", true, false, false, 0.0, 1.0, 1.0, 0.05);
+  node->declare_parameter("FollowPath.vx_samples", 10);
+  node->set_parameter(rclcpp::Parameter("FollowPath.vx_samples", 10));
+  VStandardTrajectoryGenerator generator;
+  generator.initialize(node, kPluginName);
+  nav_2d_msgs::msg::Twist2D velocity;
+  generator.startNewIteration(velocity);
+  std::set<std::pair<double, double>> commands;
+  std::size_t count = 0u;
+  while (generator.hasMoreTwists()) {
+    const auto command = generator.nextTwist();
+    commands.insert({command.x, command.theta});
+    ++count;
+  }
+  EXPECT_EQ(count, 150u);
+  EXPECT_EQ(commands.size(), 150u);
+  EXPECT_EQ(commands.count({0.0, 0.0}), 1u);
 }
 
 }  // namespace f_dwa_controller

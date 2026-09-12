@@ -41,6 +41,8 @@ class VLimitedAccelTrajectoryGenerator
 public:
   void set_planning_snapshot(
     std::shared_ptr<const PlanningSnapshot> snapshot);
+  nav_2d_msgs::msg::Twist2D current_command_velocity(
+    const nav_2d_msgs::msg::Twist2D & current_velocity) const;
   void startNewIteration(
     const nav_2d_msgs::msg::Twist2D & current_velocity) override;
   void reset() override;
@@ -53,13 +55,12 @@ private:
   std::shared_ptr<const PlanningSnapshot> planning_snapshot_;
 };
 
-// This adapter intentionally adds no behavior. Exporting the Nav2 generators
-// from the same library as CertifiedDWBLocalPlanner avoids loading their
-// factories through a second class loader after this library has already linked
-// them as dependencies.
+// Preserve the standard rollout while sharing the fixed sample-count iterator.
 class VStandardTrajectoryGenerator
   : public dwb_plugins::StandardTrajectoryGenerator
 {
+protected:
+  void initializeIterator(const nav2_util::LifecycleNode::SharedPtr & node) override;
 };
 
 }  // namespace f_dwa_controller

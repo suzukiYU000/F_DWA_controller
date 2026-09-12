@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "dwb_core/trajectory_critic.hpp"
+#include "f_dwa_controller/path_segment_bounds.hpp"
 
 namespace f_dwa_controller
 {
@@ -41,6 +42,11 @@ public:
   double scoreTrajectory(
     const dwb_msgs::msg::Trajectory2D & trajectory) override;
 
+  bool beyondPathEndWithinCorridor(
+    const geometry_msgs::msg::Pose2D & pose,
+    const geometry_msgs::msg::Pose2D & endpoint,
+    double terminal_heading, double maximum_overshoot) const;
+
 protected:
   struct PathSegment
   {
@@ -65,9 +71,12 @@ protected:
 
   nav_2d_msgs::msg::Path2D reference_path_;
   std::vector<PathSegment> path_segments_;
+  std::vector<PathSegmentBounds> path_segment_bounds_;
   double maximum_path_distance_{1.5};
   double deviation_penalty_{1000.0};
   double excess_distance_scale_{1000.0};
+  double path_distance_scale_{0.0};
+  double path_distance_tolerance_{0.0};
   double heading_recovery_activation_distance_{1.05};
   double heading_recovery_lookahead_distance_{0.9};
   double heading_recovery_scale_{200.0};

@@ -37,6 +37,73 @@ nav_2d_msgs::msg::Path2D default_reference_plan()
   return plan;
 }
 
+TEST(PathDeviationCritic, TerminalOvershootCoversPathCorridorOutsideGoalCircle)
+{
+  class EndpointCritic : public f_dwa_controller::PathDeviationCritic
+  {
+  public:
+    EndpointCritic() {maximum_path_distance_ = 1.0;}
+  } critic;
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(2u);
+  path.poses[0].x = 6.0;
+  path.poses[0].y = 5.4;
+  path.poses[1].x = 0.5;
+  path.poses[1].y = 5.4;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(path.poses[0], velocity, path.poses.back(), path));
+  // Stopping endpoint from the failed 1.5 m/s J-DWA run. It escaped the
+  // old 0.3 m lateral gate even though it remained in the 1 m Path corridor.
+  geometry_msgs::msg::Pose2D stop;
+  stop.x = -0.23171399367683473;
+  stop.y = 5.813486193937818;
+  EXPECT_TRUE(critic.beyondPathEndWithinCorridor(stop, path.poses.back(), M_PI, 0.3));
+  stop.x = 0.3;
+  EXPECT_FALSE(critic.beyondPathEndWithinCorridor(stop, path.poses.back(), M_PI, 0.3));
+  stop.x = -0.3;
+  stop.y = 6.400001;
+  EXPECT_FALSE(critic.beyondPathEndWithinCorridor(stop, path.poses.back(), M_PI, 0.3));
+}
+
+TEST(PathDeviationCritic, TerminalOvershootDoesNotRejectEarlierReturningPathLeg)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  nav_2d_msgs::msg::Path2D path;
+  path.poses.resize(4u);
+  path.poses[0].x = 3.8;
+  path.poses[0].y = 0.4;
+  path.poses[1].x = 1.0;
+  path.poses[1].y = 0.4;
+  path.poses[2].x = 1.0;
+  path.poses[3].x = 3.0;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(critic.prepare(path.poses[0], velocity, path.poses.back(), path));
+  geometry_msgs::msg::Pose2D stop;
+  stop.x = 3.75;
+  stop.y = 0.4;
+  EXPECT_FALSE(critic.beyondPathEndWithinCorridor(stop, path.poses.back(), 0.0, 0.3));
+  // On the other side, the endpoint is the closest Path point.
+  stop.x = 3.4;
+  stop.y = -0.4;
+  EXPECT_TRUE(critic.beyondPathEndWithinCorridor(stop, path.poses.back(), 0.0, 0.3));
+}
+
+TEST(PathDeviationCritic, TerminalOvershootRequiresActualGlobalEndpoint)
+{
+  f_dwa_controller::PathDeviationCritic critic;
+  const auto path = default_reference_plan();
+  nav_2d_msgs::msg::Twist2D velocity;
+  geometry_msgs::msg::Pose2D stop = path.poses.back();
+  stop.x += 1.0;
+  EXPECT_FALSE(critic.beyondPathEndWithinCorridor(stop, path.poses.back(), 0.0, 0.3));
+  ASSERT_TRUE(critic.prepare(path.poses[0], velocity, path.poses.back(), path));
+  auto different_goal = path.poses.back();
+  different_goal.x += 0.01;
+  EXPECT_FALSE(critic.beyondPathEndWithinCorridor(stop, different_goal, 0.0, 0.3));
+  stop.x = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(critic.beyondPathEndWithinCorridor(stop, path.poses.back(), 0.0, 0.3));
+}
+
 class StubMeanPathDistCritic : public f_dwa_controller::MeanPathDistCritic
 {
 public:
@@ -429,6 +496,100 @@ public:
     return minimumFootprintClearance(pose);
   }
 
+  // Frozen pre-optimization reference; compare full geometry below.
+  double referenceClearance(
+  const geometry_msgs::msg::Pose2D & pose) const
+{
+  if (!costmap_ || footprint_boundary_samples_.empty() ||
+    obstacle_distance_field_.size() !=
+    static_cast<std::size_t>(costmap_->getSizeInCellsX()) *
+    static_cast<std::size_t>(costmap_->getSizeInCellsY()) ||
+    !std::isfinite(pose.x) || !std::isfinite(pose.y) ||
+    !std::isfinite(pose.theta))
+  {
+    return 0.0;
+  }
+  const double resolution = costmap_->getResolution();
+  if (!std::isfinite(resolution) || resolution <= 0.0) {
+    return 0.0;
+  }
+  const double obstacle_cell_radius = std::sqrt(0.5) * resolution;
+  const double probe_gap_radius = 0.5 * maximum_footprint_probe_gap_;
+  const double origin_x = costmap_->getOriginX();
+  const double origin_y = costmap_->getOriginY();
+  const unsigned int size_x = costmap_->getSizeInCellsX();
+  const double maximum_x = origin_x +
+    static_cast<double>(size_x) * resolution;
+  const double maximum_y = origin_y +
+    static_cast<double>(costmap_->getSizeInCellsY()) * resolution;
+  const double cosine = std::cos(pose.theta);
+  const double sine = std::sin(pose.theta);
+  double minimum_clearance = std::numeric_limits<double>::infinity();
+  for (const auto & point : footprint_boundary_samples_) {
+    const double world_x = pose.x + point.x * cosine - point.y * sine;
+    const double world_y = pose.y + point.x * sine + point.y * cosine;
+    minimum_clearance = std::min(
+      minimum_clearance,
+      std::min({
+        world_x - origin_x, maximum_x - world_x,
+        world_y - origin_y, maximum_y - world_y}));
+    if (minimum_clearance <= 0.0) {
+      // Preserve the signed map-boundary penetration for directional recovery
+      // ranking. Ordinary soft scoring below still saturates at one.
+      return minimum_clearance;
+    }
+    unsigned int cell_x = 0u;
+    unsigned int cell_y = 0u;
+    if (!costmap_->worldToMap(world_x, world_y, cell_x, cell_y)) {
+      return 0.0;
+    }
+    // Interpolate conservative bounds, not the EDT alone. Each corner's
+    // D(c) - |p-c| is a lower bound at p by the 1-Lipschitz property. Their
+    // convex combination stays conservative and is continuous across cell
+    // boundaries, unlike choosing only the cell containing p.
+    const double grid_x = std::clamp(
+      (world_x - origin_x) / resolution - 0.5,
+      0.0, static_cast<double>(size_x - 1u));
+    const double grid_y = std::clamp(
+      (world_y - origin_y) / resolution - 0.5,
+      0.0, static_cast<double>(costmap_->getSizeInCellsY() - 1u));
+    const unsigned int x0 = static_cast<unsigned int>(std::floor(grid_x));
+    const unsigned int y0 = static_cast<unsigned int>(std::floor(grid_y));
+    const unsigned int x1 = std::min(x0 + 1u, size_x - 1u);
+    const unsigned int y1 = std::min(y0 + 1u, costmap_->getSizeInCellsY() - 1u);
+    const double fraction_x = grid_x - static_cast<double>(x0);
+    const double fraction_y = grid_y - static_cast<double>(y0);
+    double interpolated_lower_bound = 0.0;
+    for (unsigned int row = 0u; row < 2u; ++row) {
+      for (unsigned int column = 0u; column < 2u; ++column) {
+        const double weight =
+          (column == 0u ? 1.0 - fraction_x : fraction_x) *
+          (row == 0u ? 1.0 - fraction_y : fraction_y);
+        if (weight <= 0.0) {
+          continue;
+        }
+        const unsigned int x = column == 0u ? x0 : x1;
+        const unsigned int y = row == 0u ? y0 : y1;
+        const double distance = obstacle_distance_field_[
+          static_cast<std::size_t>(y) * size_x + x];
+        const double centre_x = origin_x + (static_cast<double>(x) + 0.5) * resolution;
+        const double centre_y = origin_y + (static_cast<double>(y) + 0.5) * resolution;
+        const double delta_x = world_x - centre_x;
+        const double delta_y = world_y - centre_y;
+        interpolated_lower_bound += weight *
+          (distance - std::sqrt(delta_x * delta_x + delta_y * delta_y));
+      }
+    }
+    const double conservative_clearance = interpolated_lower_bound -
+      obstacle_cell_radius - probe_gap_radius;
+    minimum_clearance = std::min(minimum_clearance, conservative_clearance);
+  }
+  // Keep the conservative lower bound signed. This lets exceptional recovery
+  // selection distinguish moving farther into the reserve from moving out of
+  // it even while the bounded soft penalty is saturated at one.
+  return minimum_clearance;
+}
+
   double poseScore(const geometry_msgs::msg::Pose2D & pose) const
   {
     return scorePoseClearance(pose);
@@ -787,6 +948,144 @@ public:
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(invalid), 1000.0);
 }
 
+TEST(PathSegmentBounds, BlockPruningMatchesOriginalSegmentScanIncludingTiesAndHints)
+{
+  class DistanceOracle : public f_dwa_controller::PathDeviationCritic
+  {
+  public:
+    using PathDeviationCritic::distanceToPath;
+    std::size_t size() const {return path_segments_.size();}
+    double brute(const geometry_msgs::msg::Pose2D & pose,
+      std::size_t & hint, double sufficient) const
+    {
+      hint = std::min(hint, size() - 1u);
+      const std::size_t first = hint;
+      double best = std::numeric_limits<double>::infinity();
+      for (std::size_t offset = 0u; offset < size(); ++offset) {
+        const std::size_t index = (first + offset) % size();
+        const auto & segment = path_segments_[index];
+        // Preserve the original per-segment bound as well as scan order.
+        // Evaluating an endpoint by interpolation can round differently from
+        // its exact box edge and change an otherwise equal-distance hint.
+        const double box_dx = std::max({segment.minimum_x - pose.x, 0.0,
+          pose.x - segment.maximum_x});
+        const double box_dy = std::max({segment.minimum_y - pose.y, 0.0,
+          pose.y - segment.maximum_y});
+        if (box_dx * box_dx + box_dy * box_dy >= best) {continue;}
+        const double fraction = std::clamp(
+          ((pose.x - segment.start_x) * segment.delta_x +
+          (pose.y - segment.start_y) * segment.delta_y) *
+          segment.inverse_squared_length, 0.0, 1.0);
+        const double dx = pose.x - (segment.start_x + fraction * segment.delta_x);
+        const double dy = pose.y - (segment.start_y + fraction * segment.delta_y);
+        const double squared = dx * dx + dy * dy;
+        if (squared < best) {best = squared; hint = index;}
+        if (best <= sufficient * sufficient) {break;}
+      }
+      return std::sqrt(best);
+    }
+  } distance;
+  class ProgressOracle : public f_dwa_controller::TrajectoryProgressCritic
+  {
+  public:
+    using TrajectoryProgressCritic::projectOntoPath;
+    PathProjection brute(const geometry_msgs::msg::Pose2D & pose,
+      std::size_t & hint) const
+    {
+      double best = std::numeric_limits<double>::infinity(), progress = 0.0;
+      const std::size_t first = std::min(hint, path_segments_.size() - 1u);
+      hint = path_segments_.size();
+      for (std::size_t offset = 0u; offset <= path_segments_.size(); ++offset) {
+        const std::size_t index = offset == 0u ? first : offset - 1u;
+        if (offset != 0u && index == first) {continue;}
+        const auto & segment = path_segments_[index];
+        const double box_dx = std::max({segment.minimum_x - pose.x, 0.0,
+          pose.x - segment.maximum_x});
+        const double box_dy = std::max({segment.minimum_y - pose.y, 0.0,
+          pose.y - segment.maximum_y});
+        const double lower = box_dx * box_dx + box_dy * box_dy;
+        if (lower > best || (lower == best && index >= hint)) {continue;}
+        const double fraction = std::clamp(
+          ((pose.x - segment.start_x) * segment.delta_x +
+          (pose.y - segment.start_y) * segment.delta_y) *
+          segment.inverse_squared_length, 0.0, 1.0);
+        const double dx = pose.x - (segment.start_x + fraction * segment.delta_x);
+        const double dy = pose.y - (segment.start_y + fraction * segment.delta_y);
+        const double squared = dx * dx + dy * dy;
+        if (squared < best || (squared == best && index < hint)) {
+          best = squared; hint = index;
+          progress = segment.cumulative_start + fraction * segment.length;
+        }
+      }
+      return {progress, std::sqrt(best)};
+    }
+  } progress;
+  nav_2d_msgs::msg::Path2D plan;
+  // Repeated traversals create exact equal-distance ties in different blocks.
+  for (int repetition = 0; repetition < 3; ++repetition) {
+    for (int i = 0; i <= 200; ++i) {
+      geometry_msgs::msg::Pose2D point;
+      point.x = 0.05 * i;
+      point.y = std::sin(point.x) + 0.2 * std::cos(3.0 * point.x);
+      plan.poses.push_back(point);
+      if (i % 17 == 0) {plan.poses.push_back(point);}
+    }
+  }
+  geometry_msgs::msg::Pose2D pose;
+  nav_2d_msgs::msg::Twist2D velocity;
+  ASSERT_TRUE(distance.prepare(pose, velocity, pose, plan));
+  ASSERT_TRUE(progress.prepare(pose, velocity, pose, plan));
+  for (int ix = -3; ix <= 34; ++ix) {
+    for (int iy = -8; iy <= 8; ++iy) {
+      pose.x = ix * 0.33; pose.y = iy * 0.29;
+      for (const std::size_t initial_hint : {0u, 17u, 191u, 399u, 600u, 999u}) {
+        for (const double sufficient : {0.0, 0.1, 1.0}) {
+          auto actual_hint = initial_hint, reference_hint = initial_hint;
+          EXPECT_DOUBLE_EQ(distance.distanceToPath(pose, actual_hint, sufficient),
+            distance.brute(pose, reference_hint, sufficient));
+          EXPECT_EQ(actual_hint, reference_hint);
+        }
+        auto actual_hint = initial_hint, reference_hint = initial_hint;
+        const auto actual = progress.projectOntoPath(pose, actual_hint);
+        const auto reference = progress.brute(pose, reference_hint);
+        EXPECT_DOUBLE_EQ(actual.distance, reference.distance);
+        EXPECT_DOUBLE_EQ(actual.progress, reference.progress);
+        EXPECT_EQ(actual_hint, reference_hint);
+      }
+    }
+  }
+}
+
+TEST(FootprintClearanceCritic, OptimizedInterpolationMatchesFrozenReference)
+{
+  for (const double resolution : {0.03, 0.05, 0.1}) {
+    nav2_costmap_2d::Costmap2D map(83, 71, resolution, -1.73, -1.27,
+      nav2_costmap_2d::FREE_SPACE);
+    for (unsigned int i = 4u; i < 60u; i += 7u) {
+      map.setCost(i, (i * 13u) % 69u, nav2_costmap_2d::LETHAL_OBSTACLE);
+    }
+    CostmapFootprintClearanceCritic critic;
+    ASSERT_TRUE(critic.configure(&map));
+    nav2_costmap_2d::Footprint footprint(4);
+    footprint[0].x = 0.43; footprint[0].y = 0.31;
+    footprint[1].x = -0.36; footprint[1].y = 0.31;
+    footprint[2].x = -0.36; footprint[2].y = -0.31;
+    footprint[3].x = 0.43; footprint[3].y = -0.31;
+    ASSERT_TRUE(critic.setPhysicalFootprint(footprint));
+    for (int ix = -2; ix <= 44; ++ix) {
+      for (int iy = -2; iy <= 37; ++iy) {
+        for (int angle = 0; angle < 9; ++angle) {
+          geometry_msgs::msg::Pose2D pose;
+          pose.x = map.getOriginX() + ix * 1.93 * resolution;
+          pose.y = map.getOriginY() + iy * 1.91 * resolution;
+          pose.theta = 0.37 * angle;
+          EXPECT_DOUBLE_EQ(critic.minimumClearance(pose), critic.referenceClearance(pose));
+        }
+      }
+    }
+  }
+}
+
 TEST(PathDeviationCritic, IsNeutralAtOrInsideMaximumDistance)
 {
   f_dwa_controller::PathDeviationCritic critic;
@@ -801,6 +1100,44 @@ TEST(PathDeviationCritic, IsNeutralAtOrInsideMaximumDistance)
   trajectory.poses.front().y = 1.5;
   trajectory.poses.back().y = -1.5;
   EXPECT_DOUBLE_EQ(critic.scoreTrajectory(trajectory), 0.0);
+}
+
+TEST(PathDeviationCritic, CompactPathCostHasToleranceAndContinuousCorridorPenalty)
+{
+  class CompactCritic : public f_dwa_controller::PathDeviationCritic
+  {
+  public:
+    CompactCritic()
+    {
+      maximum_path_distance_ = 1.0;
+      deviation_penalty_ = 0.0;
+      excess_distance_scale_ = 1000.0;
+      path_distance_scale_ = 32.0;
+      path_distance_tolerance_ = 0.1;
+      heading_recovery_activation_distance_ = 0.7;
+      heading_recovery_scale_ = 0.0;
+      validateParameters();
+    }
+  } critic;
+  geometry_msgs::msg::Pose2D pose;
+  nav_2d_msgs::msg::Twist2D velocity;
+  geometry_msgs::msg::Pose2D goal;
+  ASSERT_TRUE(critic.prepare(pose, velocity, goal, straight_path(4.0)));
+  const auto score_at = [&critic](const double lateral_distance) {
+      dwb_msgs::msg::Trajectory2D trajectory;
+      trajectory.poses.resize(3u);
+      for (std::size_t i = 0u; i < trajectory.poses.size(); ++i) {
+        trajectory.poses[i].x = 0.2 * static_cast<double>(i);
+        trajectory.poses[i].y = lateral_distance;
+      }
+      return critic.scoreTrajectory(trajectory);
+    };
+  EXPECT_DOUBLE_EQ(score_at(0.05), 0.0);
+  EXPECT_NEAR(score_at(0.20), 3.2, 1.0e-10);
+  EXPECT_NEAR(score_at(-0.20), score_at(0.20), 1.0e-10);
+  EXPECT_NEAR(score_at(1.0), 28.8, 1.0e-10);
+  EXPECT_LT(score_at(1.0 + 1.0e-7) - score_at(1.0 - 1.0e-7), 0.001);
+  EXPECT_NEAR(score_at(1.20), 235.2, 1.0e-9);
 }
 
 TEST(PathDeviationCritic, AddsMeanExcessDistanceOutsideCorridor)
@@ -1466,6 +1803,59 @@ TEST(FootprintClearanceCritic, DistanceFieldSeparatesNearAndFarPoses)
 
   EXPECT_LT(critic.minimumClearance(near_pose), 0.25);
   EXPECT_GT(critic.minimumClearance(far_pose), 0.25);
+}
+
+TEST(FootprintClearanceCritic, ClearanceIsContinuousAcrossRasterBoundaries)
+{
+  nav2_costmap_2d::Costmap2D costmap(80, 80, 0.05, -2.0, -2.0, 0u);
+  costmap.setCost(59u, 47u, nav2_costmap_2d::LETHAL_OBSTACLE);
+  CostmapFootprintClearanceCritic critic;
+  ASSERT_TRUE(critic.configure(&costmap));
+  ASSERT_TRUE(critic.setPhysicalFootprint(squareFootprint(0.20)));
+  critic.setExpandedFootprints({squareFootprint(0.45)});
+  constexpr double epsilon = 1.0e-7;
+  double largest_jump = 0.0;
+  for (int x = -10; x <= 15; ++x) {
+    for (int y = -6; y <= 10; ++y) {
+      geometry_msgs::msg::Pose2D left;
+      left.x = x * 0.05 - epsilon;
+      left.y = y * 0.025 + 0.003;
+      auto right = left;
+      right.x += 2.0 * epsilon;
+      largest_jump = std::max(largest_jump, std::abs(
+        critic.minimumClearance(left) - critic.minimumClearance(right)));
+    }
+  }
+  EXPECT_LT(largest_jump, 2.0e-6);
+}
+
+TEST(FootprintClearanceCritic, ClearanceLowerBoundHoldsForDisjointFootprints)
+{
+  nav2_costmap_2d::Costmap2D costmap(80, 80, 0.05, -2.0, -2.0, 0u);
+  costmap.setCost(59u, 47u, nav2_costmap_2d::LETHAL_OBSTACLE);
+  CostmapFootprintClearanceCritic critic;
+  ASSERT_TRUE(critic.configure(&costmap));
+  ASSERT_TRUE(critic.setPhysicalFootprint(squareFootprint(0.20)));
+  for (int x = -30; x <= 65; ++x) {
+    for (int y = -20; y <= 30; ++y) {
+      geometry_msgs::msg::Pose2D pose;
+      pose.x = x * 0.017;
+      pose.y = y * 0.019;
+      // Exact distance between the axis-aligned physical square and the
+      // occupied square [0.95, 1.00] x [0.35, 0.40].
+      const double dx = std::max({0.95 - (pose.x + 0.20),
+          pose.x - 0.20 - 1.00, 0.0});
+      const double dy = std::max({0.35 - (pose.y + 0.20),
+          pose.y - 0.20 - 0.40, 0.0});
+      if (dx == 0.0 && dy == 0.0) {
+        // This critic measures boundary distance. Occupied cells enclosed by
+        // the body require the independent collision gate, not a distance
+        // query over the body's boundary.
+        continue;
+      }
+      EXPECT_LE(critic.minimumClearance(pose), std::hypot(dx, dy) + 1.0e-12);
+    }
+  }
 }
 
 TEST(FootprintClearanceCritic, ZeroPenaltyBoundPreservesExactPoseScores)

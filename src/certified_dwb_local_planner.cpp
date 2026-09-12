@@ -43,6 +43,7 @@
 #include "dwb_core/illegal_trajectory_tracker.hpp"
 #include "f_dwa_controller/horizon_obstacle_footprint_critic.hpp"
 #include "f_dwa_controller/native_input_trajectory_generator.hpp"
+#include "f_dwa_controller/path_deviation_critic.hpp"
 #include "f_dwa_controller/path_subgoal.hpp"
 #include "f_dwa_controller/terminal_stop_dynamics.hpp"
 #include "f_dwa_controller/trajectory_certifier.hpp"
@@ -177,6 +178,9 @@ std::string candidate_diagnostic_metadata(
          << ";angular_native_input=" << value.angular_native_input
          << ";linear_prediction_input_duration=" << value.linear_prediction_input_duration
          << ";angular_prediction_input_duration=" << value.angular_prediction_input_duration
+         << ";uses_input_recovery=" << value.uses_recovery
+         << ";linear_recovery_input=" << value.linear_recovery_input
+         << ";angular_recovery_input=" << value.angular_recovery_input
          << ";initial_linear_velocity=" << value.initial_linear_velocity
          << ";initial_angular_velocity=" << value.initial_angular_velocity
          << ";initial_linear_acceleration="
@@ -938,7 +942,11 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
 {
   (void)goal_checker;
   const auto planning_started_at = std::chrono::steady_clock::now();
-  std::lock_guard<std::mutex> lock(controller_state_mutex_);
+  std::unique_lock<std::mutex> lock(controller_state_mutex_, std::defer_lock);
+  {
+    ScopedDuration controller_lock_duration(planning_metrics_enabled_, controller_lock_timing_);
+    lock.lock();
+  }
   std::shared_ptr<dwb_msgs::msg::LocalPlanEvaluation> evaluation;
   const bool publish_full_evaluation = should_publish_evaluation();
   const bool publish_candidate_markers =
@@ -973,6 +981,7 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
       // The mutex is recursive; base DWB takes it again while scoring. Keeping
       // this outer lock makes the committed-delay check, broadphase prefix,
       // critic preparation, and candidate certification use one snapshot.
+      ScopedDuration costmap_lock_duration(planning_metrics_enabled_, costmap_lock_timing_);
       certification_costmap_lock.lock();
     }
     if (certification_enabled_ || enable_initial_overlap_recovery_ ||
@@ -980,7 +989,10 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
     {
       prepare_collision_footprints();
     }
-    planning_snapshot_ = build_planning_snapshot(pose, velocity);
+    {
+      ScopedDuration planning_snapshot_duration(planning_metrics_enabled_, planning_snapshot_timing_);
+      planning_snapshot_ = build_planning_snapshot(pose, velocity);
+    }
     if (!planning_snapshot_->valid) {
       throw nav2_core::NoValidControl(
               "No valid robot-observable command-dispatch state");
@@ -1111,11 +1123,11 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
     nav_2d_msgs::msg::Pose2DStamped activation_pose =
       nav_2d_utils::poseStampedToPose2D(pose);
     activation_pose.pose = planning_snapshot_->activation_state.pose;
-    const nav_2d_msgs::msg::Twist2DStamped command_2d =
-      dwb_core::DWBLocalPlanner::computeVelocityCommands(
-      activation_pose,
-      planning_snapshot_->activation_state.velocity,
-      evaluation);
+    const nav_2d_msgs::msg::Twist2DStamped command_2d = [&]() {
+        ScopedDuration dwb_call_duration(planning_metrics_enabled_, dwb_call_timing_);
+        return dwb_core::DWBLocalPlanner::computeVelocityCommands(
+          activation_pose, planning_snapshot_->activation_state.velocity, evaluation);
+      }();
     enqueue_diagnostic_publication(
       evaluation, publish_full_evaluation, publish_candidate_markers);
     geometry_msgs::msg::TwistStamped command;
@@ -1723,6 +1735,10 @@ void CertifiedDWBLocalPlanner::report_planning_metrics(
         1.0e6 * counter.total_seconds / static_cast<double>(counter.calls),
         share_percent);
     };
+  report_duration("stage", "controller_lock", controller_lock_timing_);
+  report_duration("stage", "costmap_lock", costmap_lock_timing_);
+  report_duration("stage", "planning_snapshot", planning_snapshot_timing_);
+  report_duration("stage", "dwb_call", dwb_call_timing_);
   report_duration("stage", "core_scoring", core_scoring_timing_);
   report_duration(
     "stage", "candidate_evaluation", candidate_evaluation_timing_);
@@ -2661,6 +2677,10 @@ void CertifiedDWBLocalPlanner::stop_diagnostic_publisher()
 
 void CertifiedDWBLocalPlanner::reset_detailed_timing_metrics()
 {
+  controller_lock_timing_ = DurationCounter();
+  costmap_lock_timing_ = DurationCounter();
+  planning_snapshot_timing_ = DurationCounter();
+  dwb_call_timing_ = DurationCounter();
   core_scoring_timing_ = DurationCounter();
   candidate_evaluation_timing_ = DurationCounter();
   trajectory_generation_timing_ = DurationCounter();
@@ -3233,6 +3253,13 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   const bool terminal_endpoint_policy_enabled =
     terminal_stop_policy_enabled && current_goal_pose_valid_ &&
     current_terminal_path_heading_valid_;
+  std::shared_ptr<PathDeviationCritic> terminal_path_critic;
+  if (terminal_endpoint_policy_enabled) {
+    for (const auto & critic : critics_) {
+      terminal_path_critic = std::dynamic_pointer_cast<PathDeviationCritic>(critic);
+      if (terminal_path_critic) {break;}
+    }
+  }
   if ((certification_enabled_ || stop_admissibility_enabled_) &&
     terminal_stop_goal_distance_scale_ > 0.0 &&
     !current_terminal_distance_target_pose_valid_)
@@ -3459,6 +3486,12 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
             throw dwb_core::IllegalTrajectoryException(
                     "TerminalGoalAdmissibility",
                     "Terminal stop endpoint is not finite");
+          }
+          if (!terminal_stop_assessment.crosses_terminal_limit && terminal_path_critic) {
+            terminal_stop_assessment.crosses_terminal_limit =
+              terminal_path_critic->beyondPathEndWithinCorridor(
+              terminal_stop_assessment.terminal_pose, current_goal_pose_,
+              current_terminal_path_heading_, terminal_stop_goal_capture_distance_);
           }
         }
       }
@@ -4452,7 +4485,8 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
     });
   const auto build_certified_native_direct_stop =
     [this, &native_generator, &pose, &results](
-    const char * detail_name, const char * warning_message) ->
+    const char * detail_name, const char * warning_message,
+    const bool require_goal_capture = false) ->
     std::optional<dwb_msgs::msg::TrajectoryScore>
     {
       if (!native_generator) {
@@ -4472,11 +4506,29 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         return std::nullopt;
       }
 
+      if (require_goal_capture &&
+        (!current_goal_pose_valid_ || !current_terminal_path_heading_valid_ ||
+        !terminal_plan_fallback_is_applicable(
+          pose, current_goal_pose_, terminal_stop_goal_capture_distance_) ||
+        !assess_terminal_stop(
+          direct_stop_poses, current_goal_pose_, current_terminal_path_heading_,
+          terminal_stop_goal_capture_distance_, terminal_stop_goal_capture_yaw_tolerance_,
+          terminal_stop_goal_capture_distance_).captures_goal))
+      {
+        return std::nullopt;
+      }
+
       CertificationFailure direct_stop_failure =
         CertificationFailure::kInvalidInput;
       bool used_boundary_margin_recovery = false;
-      const bool padded_stop_is_safe = certify_stop_poses(
-        direct_stop_poses, direct_stop_failure);
+      const bool padded_stop_is_safe = require_goal_capture && !certification_enabled_ ?
+        certify_pose_sequence(
+          *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
+          direct_stop_poses, maximum_swept_distance_, &certification_workspace_).safe :
+        certify_stop_poses(direct_stop_poses, direct_stop_failure);
+      if (require_goal_capture && !padded_stop_is_safe) {
+        return std::nullopt;
+      }
       const bool physical_stop_is_safe = padded_stop_is_safe ||
         certify_physical_sequence(
         direct_stop_poses, nullptr, &used_boundary_margin_recovery);
@@ -4510,6 +4562,80 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         "%s", warning_message);
       return direct_stop_score;
     };
+  // Inside the observed GoalChecker radius, execute a native stop whose
+  // endpoint also meets that radius. Revalidate from the current state
+  // every cycle so a localization correction cannot retain an early stop.
+  if (terminal_stop_policy_enabled && inside_terminal_capture_region) {
+    const auto goal_stop = build_certified_native_direct_stop(
+      "TerminalGoalNativeDirectStop",
+      "Inside the goal radius; executing a revalidated method-native stop", true);
+    if (goal_stop) {
+      return *goal_stop;
+    }
+  }
+
+  // V uses Nav2's velocity-window generator, rather than the native-input
+  // interface above. Reuse its acceleration-stop certificate at the goal.
+  const auto velocity_generator =
+    std::dynamic_pointer_cast<VLimitedAccelTrajectoryGenerator>(traj_generator_);
+  if (inside_terminal_capture_region && current_terminal_path_heading_valid_ &&
+    terminal_stop_goal_capture_distance_ > 0.0 &&
+    terminal_stop_goal_capture_yaw_tolerance_ > 0.0 &&
+    velocity_generator)
+  {
+    // Braking must share the ordinary window's command state. Physical response
+    // lag would otherwise permit a discontinuity at entry to the goal radius.
+    const auto command_velocity = velocity_generator->current_command_velocity(velocity);
+    const int maximum_stop_steps = static_cast<int>(std::ceil(
+        terminal_stop_maximum_time_ / certification_control_period_));
+    const auto linear_stop = generate_acceleration_stop_sequence(
+      AxisState{command_velocity.x, 0.0}, linear_limits(), certification_control_period_,
+      maximum_stop_steps, terminal_stop_velocity_threshold_);
+    const auto angular_stop = generate_acceleration_stop_sequence(
+      AxisState{command_velocity.theta, 0.0}, angular_limits(), certification_control_period_,
+      maximum_stop_steps, terminal_stop_velocity_threshold_);
+    if (linear_stop.feasible && angular_stop.feasible &&
+      linear_stop.terminal_state_cleared && angular_stop.terminal_state_cleared)
+    {
+      dwb_msgs::msg::Trajectory2D stop_candidate;
+      stop_candidate.poses.push_back(pose);
+      stop_candidate.velocity.x = linear_stop.states.empty() ?
+        0.0 : linear_stop.states.front().velocity;
+      stop_candidate.velocity.theta = angular_stop.states.empty() ?
+        0.0 : angular_stop.states.front().velocity;
+      std::vector<geometry_msgs::msg::Pose2D> stop_poses;
+      CertificationFailure failure = CertificationFailure::kInvalidInput;
+      if (build_stop_trajectory(stop_candidate, stop_poses, nullptr, nullptr, std::nullopt) &&
+        assess_terminal_stop(
+          stop_poses, current_goal_pose_, current_terminal_path_heading_,
+          terminal_stop_goal_capture_distance_, terminal_stop_goal_capture_yaw_tolerance_,
+          terminal_stop_goal_capture_distance_).captures_goal &&
+        (certification_enabled_ ? certify_stop_poses(stop_poses, failure) :
+        certify_pose_sequence(
+          *costmap_ros_->getCostmap(), costmap_ros_->getRobotFootprint(),
+          stop_poses, maximum_swept_distance_, &certification_workspace_).safe))
+      {
+        dwb_msgs::msg::TrajectoryScore goal_stop;
+        goal_stop.total = 0.0;
+        goal_stop.traj.velocity = stop_candidate.velocity;
+        goal_stop.traj.poses = std::move(stop_poses);
+        dwb_msgs::msg::CriticScore detail;
+        detail.name = "TerminalGoalVelocityStop";
+        detail.scale = 0.0;
+        detail.raw_score = 1.0;
+        goal_stop.scores.push_back(std::move(detail));
+        retained_backup_commands_.clear();
+        retained_backup_states_.clear();
+        terminal_stop_goal_capture_committed_ = false;
+        if (results) {
+          results->twists.push_back(goal_stop);
+          results->best_index = results->twists.size() - 1u;
+        }
+        return goal_stop;
+      }
+    }
+  }
+
   const bool native_window_needs_direct_stop =
     native_generator && best.total < 0.0 &&
     no_valid_control_deceleration_fallback_enabled_ &&
@@ -6614,6 +6740,16 @@ void CertifiedDWBLocalPlanner::reload_motion_limits()
   if (values[7] < 0.0 || values[8] < 0.0) {
     throw std::invalid_argument("Invalid Controller terminal goal tolerances");
   }
+  std::vector<double> critic_scales;
+  critic_scales.reserve(critics_.size());
+  for (const auto & critic : critics_) {
+    const std::string key = dwb_plugin_name_ + "." + critic->getName() + ".scale";
+    const double scale = node->get_parameter(key).as_double();
+    if (!std::isfinite(scale) || scale < 0.0) {
+      throw std::invalid_argument(key + " must be finite and non-negative");
+    }
+    critic_scales.push_back(scale);
+  }
   // Commit together at the stopped trial boundary, not during a rollout.
   minimum_linear_velocity_ = values[0];
   maximum_linear_velocity_ = values[1];
@@ -6624,6 +6760,9 @@ void CertifiedDWBLocalPlanner::reload_motion_limits()
   maximum_angular_deceleration_ = values[6];
   terminal_stop_goal_capture_distance_ = values[7];
   terminal_stop_goal_capture_yaw_tolerance_ = values[8];
+  for (std::size_t index = 0u; index < critics_.size(); ++index) {
+    critics_[index]->setScale(critic_scales[index]);
+  }
   RCLCPP_INFO(
     logger_, "%s internal motion limits reloaded: v=%.6f w=%.6f a=%.6f aw=%.6f "
     "goal_radius=%.6f goal_yaw=%.6f",

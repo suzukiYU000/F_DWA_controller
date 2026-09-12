@@ -100,6 +100,51 @@ bool reference_zero_input_reaches_terminal(
   return false;
 }
 
+FeasibleInterval reference_one_tick_fir_interval(
+  const AxisState & state, const AxisLimits & limits,
+  const std::vector<double> & coefficients,
+  const std::vector<double> & history, const double dt, const int steps)
+{
+  // Brute-force two convolutions: q=0 throughout, and q=1 for one tick.
+  // Their difference is the affine response to the single committed input.
+  auto zero_history = history;
+  auto one_history = history;
+  double zero_velocity = state.velocity;
+  double one_velocity = state.velocity;
+  FeasibleInterval result;
+  result.lower = limits.native_input_min;
+  result.upper = limits.native_input_max;
+  auto constrain = [&result](double base, double slope, double low, double high) {
+      if (std::abs(slope) <= 1.0e-12) {
+        return base >= low - 1.0e-9 && base <= high + 1.0e-9;
+      }
+      double a = (low - base) / slope;
+      double b = (high - base) / slope;
+      if (a > b) {std::swap(a, b);}
+      result.lower = std::max(result.lower, a);
+      result.upper = std::min(result.upper, b);
+      return result.lower <= result.upper;
+    };
+  for (int index = 0; index < steps; ++index) {
+    const double one_input = index == 0 ? 1.0 : 0.0;
+    const double zero_acceleration = fir_acceleration(coefficients, zero_history, 0.0);
+    const double one_acceleration = fir_acceleration(coefficients, one_history, one_input);
+    zero_velocity += dt * zero_acceleration;
+    one_velocity += dt * one_acceleration;
+    if (!constrain(zero_acceleration, one_acceleration - zero_acceleration,
+        limits.acceleration_min, limits.acceleration_max) ||
+      !constrain(zero_velocity, one_velocity - zero_velocity,
+        limits.velocity_min, limits.velocity_max))
+    {
+      return result;
+    }
+    push_fir_input(zero_history, 0.0);
+    push_fir_input(one_history, one_input);
+  }
+  result.feasible = true;
+  return result;
+}
+
 StopSequence generate_reference_fir_stop_sequence(
   const AxisState & initial_state,
   const AxisLimits & limits,
@@ -169,7 +214,7 @@ StopSequence generate_reference_fir_stop_sequence(
       feasible_input.feasible = true;
     } else {
       feasible_input =
-        held_fir_input_interval(
+        reference_one_tick_fir_interval(
         state, stop_limits, coefficients, current_history,
         time_step, lookahead_steps);
     }
@@ -438,6 +483,77 @@ TEST(TerminalStopDynamics, JerkRandomizedStopsRetainTerminalState)
 
     SCOPED_TRACE(trial_index);
     expect_directional_bounds(sequence, positive_direction, limits);
+  }
+}
+
+TEST(TerminalStopDynamics, FirNinetyTwoTapsStopAfterOneCommittedInput)
+{
+  // Minimum-phase Hamming FIR: 20 Hz sampling, 3 Hz cutoff, design length 183.
+  // The old held-input certificate stalled at 0.2129688 m/s in this condition.
+  const std::vector<double> coefficients{
+    0.05692685418449837, 0.13430856494579593, 0.21965595248916325,
+    0.27334457901068065, 0.26194939481034824, 0.17918440614514183,
+    0.054721087062184544, -0.05836069067876422, -0.11207061978549453,
+    -0.09093800963272183, -0.020569254747264995, 0.04907963079601853,
+    0.07516913297991097, 0.04762324500887386, -0.0077580504583894,
+    -0.04987883075684019, -0.051488132626854415, -0.016452165627945672,
+    0.026070005177403682, 0.0447025263529043, 0.02852563172768648,
+    -0.006926994646468927, -0.033490883677996776, -0.032288889570255684,
+    -0.006874794883569318, 0.021242793241559865, 0.030575173263903164,
+    0.015671407812093214, -0.009902981379193121, -0.02554926444595089,
+    -0.020107448138431776, 0.0004255635806368002, 0.018890510195472207,
+    0.021098683420987956, 0.006653851786574757, -0.011821815579407466,
+    -0.019524229548184967, -0.011257925456603092, 0.005208930280832841,
+    0.016252393225560567, 0.013579961066115956, 0.0003803992392388165,
+    -0.012078316166259302, -0.013975119788112288, -0.004627739806774918,
+    0.007659305771770244, 0.012891405869304682, 0.007444124675457289,
+    -0.003522692228127822, -0.010801396321085321, -0.008887702760796604,
+    2.8677836656794727e-06, 0.008178800813094704, 0.009138167612370532,
+    0.0026985674878754534, -0.0053996465579810886, -0.00849696019315178,
+    -0.004493534177667877, 0.002790991417893663, 0.007224679101816603,
+    0.005453004715258049, -0.0005775814774452459, -0.005624546472445005,
+    -0.005676361293798506, -0.0011206846578592383, 0.003932939614576744,
+    0.005334083925058791, 0.0022769321398520416, -0.0023413942920398004,
+    -0.004622350476070083, -0.0029291170195433836, 0.0009926358269890163,
+    0.0037260147285057125, 0.003139305572020165, 4.881781527724068e-05,
+    -0.0027838033523059306, -0.0030289726173166644, -0.0007528125100271116,
+    0.0018971569831507966, 0.0027005137590718656, 0.0011723210499503004,
+    -0.0011539924179777348, -0.0022503944193074097, -0.0013609034466323428,
+    0.0005669471974272015, 0.001792965359275627, 0.0013706843679414436,
+    -0.0001515307494578204, -0.0013631129073628189, -0.0012751839533591206,
+    -0.00011744661018870412, 0.001000366922240639,
+  };
+  const AxisLimits limits{0.0, 1.5, -1.5, 1.5, -1.2, 1.2};
+  for (const double velocity : {0.0, 0.1, 0.2, 0.2129688127865, 0.3, 0.5, 1.0, 1.4}) {
+    for (const double input : {0.0, 0.24, 1.2}) {
+      SCOPED_TRACE(velocity);
+      SCOPED_TRACE(input);
+      std::vector<double> history(coefficients.size() - 1u, 0.0);
+      AxisState state{velocity + 0.05 * coefficients.front() * input,
+        coefficients.front() * input};
+      push_fir_input(history, input);
+      const StopSequence sequence = generate_fir_stop_sequence(
+        state, limits, coefficients, history, 0.05, 240, 0.01, true);
+      ASSERT_TRUE(sequence.feasible);
+      ASSERT_TRUE(sequence.terminal_state_cleared);
+      ASSERT_LE(sequence.states.size(), 240u);
+      for (std::size_t index = 0; index < sequence.states.size(); ++index) {
+        const double q = sequence.native_inputs[index];
+        EXPECT_LE(std::abs(q), 1.2);
+        state.acceleration = fir_acceleration(coefficients, history, q);
+        state.velocity += 0.05 * state.acceleration;
+        push_fir_input(history, q);
+        EXPECT_NEAR(state.acceleration, sequence.states[index].acceleration, 1.0e-12);
+        EXPECT_NEAR(state.velocity, sequence.states[index].velocity, 1.0e-12);
+        EXPECT_EQ(history, sequence.fir_histories[index]);
+        EXPECT_GE(state.velocity, -1.0e-12);
+        EXPECT_LE(state.velocity, 1.5 + 1.0e-12);
+        EXPECT_LE(std::abs(state.acceleration), 1.5 + 1.0e-12);
+      }
+      EXPECT_LE(std::abs(state.velocity), 0.01);
+      EXPECT_LE(std::abs(state.acceleration), 0.01);
+      for (const double value : history) {EXPECT_LE(std::abs(value), 0.01);}
+    }
   }
 }
 

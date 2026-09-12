@@ -28,6 +28,17 @@ void MeanSpeedCritic::onInit()
     node,
     dwb_plugin_name_ + "." + name_ + ".target_speed",
     rclcpp::ParameterValue(1.2));
+  reset();
+}
+
+void MeanSpeedCritic::reset()
+{
+  auto node = node_.lock();
+  if (!node) {
+    throw std::runtime_error{"Failed to lock node"};
+  }
+  // Motion-limit updates are applied at a stopped trial boundary. Refresh
+  // the target there so scoring needs no parameter lookup in the hot loop.
   node->get_parameter(
     dwb_plugin_name_ + "." + name_ + ".target_speed",
     target_speed_);
