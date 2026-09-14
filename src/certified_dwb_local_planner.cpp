@@ -179,6 +179,13 @@ std::string candidate_diagnostic_metadata(
          << ";linear_prediction_input_duration=" << value.linear_prediction_input_duration
          << ";angular_prediction_input_duration=" << value.angular_prediction_input_duration
          << ";uses_input_recovery=" << value.uses_recovery
+         << ";uses_equal_effect_max_duration=" << value.uses_equal_effect_max_duration
+         << ";linear_fractional_last_input=" << value.linear_fractional_last_input
+         << ";angular_fractional_last_input=" << value.angular_fractional_last_input
+         << ";linear_zero_input_duration_unbounded=" <<
+    value.linear_zero_input_duration_unbounded
+         << ";angular_zero_input_duration_unbounded=" <<
+    value.angular_zero_input_duration_unbounded
          << ";linear_recovery_input=" << value.linear_recovery_input
          << ";angular_recovery_input=" << value.angular_recovery_input
          << ";initial_linear_velocity=" << value.initial_linear_velocity
@@ -990,7 +997,8 @@ CertifiedDWBLocalPlanner::computeVelocityCommands(
       prepare_collision_footprints();
     }
     {
-      ScopedDuration planning_snapshot_duration(planning_metrics_enabled_, planning_snapshot_timing_);
+      ScopedDuration planning_snapshot_duration(planning_metrics_enabled_,
+        planning_snapshot_timing_);
       planning_snapshot_ = build_planning_snapshot(pose, velocity);
     }
     if (!planning_snapshot_->valid) {

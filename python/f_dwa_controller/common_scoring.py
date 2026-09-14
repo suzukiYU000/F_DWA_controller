@@ -6,7 +6,6 @@ ACTIVE_CRITICS = ('ObstacleFootprint', *SOFT_CRITICS)
 PHYSICAL_COLLISION_SCALE = 0.4
 
 
-
 def apply_compact_cost_policy(parameters):
     """Five soft costs, a physical collision gate, and native safe stopping."""
     oscillation_enabled = 'Oscillation' in parameters.get('critics', ())

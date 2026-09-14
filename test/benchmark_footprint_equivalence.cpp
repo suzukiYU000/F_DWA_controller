@@ -15,7 +15,12 @@
 
 namespace
 {
-using namespace f_dwa_controller;
+using f_dwa_controller::CertificationResult;
+using f_dwa_controller::CertificationWorkspace;
+using f_dwa_controller::HorizonObstacleFootprintCritic;
+using f_dwa_controller::certify_initial_overlap_margin_sequence;
+using f_dwa_controller::certify_pose_sequence;
+using f_dwa_controller::prepare_certification_broadphase;
 
 std::vector<geometry_msgs::msg::Point> footprint()
 {

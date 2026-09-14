@@ -552,7 +552,9 @@ TEST(TerminalStopDynamics, FirNinetyTwoTapsStopAfterOneCommittedInput)
       }
       EXPECT_LE(std::abs(state.velocity), 0.01);
       EXPECT_LE(std::abs(state.acceleration), 0.01);
-      for (const double value : history) {EXPECT_LE(std::abs(value), 0.01);}
+      for (const double value : history) {
+        EXPECT_LE(std::abs(value), 0.01);
+      }
     }
   }
 }

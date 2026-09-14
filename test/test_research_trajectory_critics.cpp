@@ -41,7 +41,7 @@ TEST(PathDeviationCritic, TerminalOvershootCoversPathCorridorOutsideGoalCircle)
 {
   class EndpointCritic : public f_dwa_controller::PathDeviationCritic
   {
-  public:
+public:
     EndpointCritic() {maximum_path_distance_ = 1.0;}
   } critic;
   nav_2d_msgs::msg::Path2D path;
@@ -498,97 +498,97 @@ public:
 
   // Frozen pre-optimization reference; compare full geometry below.
   double referenceClearance(
-  const geometry_msgs::msg::Pose2D & pose) const
-{
-  if (!costmap_ || footprint_boundary_samples_.empty() ||
-    obstacle_distance_field_.size() !=
-    static_cast<std::size_t>(costmap_->getSizeInCellsX()) *
-    static_cast<std::size_t>(costmap_->getSizeInCellsY()) ||
-    !std::isfinite(pose.x) || !std::isfinite(pose.y) ||
-    !std::isfinite(pose.theta))
+    const geometry_msgs::msg::Pose2D & pose) const
   {
-    return 0.0;
-  }
-  const double resolution = costmap_->getResolution();
-  if (!std::isfinite(resolution) || resolution <= 0.0) {
-    return 0.0;
-  }
-  const double obstacle_cell_radius = std::sqrt(0.5) * resolution;
-  const double probe_gap_radius = 0.5 * maximum_footprint_probe_gap_;
-  const double origin_x = costmap_->getOriginX();
-  const double origin_y = costmap_->getOriginY();
-  const unsigned int size_x = costmap_->getSizeInCellsX();
-  const double maximum_x = origin_x +
-    static_cast<double>(size_x) * resolution;
-  const double maximum_y = origin_y +
-    static_cast<double>(costmap_->getSizeInCellsY()) * resolution;
-  const double cosine = std::cos(pose.theta);
-  const double sine = std::sin(pose.theta);
-  double minimum_clearance = std::numeric_limits<double>::infinity();
-  for (const auto & point : footprint_boundary_samples_) {
-    const double world_x = pose.x + point.x * cosine - point.y * sine;
-    const double world_y = pose.y + point.x * sine + point.y * cosine;
-    minimum_clearance = std::min(
-      minimum_clearance,
-      std::min({
-        world_x - origin_x, maximum_x - world_x,
-        world_y - origin_y, maximum_y - world_y}));
-    if (minimum_clearance <= 0.0) {
-      // Preserve the signed map-boundary penetration for directional recovery
-      // ranking. Ordinary soft scoring below still saturates at one.
-      return minimum_clearance;
-    }
-    unsigned int cell_x = 0u;
-    unsigned int cell_y = 0u;
-    if (!costmap_->worldToMap(world_x, world_y, cell_x, cell_y)) {
+    if (!costmap_ || footprint_boundary_samples_.empty() ||
+      obstacle_distance_field_.size() !=
+      static_cast<std::size_t>(costmap_->getSizeInCellsX()) *
+      static_cast<std::size_t>(costmap_->getSizeInCellsY()) ||
+      !std::isfinite(pose.x) || !std::isfinite(pose.y) ||
+      !std::isfinite(pose.theta))
+    {
       return 0.0;
     }
+    const double resolution = costmap_->getResolution();
+    if (!std::isfinite(resolution) || resolution <= 0.0) {
+      return 0.0;
+    }
+    const double obstacle_cell_radius = std::sqrt(0.5) * resolution;
+    const double probe_gap_radius = 0.5 * maximum_footprint_probe_gap_;
+    const double origin_x = costmap_->getOriginX();
+    const double origin_y = costmap_->getOriginY();
+    const unsigned int size_x = costmap_->getSizeInCellsX();
+    const double maximum_x = origin_x +
+      static_cast<double>(size_x) * resolution;
+    const double maximum_y = origin_y +
+      static_cast<double>(costmap_->getSizeInCellsY()) * resolution;
+    const double cosine = std::cos(pose.theta);
+    const double sine = std::sin(pose.theta);
+    double minimum_clearance = std::numeric_limits<double>::infinity();
+    for (const auto & point : footprint_boundary_samples_) {
+      const double world_x = pose.x + point.x * cosine - point.y * sine;
+      const double world_y = pose.y + point.x * sine + point.y * cosine;
+      minimum_clearance = std::min(
+      minimum_clearance,
+      std::min({
+          world_x - origin_x, maximum_x - world_x,
+          world_y - origin_y, maximum_y - world_y}));
+      if (minimum_clearance <= 0.0) {
+      // Preserve the signed map-boundary penetration for directional recovery
+      // ranking. Ordinary soft scoring below still saturates at one.
+        return minimum_clearance;
+      }
+      unsigned int cell_x = 0u;
+      unsigned int cell_y = 0u;
+      if (!costmap_->worldToMap(world_x, world_y, cell_x, cell_y)) {
+        return 0.0;
+      }
     // Interpolate conservative bounds, not the EDT alone. Each corner's
     // D(c) - |p-c| is a lower bound at p by the 1-Lipschitz property. Their
     // convex combination stays conservative and is continuous across cell
     // boundaries, unlike choosing only the cell containing p.
-    const double grid_x = std::clamp(
-      (world_x - origin_x) / resolution - 0.5,
+      const double grid_x = std::clamp(
+        (world_x - origin_x) / resolution - 0.5,
       0.0, static_cast<double>(size_x - 1u));
-    const double grid_y = std::clamp(
-      (world_y - origin_y) / resolution - 0.5,
+      const double grid_y = std::clamp(
+        (world_y - origin_y) / resolution - 0.5,
       0.0, static_cast<double>(costmap_->getSizeInCellsY() - 1u));
-    const unsigned int x0 = static_cast<unsigned int>(std::floor(grid_x));
-    const unsigned int y0 = static_cast<unsigned int>(std::floor(grid_y));
-    const unsigned int x1 = std::min(x0 + 1u, size_x - 1u);
-    const unsigned int y1 = std::min(y0 + 1u, costmap_->getSizeInCellsY() - 1u);
-    const double fraction_x = grid_x - static_cast<double>(x0);
-    const double fraction_y = grid_y - static_cast<double>(y0);
-    double interpolated_lower_bound = 0.0;
-    for (unsigned int row = 0u; row < 2u; ++row) {
-      for (unsigned int column = 0u; column < 2u; ++column) {
-        const double weight =
-          (column == 0u ? 1.0 - fraction_x : fraction_x) *
-          (row == 0u ? 1.0 - fraction_y : fraction_y);
-        if (weight <= 0.0) {
-          continue;
+      const unsigned int x0 = static_cast<unsigned int>(std::floor(grid_x));
+      const unsigned int y0 = static_cast<unsigned int>(std::floor(grid_y));
+      const unsigned int x1 = std::min(x0 + 1u, size_x - 1u);
+      const unsigned int y1 = std::min(y0 + 1u, costmap_->getSizeInCellsY() - 1u);
+      const double fraction_x = grid_x - static_cast<double>(x0);
+      const double fraction_y = grid_y - static_cast<double>(y0);
+      double interpolated_lower_bound = 0.0;
+      for (unsigned int row = 0u; row < 2u; ++row) {
+        for (unsigned int column = 0u; column < 2u; ++column) {
+          const double weight =
+            (column == 0u ? 1.0 - fraction_x : fraction_x) *
+            (row == 0u ? 1.0 - fraction_y : fraction_y);
+          if (weight <= 0.0) {
+            continue;
+          }
+          const unsigned int x = column == 0u ? x0 : x1;
+          const unsigned int y = row == 0u ? y0 : y1;
+          const double distance = obstacle_distance_field_[
+            static_cast<std::size_t>(y) * size_x + x];
+          const double centre_x = origin_x + (static_cast<double>(x) + 0.5) * resolution;
+          const double centre_y = origin_y + (static_cast<double>(y) + 0.5) * resolution;
+          const double delta_x = world_x - centre_x;
+          const double delta_y = world_y - centre_y;
+          interpolated_lower_bound += weight *
+            (distance - std::sqrt(delta_x * delta_x + delta_y * delta_y));
         }
-        const unsigned int x = column == 0u ? x0 : x1;
-        const unsigned int y = row == 0u ? y0 : y1;
-        const double distance = obstacle_distance_field_[
-          static_cast<std::size_t>(y) * size_x + x];
-        const double centre_x = origin_x + (static_cast<double>(x) + 0.5) * resolution;
-        const double centre_y = origin_y + (static_cast<double>(y) + 0.5) * resolution;
-        const double delta_x = world_x - centre_x;
-        const double delta_y = world_y - centre_y;
-        interpolated_lower_bound += weight *
-          (distance - std::sqrt(delta_x * delta_x + delta_y * delta_y));
       }
+      const double conservative_clearance = interpolated_lower_bound -
+        obstacle_cell_radius - probe_gap_radius;
+      minimum_clearance = std::min(minimum_clearance, conservative_clearance);
     }
-    const double conservative_clearance = interpolated_lower_bound -
-      obstacle_cell_radius - probe_gap_radius;
-    minimum_clearance = std::min(minimum_clearance, conservative_clearance);
-  }
   // Keep the conservative lower bound signed. This lets exceptional recovery
   // selection distinguish moving farther into the reserve from moving out of
   // it even while the bounded soft penalty is saturated at one.
-  return minimum_clearance;
-}
+    return minimum_clearance;
+  }
 
   double poseScore(const geometry_msgs::msg::Pose2D & pose) const
   {
@@ -952,10 +952,11 @@ TEST(PathSegmentBounds, BlockPruningMatchesOriginalSegmentScanIncludingTiesAndHi
 {
   class DistanceOracle : public f_dwa_controller::PathDeviationCritic
   {
-  public:
+public:
     using PathDeviationCritic::distanceToPath;
     std::size_t size() const {return path_segments_.size();}
-    double brute(const geometry_msgs::msg::Pose2D & pose,
+    double brute(
+      const geometry_msgs::msg::Pose2D & pose,
       std::size_t & hint, double sufficient) const
     {
       hint = std::min(hint, size() - 1u);
@@ -968,9 +969,9 @@ TEST(PathSegmentBounds, BlockPruningMatchesOriginalSegmentScanIncludingTiesAndHi
         // Evaluating an endpoint by interpolation can round differently from
         // its exact box edge and change an otherwise equal-distance hint.
         const double box_dx = std::max({segment.minimum_x - pose.x, 0.0,
-          pose.x - segment.maximum_x});
+              pose.x - segment.maximum_x});
         const double box_dy = std::max({segment.minimum_y - pose.y, 0.0,
-          pose.y - segment.maximum_y});
+              pose.y - segment.maximum_y});
         if (box_dx * box_dx + box_dy * box_dy >= best) {continue;}
         const double fraction = std::clamp(
           ((pose.x - segment.start_x) * segment.delta_x +
@@ -987,9 +988,10 @@ TEST(PathSegmentBounds, BlockPruningMatchesOriginalSegmentScanIncludingTiesAndHi
   } distance;
   class ProgressOracle : public f_dwa_controller::TrajectoryProgressCritic
   {
-  public:
+public:
     using TrajectoryProgressCritic::projectOntoPath;
-    PathProjection brute(const geometry_msgs::msg::Pose2D & pose,
+    PathProjection brute(
+      const geometry_msgs::msg::Pose2D & pose,
       std::size_t & hint) const
     {
       double best = std::numeric_limits<double>::infinity(), progress = 0.0;
@@ -1000,9 +1002,9 @@ TEST(PathSegmentBounds, BlockPruningMatchesOriginalSegmentScanIncludingTiesAndHi
         if (offset != 0u && index == first) {continue;}
         const auto & segment = path_segments_[index];
         const double box_dx = std::max({segment.minimum_x - pose.x, 0.0,
-          pose.x - segment.maximum_x});
+              pose.x - segment.maximum_x});
         const double box_dy = std::max({segment.minimum_y - pose.y, 0.0,
-          pose.y - segment.maximum_y});
+              pose.y - segment.maximum_y});
         const double lower = box_dx * box_dx + box_dy * box_dy;
         if (lower > best || (lower == best && index >= hint)) {continue;}
         const double fraction = std::clamp(
@@ -1106,7 +1108,7 @@ TEST(PathDeviationCritic, CompactPathCostHasToleranceAndContinuousCorridorPenalt
 {
   class CompactCritic : public f_dwa_controller::PathDeviationCritic
   {
-  public:
+public:
     CompactCritic()
     {
       maximum_path_distance_ = 1.0;
@@ -1452,6 +1454,37 @@ TEST(FootprintClearanceCritic, NativeTimeDoesNotProjectBackToBlockedPath)
   const auto executable_prefix_stays_clear = trajectory_to(0.5, 1.0);
   EXPECT_DOUBLE_EQ(
     critic.scoreTrajectory(executable_prefix_stays_clear), 0.0);
+}
+
+TEST(FootprintClearanceCritic, NativeTimeScoresConfiguredPredictionRange)
+{
+  StubFootprintClearanceCritic critic;
+  critic.setFixedClearance(0.1);
+  critic.setRiskPath(2.5, 5);
+  critic.setRiskSeedTime(2.5);
+  critic.setRiskPathMode("native_time");
+
+  double reference_score = std::numeric_limits<double>::quiet_NaN();
+  for (const double prediction_time : {0.5, 2.0, 2.4, 2.5, 4.0}) {
+    const auto prediction = trajectory_to(1.0, prediction_time);
+    const auto & risk_path = critic.buildRiskPath(prediction);
+    ASSERT_EQ(risk_path.size(), 2u) << "prediction_time=" << prediction_time;
+    EXPECT_DOUBLE_EQ(risk_path.front().arc_length, 0.0);
+    EXPECT_NEAR(
+      risk_path.back().arc_length, std::min(prediction_time, 2.5), 1.0e-12);
+
+    const double score = critic.scoreTrajectory(prediction);
+    EXPECT_TRUE(std::isfinite(score));
+    EXPECT_GT(score, 0.0);
+    EXPECT_LE(score, 1.0);
+    if (!std::isfinite(reference_score)) {
+      reference_score = score;
+    } else {
+      // A constant-clearance trajectory has the same mean exposure even when
+      // only the available prefix is shorter than risk_seed_time.
+      EXPECT_NEAR(score, reference_score, 1.0e-12);
+    }
+  }
 }
 
 TEST(FootprintClearanceCritic, ReportsApproachWithoutPenalizingParallelRisk)
@@ -1844,9 +1877,9 @@ TEST(FootprintClearanceCritic, ClearanceLowerBoundHoldsForDisjointFootprints)
       // Exact distance between the axis-aligned physical square and the
       // occupied square [0.95, 1.00] x [0.35, 0.40].
       const double dx = std::max({0.95 - (pose.x + 0.20),
-          pose.x - 0.20 - 1.00, 0.0});
+            pose.x - 0.20 - 1.00, 0.0});
       const double dy = std::max({0.35 - (pose.y + 0.20),
-          pose.y - 0.20 - 0.40, 0.0});
+            pose.y - 0.20 - 0.40, 0.0});
       if (dx == 0.0 && dy == 0.0) {
         // This critic measures boundary distance. Occupied cells enclosed by
         // the body require the independent collision gate, not a distance

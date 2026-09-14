@@ -73,8 +73,13 @@ public:
     double initial_linear_acceleration{0.0};
     double initial_angular_acceleration{0.0};
     bool uses_recovery{false};
+    bool uses_equal_effect_max_duration{false};
     double linear_recovery_input{0.0};
     double angular_recovery_input{0.0};
+    double linear_fractional_last_input{0.0};
+    double angular_fractional_last_input{0.0};
+    bool linear_zero_input_duration_unbounded{false};
+    bool angular_zero_input_duration_unbounded{false};
     NativeCommandState first_command_state;
   };
 
@@ -200,11 +205,16 @@ protected:
   struct AxisRollout
   {
     bool uses_recovery{false};
+    bool uses_equal_effect_max_duration{false};
     double recovery_input{0.0};
     int prediction_input_steps{0};
+    double prediction_input_duration{0.0};
+    double fractional_last_input{0.0};
+    bool zero_input_duration_unbounded{false};
     std::vector<AxisState> states;
     std::vector<double> first_fir_history;
     double native_input{0.0};
+    double first_native_input{0.0};
     bool valid{false};
     std::shared_ptr<AxisStopData> stop_data;
     mutable AngularPoseIntegrationCache pose_integration_cache;
@@ -291,9 +301,11 @@ private:
   double maximum_linear_raw_input_{1.2};
   double maximum_angular_raw_input_{1.57};
   double fir_cutoff_frequency_hz_{1.2};
+  std::string fir_filter_specification_;
   double fir_prediction_pulse_duration_{0.0};
   std::vector<double> fir_prediction_pulse_durations_;
   bool fir_independent_pulse_durations_{false};
+  bool fir_equal_effect_max_duration_sampling_{false};
   bool native_input_recovery_{false};
   double native_input_pulse_duration_{0.0};
   double stop_capture_velocity_{0.01};

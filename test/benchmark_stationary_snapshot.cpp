@@ -336,7 +336,7 @@ int main(int argc, char ** argv)
       planner->configure(parent, "f_dwa", tf, costmap);
       planner->activate();
       for (const auto & key : {"vx_samples", "vtheta_samples", "fir_prediction_pulse_duration",
-        "fir_prediction_pulse_durations", "fir_independent_pulse_durations", "sim_time"})
+          "fir_prediction_pulse_durations", "fir_independent_pulse_durations", "sim_time"})
       {
         const auto parameter = parent->get_parameter(std::string("f_dwa.") + key);
         std::cout << "READBACK " << parameter.get_name() << ": " <<

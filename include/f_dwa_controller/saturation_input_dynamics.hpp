@@ -1,5 +1,12 @@
+// Copyright 2026 YT Lab
+// SPDX-License-Identifier: MIT
+
 #ifndef F_DWA_CONTROLLER__SATURATION_INPUT_DYNAMICS_HPP_
 #define F_DWA_CONTROLLER__SATURATION_INPUT_DYNAMICS_HPP_
+
+#include <algorithm>
+#include <utility>
+#include <vector>
 
 #include "f_dwa_controller/recovery_input_dynamics.hpp"
 
@@ -70,7 +77,9 @@ inline std::vector<double> sample_input_intervals(
   if (intervals.empty() || count < 1) {return {};}
   if (intervals.size() == 1) {return uniform_samples(intervals.front(), count);}
   double width = 0.;
-  for (const auto & interval : intervals) {width += interval.upper - interval.lower;}
+  for (const auto & interval : intervals) {
+    width += interval.upper - interval.lower;
+  }
   std::vector<double> samples;
   for (int i = 0; i < count; ++i) {
     if (i == 0) {samples.push_back(intervals.front().lower); continue;}
@@ -127,7 +136,8 @@ inline RecoveryRollout longest_jerk_recovery(
 {
   RecoveryRollout result;
   if (!std::isfinite(input) || input < limits.native_input_min - 1e-12 ||
-    input > limits.native_input_max + 1e-12 || !std::isfinite(dt) || dt <= 0. || horizon < 2) {
+    input > limits.native_input_max + 1e-12 || !std::isfinite(dt) || dt <= 0. || horizon < 2)
+  {
     return result;
   }
   AxisState state = initial;
@@ -206,7 +216,8 @@ inline ZeroFirResponse prepare_zero_fir_response(
 {
   ZeroFirResponse result;
   if (coefficients.empty() || initial_history.size() + 1 != coefficients.size() ||
-    !std::isfinite(initial.velocity) || !std::isfinite(dt) || dt <= 0. || horizon < 1) {
+    !std::isfinite(initial.velocity) || !std::isfinite(dt) || dt <= 0. || horizon < 1)
+  {
     return result;
   }
   result.horizon = horizon;
@@ -275,12 +286,16 @@ inline InputStepInterval zero_fir_velocity_steps(
     const double lower = std::min(first, second), upper = std::max(first, second);
     if (lower > r || upper < 0.) {return {};}
     if (lower > 0.) {
-      const auto at = std::lower_bound(response.integrated.begin(), response.integrated.end(), lower);
-      interval.upper = std::min(interval.upper, k - static_cast<int>(at - response.integrated.begin()));
+      const auto at = std::lower_bound(response.integrated.begin(), response.integrated.end(),
+          lower);
+      interval.upper = std::min(interval.upper,
+          k - static_cast<int>(at - response.integrated.begin()));
     }
     if (upper < r) {
-      const auto at = std::upper_bound(response.integrated.begin(), response.integrated.end(), upper);
-      interval.lower = std::max(interval.lower, k - static_cast<int>(at - response.integrated.begin()) + 1);
+      const auto at = std::upper_bound(response.integrated.begin(), response.integrated.end(),
+          upper);
+      interval.lower = std::max(interval.lower,
+          k - static_cast<int>(at - response.integrated.begin()) + 1);
     }
     if (interval.lower > interval.upper) {return {};}
   }

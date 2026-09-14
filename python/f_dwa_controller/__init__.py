@@ -25,10 +25,13 @@ from pkgutil import extend_path
 __path__ = extend_path(__path__, __name__)
 
 from .fir_filter_design import (
+    canonical_filter_specification,
     coefficient_fingerprint,
     design_fir_coefficients,
+    design_fir_coefficients_for_specification,
     design_fir_coefficients_from_spec,
     DesignReport,
+    filter_design_for_specification,
     FirFilterDesign,
     inject_fir_coefficients,
 )
@@ -36,8 +39,11 @@ from .fir_filter_design import (
 __all__ = [
     'DesignReport',
     'FirFilterDesign',
+    'canonical_filter_specification',
     'coefficient_fingerprint',
     'design_fir_coefficients',
+    'design_fir_coefficients_for_specification',
     'design_fir_coefficients_from_spec',
+    'filter_design_for_specification',
     'inject_fir_coefficients',
 ]

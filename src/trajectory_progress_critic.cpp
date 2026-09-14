@@ -156,7 +156,7 @@ TrajectoryProgressCritic::projectOntoPath(
 
   segment_hint = std::min(segment_hint, path_segments_.size() - 1u);
   consider_segment(segment_hint);
-  for (std::size_t first = 0u; first < path_segments_.size();) {
+  for (std::size_t first = 0u; first < path_segments_.size(); ) {
     const auto & block = path_segment_bounds_[first / kPathSegmentBlockSize];
     const double lower_bound = block.squaredDistance(pose.x, pose.y);
     if (lower_bound > nearest_squared_distance ||

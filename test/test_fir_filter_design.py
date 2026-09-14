@@ -22,14 +22,18 @@ from copy import deepcopy
 from pathlib import Path
 
 from f_dwa_controller.fir_filter_design import (
+    canonical_filter_specification,
     coefficient_fingerprint,
     design_fir_coefficients,
     design_fir_coefficients_for_cutoff,
+    design_fir_coefficients_for_specification,
     design_fir_coefficients_from_spec,
+    filter_design_for_specification,
     FirFilterDesign,
     inject_fir_coefficients,
 )
 import pytest
+from scipy import signal
 import yaml
 
 
@@ -132,6 +136,78 @@ def test_attenuation_bands_can_be_defined_in_python():
     assert sum(coefficients) == pytest.approx(1.0, abs=1.0e-12)
 
 
+@pytest.mark.parametrize(
+    ('specification', 'mode', 'cutoff_hz', 'bands', 'canonical'),
+    [
+        ('1.0', 'lowpass', 1.0, (), '1'),
+        ('[0.8, 1.6]', 'bandstop', None, ((0.8, 1.6),), '[0.8, 1.6]'),
+        (
+            '[0.8, 1.6], [2.0, inf]',
+            'bandstop',
+            None,
+            ((0.8, 1.6), (2.0, float('inf'))),
+            '[0.8, 1.6], [2, inf]',
+        ),
+    ],
+)
+def test_operator_filter_specification_is_parsed_and_canonicalized(
+    specification, mode, cutoff_hz, bands, canonical,
+):
+    design = filter_design_for_specification(specification)
+
+    assert design.mode == mode
+    assert design.cutoff_hz == cutoff_hz
+    assert design.attenuation_bands_hz == bands
+    assert canonical_filter_specification(design) == canonical
+
+
+@pytest.mark.parametrize(
+    'specification',
+    [
+        '', 'inf', '[0.8]', '[0.8, 1.6] [2.0, inf]',
+        '[0, 1.0]', '[1.6, 0.8]', '[0.8, 1.6], [1.5, 2.0]',
+        '[0.8, inf], [2.0, 3.0]', '[0.8, 10.0]', '[10.0, inf]',
+    ],
+)
+def test_invalid_operator_filter_specification_is_rejected(specification):
+    with pytest.raises(ValueError):
+        filter_design_for_specification(specification)
+
+
+def test_open_ended_attenuation_band_generates_unit_dc_gain_coefficients():
+    coefficients = design_fir_coefficients_for_specification(
+        '[0.8, 1.6], [2.0, inf]'
+    )
+
+    assert len(coefficients) == 46
+    assert sum(coefficients) == pytest.approx(1.0, abs=1.0e-12)
+    _, response = signal.freqz(
+        coefficients,
+        worN=[0.2, 1.2, 3.0, 8.0],
+        fs=20.0,
+    )
+    assert abs(response[0]) > 0.9
+    assert all(abs(value) < 0.03 for value in response[1:])
+
+
+def test_operator_attenuation_bands_are_injected_as_auditable_metadata():
+    parameters = _load_f_dwa_parameters()
+    active = parameters['controller_server']['ros__parameters']['FollowPath']
+    active.pop('fir_cutoff_frequency_hz')
+    active['fir_filter_specification'] = '[0.8, 1.6], [2.0, inf]'
+
+    report = inject_fir_coefficients(parameters)
+
+    assert report.mode == 'bandstop'
+    assert report.cutoff_hz is None
+    assert report.attenuation_bands_hz == (
+        (0.8, 1.6), (2.0, float('inf')),
+    )
+    assert active['fir_filter_specification'] == '[0.8, 1.6], [2, inf]'
+    assert 'fir_cutoff_frequency_hz' not in active
+    assert len(active['fir_coefficients']) == 46
+
+
 def test_each_startup_regenerates_the_current_numeric_cutoff():
     first_parameters = _load_f_dwa_parameters()
     first_report = inject_fir_coefficients(first_parameters)
@@ -170,7 +246,9 @@ def test_double_effective_taps_are_regenerated_with_unit_dc_gain(cutoff):
     assert report.effective_taps == active['fir_effective_taps'] == 92
     assert len(active['fir_coefficients']) == 92
     assert sum(active['fir_coefficients']) == pytest.approx(1.0, abs=1e-12)
-    assert report.fingerprint != coefficient_fingerprint(design_fir_coefficients_for_cutoff(cutoff))
+    assert report.fingerprint != coefficient_fingerprint(
+        design_fir_coefficients_for_cutoff(cutoff)
+    )
 
 
 @pytest.mark.parametrize('taps', [0, 1, -46, 46.5, '92', True])

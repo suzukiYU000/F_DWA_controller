@@ -90,7 +90,9 @@ margin and move outward remain pending and are disabled by default.
 F-DWA defaults to a numeric 1.2 Hz low-pass cutoff, which preserves the ROS 1
 F-8 design. Its coefficients are generated deterministically by Python before
 Nav2 starts, so no source YAML contains a coefficient vector. The GUI accepts
-the cutoff in Hz; the established tap count and 20 Hz design rate stay fixed.
+a single cutoff number for a low-pass, or ordered attenuation bands such as
+`[0.8, 1.6], [2.0, inf]`; `inf` means through the 10 Hz Nyquist frequency.
+The selected effective tap count and 20 Hz design rate stay fixed.
 The nominal F-DWA rollout uses a two-control-cycle finite-pulse action
 primitive: the sampled raw input is active for 0.10 s and is then zero for the
 remainder of the scoring horizon. This is the shortest 20 Hz pulse that
@@ -145,6 +147,35 @@ Long pulses can overpredict a turn that repeated replanning defers. This option
 therefore remains disabled in the default experiment configuration until
 closed-loop tests establish progress, clearance, and timing. Treat it as a
 separate F-DWA sampling ablation, not an unlabelled V/A/J/F comparison.
+
+### Equal-effect, maximum-duration sampling (opt-in method C)
+
+`FollowPath.fir_equal_effect_max_duration_sampling: true` enables the
+simulation research condition labelled method C. For every raw-input
+amplitude `q`, it finds the longest full-tail-feasible pulse
+`q,...,q,beta*q,0,...` and measures the signed displacement over the nominal
+horizon. Sampling uses two stages. For 11 linear samples it first evaluates 6
+uniform `q` values, then assigns the remaining 5 evaluations greedily to the
+coarse interval with the largest predicted effect gap
+`abs(s[i+1]-s[i]) / (k[i]+1)`. The assigned points divide that `q` interval
+uniformly. The 15 angular samples use the same 8+7 split. Thus the two axes
+require exactly 11+15=26 pulse evaluations before their Cartesian product
+forms 165 trajectories.
+
+This bounded allocation approximates equal effect spacing from the coarse
+secants; it does not invert exact effect targets or search for unobserved
+branches. The coarse even-sized grids do not contain `q=0`, and the refinement
+allocation may or may not place a point there. Both configured sample counts
+remain odd so that the two stages have `ceil(n/2)` coarse and `floor(n/2)`
+refined evaluations.
+
+This mode cannot be combined with recovery, extra pulse-duration banks, or
+independent linear/angular duration pairing. Candidate metadata records the
+fractional last input, exact equivalent duration, and, when sampled, the
+unbounded-duration label for `q=0`. If any of the 26 axis evaluations is
+infeasible, the generator emits a throttled warning and uses the configured
+fixed-duration bank for that iteration. The option is off by default and is
+not evidence of closed-loop or real-WHILL superiority.
 
 The opt-in `DISABLED_FirSamplingBenchmark` gtest compares the baseline,
 495-duration, 1767-amplitude, 1827-hybrid, 1485/2079-independent, and
@@ -205,10 +236,11 @@ minimum-phase conversion. F-8 retains its historical 20 Hz design frequency,
 which also matches the common Nav2 Controller Server frequency. A design using
 a different frequency must receive a new name for experiment traceability.
 
-Every F-DWA research-launch startup regenerates the selected numeric design. No
+Every F-DWA research-launch startup regenerates the selected filter design. No
 coefficient cache or previous temporary parameter file is reused. Coefficients
 remain frozen for the complete run. Between runs, the experiment GUI may set
-the cutoff, coefficients, and generated marker atomically; the trial-reset
+the canonical filter specification, coefficients, and generated marker
+atomically; the trial-reset
 boundary then adopts them while no candidate evaluation or motion is active.
 
 ## Continuous simulation batches

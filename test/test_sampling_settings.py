@@ -1,8 +1,10 @@
 import copy
 
+from f_dwa_controller.sampling_settings import (
+    normalize_dwa_sampling,
+    normalize_fir_sampling,
+)
 import pytest
-
-from f_dwa_controller.sampling_settings import normalize_dwa_sampling, normalize_fir_sampling
 
 
 def test_common_grid_is_validated_without_mutation():
@@ -31,6 +33,7 @@ def bank():
         'vtheta_samples': 19,
         'fir_prediction_pulse_durations': [0.2],
         'fir_independent_pulse_durations': False,
+        'fir_equal_effect_max_duration_sampling': False,
     }
 
 
@@ -51,6 +54,7 @@ def test_deduplicates_full_horizon_and_control_ticks():
 @pytest.mark.parametrize('key,value', [
     ('vx_samples', 0), ('vx_samples', 13.5), ('vx_samples', True),
     ('vtheta_samples', -1), ('fir_independent_pulse_durations', 'false'),
+    ('fir_equal_effect_max_duration_sampling', 'true'),
     ('fir_prediction_pulse_durations', '0.2'),
     ('fir_prediction_pulse_durations', [float('nan')]),
     ('fir_prediction_pulse_durations', [float('inf')]),
@@ -75,3 +79,25 @@ def test_rejects_missing_or_unknown_keys(settings):
 def test_rejects_invalid_horizon(horizon):
     with pytest.raises(ValueError):
         normalize_fir_sampling(bank(), horizon)
+
+
+def test_equal_effect_sampling_requires_odd_single_bank():
+    settings = bank()
+    settings.update({
+        'vx_samples': 11,
+        'vtheta_samples': 15,
+        'fir_prediction_pulse_durations': [],
+        'fir_equal_effect_max_duration_sampling': True,
+    })
+    result = normalize_fir_sampling(settings, 2.5)
+    assert result['fir_equal_effect_max_duration_sampling'] is True
+    for key, value in (
+        ('vx_samples', 10),
+        ('vtheta_samples', 14),
+        ('fir_prediction_pulse_durations', [0.2]),
+        ('fir_independent_pulse_durations', True),
+    ):
+        invalid = dict(settings)
+        invalid[key] = value
+        with pytest.raises(ValueError):
+            normalize_fir_sampling(invalid, 2.5)

@@ -15,26 +15,38 @@ def normalize_dwa_sampling(settings):
 
 
 def normalize_fir_sampling(settings, prediction_time, control_period=0.05):
-    """Validate a bank and cap extra pulses to the actual rollout horizon.
+    """
+    Validate a bank and cap extra pulses to the actual rollout horizon.
 
     Zero denotes a full-horizon raw-input pulse, not a zero output command.
     The scalar pulse is kept separately by the generator and always comes first.
     """
-    keys = {
+    required_keys = {
         'vx_samples', 'vtheta_samples', 'fir_prediction_pulse_durations',
         'fir_independent_pulse_durations',
     }
-    if not isinstance(settings, dict) or set(settings) != keys:
-        raise ValueError('F-DWA sampling must specify exactly ' + ', '.join(sorted(keys)))
+    optional_keys = {'fir_equal_effect_max_duration_sampling'}
+    if (not isinstance(settings, dict)
+            or not required_keys.issubset(settings)
+            or not set(settings).issubset(required_keys | optional_keys)):
+        raise ValueError(
+            'F-DWA sampling must specify ' + ', '.join(sorted(required_keys))
+            + '; optional: ' + ', '.join(sorted(optional_keys))
+        )
     if (not math.isfinite(prediction_time) or prediction_time <= 0.0
             or not math.isfinite(control_period) or control_period <= 0.0):
         raise ValueError('F-DWA sampling requires a positive finite horizon and period')
     result = dict(settings)
+    result.setdefault('fir_equal_effect_max_duration_sampling', False)
     for key in ('vx_samples', 'vtheta_samples'):
         if type(result[key]) is not int or result[key] < 1:
             raise ValueError(f'F-DWA {key} must be a positive integer')
     if type(result['fir_independent_pulse_durations']) is not bool:
         raise ValueError('F-DWA fir_independent_pulse_durations must be boolean')
+    if type(result['fir_equal_effect_max_duration_sampling']) is not bool:
+        raise ValueError(
+            'F-DWA fir_equal_effect_max_duration_sampling must be boolean'
+        )
     durations = result['fir_prediction_pulse_durations']
     if not isinstance(durations, list):
         raise ValueError('F-DWA fir_prediction_pulse_durations must be a list')
@@ -51,4 +63,15 @@ def normalize_fir_sampling(settings, prediction_time, control_period=0.05):
         if effective not in normalized:
             normalized.append(effective)
     result['fir_prediction_pulse_durations'] = normalized
+    if result['fir_equal_effect_max_duration_sampling']:
+        if (result['vx_samples'] % 2 == 0
+                or result['vtheta_samples'] % 2 == 0):
+            raise ValueError(
+                'Equal-effect F-DWA sampling requires odd axis sample counts'
+            )
+        if normalized or result['fir_independent_pulse_durations']:
+            raise ValueError(
+                'Equal-effect F-DWA sampling uses one per-axis duration and '
+                'cannot be combined with a duration bank'
+            )
     return result

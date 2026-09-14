@@ -1,9 +1,13 @@
+// Copyright 2026 YT Lab
+// SPDX-License-Identifier: MIT
+
 // Simulation research extension. Uses the same scalar model and limits as J/F.
 #ifndef F_DWA_CONTROLLER__RECOVERY_INPUT_DYNAMICS_HPP_
 #define F_DWA_CONTROLLER__RECOVERY_INPUT_DYNAMICS_HPP_
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 #include <vector>
 
 #include "f_dwa_controller/fir_input_dynamics.hpp"
@@ -44,14 +48,15 @@ inline FeasibleInterval jerk_recovery_input_interval(
     const double duration = m * dt;
     const double velocity_gain = dt * (m + 1) / 2.0;
     const double a_lower = std::max(-limits.native_input_max * duration,
-      (limits.velocity_min - initial.velocity) / velocity_gain);
+        (limits.velocity_min - initial.velocity) / velocity_gain);
     const double a_upper = std::min(-limits.native_input_min * duration,
-      (limits.velocity_max - initial.velocity) / velocity_gain);
+        (limits.velocity_max - initial.velocity) / velocity_gain);
     const double lower = std::max(first.lower, (a_lower - initial.acceleration) / dt);
     const double upper = std::min(first.upper, (a_upper - initial.acceleration) / dt);
     if (lower > upper) {continue;}
-    if (!result.feasible) {result = {lower, upper, true};}
-    else {result.lower = std::min(result.lower, lower); result.upper = std::max(result.upper, upper);}
+    if (!result.feasible) {result = {lower, upper, true};} else {
+      result.lower = std::min(result.lower, lower); result.upper = std::max(result.upper, upper);
+    }
   }
   return result;
 }
@@ -67,11 +72,11 @@ inline FeasibleInterval pulsed_jerk_input_interval(
     const double a_gain = m * dt;
     const double v_gain = dt * dt * (m * (m + 1.0) / 2.0 + m * (k - m));
     interval.lower = std::max({interval.lower,
-      (limits.acceleration_min - initial.acceleration) / a_gain,
-      (limits.velocity_min - initial.velocity - initial.acceleration * k * dt) / v_gain});
+          (limits.acceleration_min - initial.acceleration) / a_gain,
+          (limits.velocity_min - initial.velocity - initial.acceleration * k * dt) / v_gain});
     interval.upper = std::min({interval.upper,
-      (limits.acceleration_max - initial.acceleration) / a_gain,
-      (limits.velocity_max - initial.velocity - initial.acceleration * k * dt) / v_gain});
+          (limits.acceleration_max - initial.acceleration) / a_gain,
+          (limits.velocity_max - initial.velocity - initial.acceleration * k * dt) / v_gain});
     if (interval.lower > interval.upper) {return {};}
   }
   return interval;
@@ -208,23 +213,23 @@ inline FeasibleInterval fir_recovery_input_interval(
   const double lo = limits.native_input_min, hi = limits.native_input_max;
   std::vector<Point> polygon{{lo, lo}, {hi, lo}, {hi, hi}, {lo, hi}};
   const auto clip = [&](double q_gain, double r_gain, double bound) {
-    std::vector<Point> next;
-    if (polygon.empty()) {return;}
-    Point previous = polygon.back();
-    double previous_value = q_gain * previous.q + r_gain * previous.r - bound;
-    for (const auto & point : polygon) {
-      const double value = q_gain * point.q + r_gain * point.r - bound;
-      const bool inside = value <= 0.0, previous_inside = previous_value <= 0.0;
-      if (inside != previous_inside) {
-        const double fraction = previous_value / (previous_value - value);
-        next.push_back({previous.q + fraction * (point.q - previous.q),
-          previous.r + fraction * (point.r - previous.r)});
+      std::vector<Point> next;
+      if (polygon.empty()) {return;}
+      Point previous = polygon.back();
+      double previous_value = q_gain * previous.q + r_gain * previous.r - bound;
+      for (const auto & point : polygon) {
+        const double value = q_gain * point.q + r_gain * point.r - bound;
+        const bool inside = value <= 0.0, previous_inside = previous_value <= 0.0;
+        if (inside != previous_inside) {
+          const double fraction = previous_value / (previous_value - value);
+          next.push_back({previous.q + fraction * (point.q - previous.q),
+              previous.r + fraction * (point.r - previous.r)});
+        }
+        if (inside) {next.push_back(point);}
+        previous = point; previous_value = value;
       }
-      if (inside) {next.push_back(point);}
-      previous = point; previous_value = value;
-    }
-    polygon = std::move(next);
-  };
+      polygon = std::move(next);
+    };
   for (std::size_t k = 0; k < response.free_states.size(); ++k) {
     const auto & f = response.free_states[k];
     const auto & q = response.candidate_states[k];

@@ -1,4 +1,3 @@
-#include "f_dwa_controller/saturation_input_dynamics.hpp"
 // Copyright (c) 2026 suzukiYU000
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -32,6 +31,8 @@
 #include <vector>
 
 #include "dwb_core/exceptions.hpp"
+#include "f_dwa_controller/equal_effect_fir_sampling.hpp"
+#include "f_dwa_controller/saturation_input_dynamics.hpp"
 #include "f_dwa_controller/terminal_stop_dynamics.hpp"
 #include "nav2_util/node_utils.hpp"
 #include "pluginlib/class_list_macros.hpp"
@@ -125,6 +126,9 @@ void NativeInputTrajectoryGenerator::initialize(
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".fir_cutoff_frequency_hz",
     rclcpp::ParameterValue(1.2));
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".fir_filter_specification",
+    rclcpp::ParameterValue(std::string{}));
   // Zero preserves coefficient-only callers. Generated GUI profiles provide
   // the explicit effective count, which must agree with the executed filter.
   nav2_util::declare_parameter_if_not_declared(
@@ -137,6 +141,9 @@ void NativeInputTrajectoryGenerator::initialize(
     rclcpp::ParameterValue(std::vector<double>{}));
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".fir_independent_pulse_durations",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".fir_equal_effect_max_duration_sampling",
     rclcpp::ParameterValue(false));
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".stop_capture_velocity",
@@ -170,6 +177,9 @@ void NativeInputTrajectoryGenerator::initialize(
     plugin_name + ".fir_cutoff_frequency_hz",
     fir_cutoff_frequency_hz_);
   node->get_parameter(
+    plugin_name + ".fir_filter_specification",
+    fir_filter_specification_);
+  node->get_parameter(
     plugin_name + ".fir_prediction_pulse_duration",
     fir_prediction_pulse_duration_);
   node->get_parameter(
@@ -178,6 +188,9 @@ void NativeInputTrajectoryGenerator::initialize(
   node->get_parameter(
     plugin_name + ".fir_independent_pulse_durations",
     fir_independent_pulse_durations_);
+  node->get_parameter(
+    plugin_name + ".fir_equal_effect_max_duration_sampling",
+    fir_equal_effect_max_duration_sampling_);
   node->get_parameter(
     plugin_name + ".stop_capture_velocity",
     stop_capture_velocity_);
@@ -294,6 +307,16 @@ void NativeInputTrajectoryGenerator::validate_parameters() const
                 "must be finite and within [0, sim_time] seconds");
       }
     }
+    if (fir_equal_effect_max_duration_sampling_ &&
+      (native_input_recovery_ || fir_independent_pulse_durations_ ||
+      !fir_prediction_pulse_durations_.empty() ||
+      linear_samples_ % 2 == 0 || angular_samples_ % 2 == 0))
+    {
+      throw std::invalid_argument(
+              plugin_name_ +
+              ".fir_equal_effect_max_duration_sampling requires recovery "
+              "off, no duration bank, synchronized axes, and odd sample counts");
+    }
   }
 }
 
@@ -376,7 +399,10 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   double updated_pulse_duration = fir_prediction_pulse_duration_;
   std::vector<double> updated_pulse_durations = fir_prediction_pulse_durations_;
   bool updated_independent_durations = fir_independent_pulse_durations_;
+  bool updated_equal_effect_sampling =
+    fir_equal_effect_max_duration_sampling_;
   double updated_cutoff_frequency = fir_cutoff_frequency_hz_;
+  std::string updated_filter_specification = fir_filter_specification_;
   bool updated_coefficients_generated = fir_coefficients_generated_;
   std::vector<double> updated_coefficients = fir_coefficients_;
   node->get_parameter(
@@ -402,6 +428,9 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
       plugin_name_ + ".fir_cutoff_frequency_hz",
       updated_cutoff_frequency);
     node->get_parameter(
+      plugin_name_ + ".fir_filter_specification",
+      updated_filter_specification);
+    node->get_parameter(
       plugin_name_ + ".fir_prediction_pulse_duration",
       updated_pulse_duration);
     node->get_parameter(
@@ -410,6 +439,9 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
     node->get_parameter(
       plugin_name_ + ".fir_independent_pulse_durations",
       updated_independent_durations);
+    node->get_parameter(
+      plugin_name_ + ".fir_equal_effect_max_duration_sampling",
+      updated_equal_effect_sampling);
   }
 
   const double previous_linear_jerk = maximum_linear_jerk_;
@@ -423,7 +455,11 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   const double previous_pulse_duration = fir_prediction_pulse_duration_;
   const std::vector<double> previous_pulse_durations = fir_prediction_pulse_durations_;
   const bool previous_independent_durations = fir_independent_pulse_durations_;
+  const bool previous_equal_effect_sampling =
+    fir_equal_effect_max_duration_sampling_;
   const double previous_cutoff_frequency = fir_cutoff_frequency_hz_;
+  const std::string previous_filter_specification =
+    fir_filter_specification_;
   const bool previous_coefficients_generated = fir_coefficients_generated_;
   const std::vector<double> previous_coefficients = fir_coefficients_;
   const FirStopCoefficientResponse previous_stop_response =
@@ -440,7 +476,9 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   fir_prediction_pulse_duration_ = updated_pulse_duration;
   fir_prediction_pulse_durations_ = std::move(updated_pulse_durations);
   fir_independent_pulse_durations_ = updated_independent_durations;
+  fir_equal_effect_max_duration_sampling_ = updated_equal_effect_sampling;
   fir_cutoff_frequency_hz_ = updated_cutoff_frequency;
+  fir_filter_specification_ = std::move(updated_filter_specification);
   fir_coefficients_generated_ = updated_coefficients_generated;
   fir_coefficients_ = std::move(updated_coefficients);
   try {
@@ -473,7 +511,9 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
     fir_prediction_pulse_duration_ = previous_pulse_duration;
     fir_prediction_pulse_durations_ = previous_pulse_durations;
     fir_independent_pulse_durations_ = previous_independent_durations;
+    fir_equal_effect_max_duration_sampling_ = previous_equal_effect_sampling;
     fir_cutoff_frequency_hz_ = previous_cutoff_frequency;
+    fir_filter_specification_ = previous_filter_specification;
     fir_coefficients_generated_ = previous_coefficients_generated;
     fir_coefficients_ = previous_coefficients;
     fir_stop_coefficient_response_ = previous_stop_response;
@@ -694,12 +734,23 @@ NativeInputTrajectoryGenerator::active_candidate_diagnostics() const
   diagnostics.canonical_index = active_candidate_->canonical_index;
   diagnostics.uses_recovery = active_candidate_->linear_rollout->uses_recovery ||
     active_candidate_->angular_rollout->uses_recovery;
+  diagnostics.uses_equal_effect_max_duration =
+    active_candidate_->linear_rollout->uses_equal_effect_max_duration ||
+    active_candidate_->angular_rollout->uses_equal_effect_max_duration;
   diagnostics.linear_recovery_input = active_candidate_->linear_rollout->recovery_input;
   diagnostics.angular_recovery_input = active_candidate_->angular_rollout->recovery_input;
   diagnostics.linear_prediction_input_duration =
-    active_candidate_->linear_rollout->prediction_input_steps * control_period_;
+    active_candidate_->linear_rollout->prediction_input_duration;
   diagnostics.angular_prediction_input_duration =
-    active_candidate_->angular_rollout->prediction_input_steps * control_period_;
+    active_candidate_->angular_rollout->prediction_input_duration;
+  diagnostics.linear_fractional_last_input =
+    active_candidate_->linear_rollout->fractional_last_input;
+  diagnostics.angular_fractional_last_input =
+    active_candidate_->angular_rollout->fractional_last_input;
+  diagnostics.linear_zero_input_duration_unbounded =
+    active_candidate_->linear_rollout->zero_input_duration_unbounded;
+  diagnostics.angular_zero_input_duration_unbounded =
+    active_candidate_->angular_rollout->zero_input_duration_unbounded;
   diagnostics.linear_native_input = active_candidate_->linear_native_input;
   diagnostics.angular_native_input = active_candidate_->angular_native_input;
   diagnostics.initial_linear_velocity = iteration_initial_linear_velocity_;
@@ -984,8 +1035,85 @@ void NativeInputTrajectoryGenerator::startNewIteration(
   std::map<double, std::shared_ptr<AxisStopData>> angular_stop_data;
   std::vector<std::vector<std::shared_ptr<const AxisRollout>>> linear_banks;
   std::vector<std::vector<std::shared_ptr<const AxisRollout>>> angular_banks;
+  bool equal_effect_sampling_active = false;
+  if (input_order_ == NativeInputOrder::kFir &&
+    fir_equal_effect_max_duration_sampling_)
+  {
+    const EqualEffectFirContext linear_context =
+      prepare_equal_effect_fir_context(
+      linear_state, linear_axis_limits, fir_coefficients_,
+      initial_linear_fir_history, control_period_, rollout_step_count);
+    const EqualEffectFirContext angular_context =
+      prepare_equal_effect_fir_context(
+      angular_state, angular_axis_limits, fir_coefficients_,
+      initial_angular_fir_history, control_period_, rollout_step_count);
+    const EqualEffectFirSamples linear_samples =
+      sample_equal_effect_fir_axis(linear_context, linear_samples_);
+    const EqualEffectFirSamples angular_samples =
+      sample_equal_effect_fir_axis(angular_context, angular_samples_);
+    if (linear_samples.converged && angular_samples.converged) {
+      const auto build_equal_effect_rollouts =
+        [this, rollout_step_count](
+        const std::vector<EqualEffectFirPulse> & pulses,
+        const std::vector<double> & initial_fir_history,
+        std::map<double, std::shared_ptr<AxisStopData>> & stop_data)
+        {
+          std::vector<std::shared_ptr<const AxisRollout>> rollouts;
+          rollouts.reserve(pulses.size());
+          for (const auto & pulse : pulses) {
+            if (!pulse.valid) {continue;}
+            auto rollout = std::make_shared<AxisRollout>();
+            rollout->uses_equal_effect_max_duration = true;
+            rollout->prediction_input_steps = pulse.full_input_steps;
+            rollout->prediction_input_duration = pulse.equivalent_duration;
+            rollout->fractional_last_input = pulse.fractional_last_input;
+            rollout->zero_input_duration_unbounded =
+              pulse.zero_input_duration_unbounded;
+            rollout->states = pulse.states;
+            rollout->native_input = pulse.native_input;
+            rollout->first_native_input = pulse.first_native_input;
+            rollout->first_fir_history = initial_fir_history;
+            push_fir_input(
+              rollout->first_fir_history, rollout->first_native_input);
+            auto & shared_stop = stop_data[rollout->first_native_input];
+            if (!shared_stop) {
+              shared_stop = std::make_shared<AxisStopData>();
+            }
+            rollout->stop_data = shared_stop;
+            rollout->valid = rollout->states.size() ==
+              static_cast<std::size_t>(rollout_step_count);
+            if (rollout->valid) {rollouts.push_back(std::move(rollout));}
+          }
+          return rollouts;
+        };
+      auto linear_rollouts = build_equal_effect_rollouts(
+        linear_samples.pulses, initial_linear_fir_history, linear_stop_data);
+      auto angular_rollouts = build_equal_effect_rollouts(
+        angular_samples.pulses, initial_angular_fir_history, angular_stop_data);
+      equal_effect_sampling_active =
+        linear_rollouts.size() == static_cast<std::size_t>(linear_samples_) &&
+        angular_rollouts.size() == static_cast<std::size_t>(angular_samples_);
+      if (equal_effect_sampling_active) {
+        linear_banks.push_back(std::move(linear_rollouts));
+        angular_banks.push_back(std::move(angular_rollouts));
+      }
+    }
+    if (!equal_effect_sampling_active) {
+      const auto node = node_.lock();
+      if (node) {
+        RCLCPP_WARN_THROTTLE(
+          node->get_logger(), *node->get_clock(), 5000,
+          "%s two-stage effect/max-duration sampling failed "
+          "(linear: %s; angular: %s); using the configured fixed-duration "
+          "F-DWA sampling for this iteration",
+          plugin_name_.c_str(), linear_samples.failure_reason.c_str(),
+          angular_samples.failure_reason.c_str());
+      }
+    }
+  }
   const bool recovery = native_input_recovery_;
-  const auto periods = recovery ? std::vector<int>{1} : prediction_input_step_counts();
+  const auto periods = equal_effect_sampling_active ? std::vector<int>{} :
+  recovery ? std::vector<int>{1} : prediction_input_step_counts();
   for (const int active_input_steps : periods) {
     ZeroFirResponse linear_recovery_response, angular_recovery_response;
     std::vector<FeasibleInterval> linear_recovery_intervals, angular_recovery_intervals;
@@ -1081,15 +1209,25 @@ void NativeInputTrajectoryGenerator::startNewIteration(
         for (const double input : inputs) {
           auto rollout = std::make_shared<AxisRollout>();
           rollout->prediction_input_steps = active_input_steps;
+          rollout->prediction_input_duration =
+            active_input_steps * control_period_;
           rollout->native_input = input;
+          rollout->first_native_input = input;
+          const bool finite_jerk_pulse =
+            input_order_ == NativeInputOrder::kJerk &&
+            active_input_steps < rollout_step_count;
           if (recovery) {
             auto recovered = input_order_ == NativeInputOrder::kAcceleration ?
-              longest_acceleration_input(initial_state, limits, input, control_period_, rollout_step_count) :
+              longest_acceleration_input(initial_state, limits, input, control_period_,
+              rollout_step_count) :
               input_order_ == NativeInputOrder::kJerk ?
-              longest_jerk_recovery(initial_state, limits, input, control_period_, rollout_step_count) :
+              longest_jerk_recovery(initial_state, limits, input, control_period_,
+              rollout_step_count) :
               longest_zero_fir_input(recovery_response, limits, input);
             if (!recovered.valid) {continue;}
             rollout->prediction_input_steps = recovered.active_input_steps;
+            rollout->prediction_input_duration =
+              recovered.active_input_steps * control_period_;
             rollout->uses_recovery = true;
             rollout->recovery_input = recovered.recovery_input;
             rollout->states = std::move(recovered.states);
@@ -1110,7 +1248,7 @@ void NativeInputTrajectoryGenerator::startNewIteration(
             rollout->states.resize(static_cast<std::size_t>(rollout_step_count));
             rollout->first_fir_history = initial_fir_history;
             push_fir_input(rollout->first_fir_history, input);
-          } else if (input_order_ == NativeInputOrder::kJerk && active_input_steps < rollout_step_count) {
+          } else if (finite_jerk_pulse) {
             AxisState state = initial_state;
             for (int k = 0; k < rollout_step_count; ++k) {
               state.acceleration += (k < active_input_steps ? input : 0.0) * control_period_;
@@ -1159,11 +1297,13 @@ void NativeInputTrajectoryGenerator::startNewIteration(
     const auto linear_rollouts =
       build_axis_rollouts(
       linear_inputs, linear_state, linear_axis_limits,
-      initial_linear_fir_history, linear_fir_response_pointer, linear_recovery_response, linear_stop_data);
+      initial_linear_fir_history, linear_fir_response_pointer, linear_recovery_response,
+        linear_stop_data);
     const auto angular_rollouts =
       build_axis_rollouts(
       angular_inputs, angular_state, angular_axis_limits,
-      initial_angular_fir_history, angular_fir_response_pointer, angular_recovery_response, angular_stop_data);
+      initial_angular_fir_history, angular_fir_response_pointer, angular_recovery_response,
+        angular_stop_data);
 
     linear_banks.push_back(linear_rollouts);
     angular_banks.push_back(angular_rollouts);
@@ -1180,8 +1320,11 @@ void NativeInputTrajectoryGenerator::startNewIteration(
           candidate.command_velocity.y = 0.0;
           candidate.command_velocity.theta =
             angular_rollout->states.front().velocity;
-          candidate.linear_native_input = linear_rollout->native_input;
-          candidate.angular_native_input = angular_rollout->native_input;
+          // For m=0 the first executable input is beta*q, not q. Candidate
+          // metadata and delayed-stop history must follow the command that is
+          // actually committed this cycle.
+          candidate.linear_native_input = linear_rollout->first_native_input;
+          candidate.angular_native_input = angular_rollout->first_native_input;
           candidate.first_command_state.command_velocity =
             candidate.command_velocity;
           candidate.first_command_state.linear_state =
@@ -1200,7 +1343,10 @@ void NativeInputTrajectoryGenerator::startNewIteration(
   for (std::size_t index = 0u; index < linear_banks.size(); ++index) {
     append_candidates(linear_banks[index], angular_banks[index]);
   }
-  if (!recovery && input_order_ == NativeInputOrder::kFir && fir_independent_pulse_durations_) {
+  if (!equal_effect_sampling_active && !recovery &&
+    input_order_ == NativeInputOrder::kFir &&
+    fir_independent_pulse_durations_)
+  {
     for (std::size_t linear = 0u; linear < linear_banks.size(); ++linear) {
       for (std::size_t angular = 0u; angular < angular_banks.size(); ++angular) {
         if (linear != angular) {
@@ -1673,26 +1819,33 @@ NativeInputTrajectoryGenerator::get_axis_stop_cache(
 
   AxisState state = initial_state;
   std::vector<double> fir_history = initial_fir_history;
+  const bool uses_jerk_pulse =
+    (rollout.uses_recovery || native_input_pulse_duration_ > 0.0) &&
+    input_order_ == NativeInputOrder::kJerk;
+  const bool uses_fir_pulse =
+    (rollout.uses_recovery || rollout.uses_equal_effect_max_duration) &&
+    input_order_ == NativeInputOrder::kFir;
   for (int step_index = 0;
     step_index < command_delay_steps; ++step_index)
   {
     bool feasible = false;
     if (rollout.uses_recovery && input_order_ == NativeInputOrder::kAcceleration) {
-      const auto step = project_acceleration_step(state, limits, rollout.native_input, control_period_);
+      const auto step = project_acceleration_step(state, limits, rollout.native_input,
+          control_period_);
       feasible = step.feasible &&
         std::abs(step.applied_native_input - rollout.native_input) <= 1.0e-9;
       state = step.state;
-    } else if ((rollout.uses_recovery || native_input_pulse_duration_ > 0.0) &&
-      input_order_ == NativeInputOrder::kJerk) {
+    } else if (uses_jerk_pulse) {
       const auto step = project_jerk_step(state, limits, rollout.native_input, control_period_);
       feasible = step.feasible &&
         std::abs(step.applied_native_input - rollout.native_input) <= 1.0e-9;
       state = step.state;
-    } else if (rollout.uses_recovery && input_order_ == NativeInputOrder::kFir) {
-      const double acceleration = fir_acceleration(fir_coefficients_, fir_history, rollout.native_input);
+    } else if (uses_fir_pulse) {
+      const double acceleration = fir_acceleration(
+        fir_coefficients_, fir_history, rollout.first_native_input);
       state = {state.velocity + acceleration * control_period_, acceleration};
       feasible = recovery_state_valid(state, limits);
-      push_fir_input(fir_history, rollout.native_input);
+      push_fir_input(fir_history, rollout.first_native_input);
     } else if (input_order_ == NativeInputOrder::kFir) {
       feasible = apply_projected_fir_step_in_place(
         state, limits, fir_coefficients_, fir_history,

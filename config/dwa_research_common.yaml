@@ -553,8 +553,9 @@ controller_server:
       FootprintClearance.maximum_motion_margin: 0.05
       FootprintClearance.uniform_sequence_period: 0.05
       FootprintClearance.clearance_bands: 9
-      # Score only each method's executable 2.5 s prediction. Appending the
-      # reference Path made a safe detour inherit the obstacle that it was
+      # Score only each method's executable prediction, up to 2.5 s. A shorter
+      # configured prediction scores its complete available prefix. Appending
+      # the reference Path made a safe detour inherit the obstacle that it was
       # bypassing and repeatedly selected an eastbound loop at the room entry.
       # PathDeviation now provides the independent post-obstacle return gradient.
       FootprintClearance.risk_distance: 2.5

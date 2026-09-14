@@ -41,8 +41,10 @@ namespace f_dwa_controller
  * The distance-normalized exposure integral over a fixed-distance risk path is
  * blended with the peak exposure. The integral preserves an escape gradient
  * when the current pose is already inside the margin, while the peak responds
- * early. The nominal seed is cut at risk_seed_time and continued along the
- * prepared transformed plan. Its spatial heading relaxes over
+ * early. Native-time mode scores the available executable prefix when the
+ * configured prediction is shorter than risk_seed_time. Otherwise the nominal
+ * seed is cut at risk_seed_time and continued along the prepared transformed
+ * plan. Its spatial heading relaxes over
  * heading_relaxation_distance so it does not inherit a longer sim_time suffix
  * or erase the lateral separation of an early avoidance turn.
  */

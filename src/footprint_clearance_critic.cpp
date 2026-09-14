@@ -1295,8 +1295,11 @@ const std::vector<RiskPathSample> & FootprintClearanceCritic::buildRiskPath(
         RiskPathSample{interpolated, risk_distance_});
       return native_time_risk_path_workspace_;
     }
-    throw dwb_core::IllegalTrajectoryException(
-            name_, "trajectory does not reach native-time risk seed");
+    // A shorter configured sim_time is still a valid executable prediction.
+    // Score the complete prefix that exists instead of turning this soft
+    // clearance term into a hard rejection.  Malformed/non-finite time series
+    // and the independent physical-footprint collision gate remain fail-closed.
+    return native_time_risk_path_workspace_;
   }
   // This is a soft margin, not the physical collision gate.  Sampling at the
   // 0.025 m Costmap cell size made a 2.5 m probe evaluate 101 poses for every
@@ -1378,8 +1381,17 @@ FootprintClearanceCritic::scoreTrajectoryWithPreparedRiskPathAndApproachRisk(
       (previous_penalty + penalty);
     previous_penalty = penalty;
   }
+  // A native-time path may end before risk_distance_. Normalize by the span
+  // that was actually evaluated so shortening sim_time does not dilute an
+  // otherwise identical soft-clearance exposure.
+  const double evaluated_distance =
+    risk_path.back().arc_length - risk_path.front().arc_length;
+  if (!std::isfinite(evaluated_distance) || evaluated_distance <= 0.0) {
+    throw dwb_core::IllegalTrajectoryException(
+            name_, "fixed-distance clearance path has no evaluated interval");
+  }
   const double mean_penalty = std::max(
-    exposure_integral / risk_distance_, 0.0);
+    exposure_integral / evaluated_distance, 0.0);
   if (approach_risk) {
     // Activation must describe the candidate the Controller can actually
     // dispatch. The fixed-distance score above deliberately continues beyond
