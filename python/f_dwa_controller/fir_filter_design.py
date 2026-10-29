@@ -109,6 +109,10 @@ def _validate_design(design: FirFilterDesign) -> None:
         )
 
     nyquist_hz = 0.5 * design.sample_frequency_hz
+    if design.mode == 'identity':
+        if design.cutoff_hz is not None or design.attenuation_bands_hz:
+            raise ValueError('identity does not accept cutoff or attenuation bands')
+        return
     if design.mode == 'lowpass':
         if design.cutoff_hz is None or not (
             0.0 < design.cutoff_hz < nyquist_hz
@@ -174,6 +178,9 @@ def design_fir_coefficients_from_spec(
 ) -> list[float]:
     """Generate coefficients from a fully specified Python design."""
     _validate_design(design)
+    if design.mode == 'identity':
+        taps = (design.num_taps + 1) // 2 if design.minimum_phase else design.num_taps
+        return [1.0] + [0.0] * (taps - 1)
     coefficients = _linear_phase_coefficients(design)
     if design.minimum_phase:
         coefficients = signal.minimum_phase(
@@ -281,6 +288,8 @@ def filter_design_for_specification(
         )
 
     text = str(specification).strip()
+    if text.lower() == 'identity':
+        return _effective_tap_design(mode='identity', effective_taps=effective_taps)
     if re.fullmatch(_FINITE_FREQUENCY_PATTERN, text):
         return _effective_tap_design(
             mode='lowpass',
@@ -320,6 +329,8 @@ def filter_design_for_specification(
 def canonical_filter_specification(design: FirFilterDesign) -> str:
     """Return the stable text stored in GUI state and ROS metadata."""
     _validate_design(design)
+    if design.mode == 'identity':
+        return 'identity'
     if design.mode == 'lowpass':
         return format(design.cutoff_hz, '.15g')
     return ', '.join(
@@ -396,11 +407,13 @@ def inject_fir_coefficients(
     filter_specification = plugin_parameters.pop(
         'fir_filter_specification', None
     )
+    angular_specification = plugin_parameters.pop('fir_angular_filter_specification', None)
     cutoff_hz = plugin_parameters.get('fir_cutoff_frequency_hz')
     effective_taps = plugin_parameters.get('fir_effective_taps', 46)
     if not uses_fir:
         if (
-            profile_name is not None
+            angular_specification not in (None, '')
+            or profile_name is not None
             or filter_specification is not None
             or cutoff_hz is not None
             or 'fir_effective_taps' in plugin_parameters
@@ -411,7 +424,7 @@ def inject_fir_coefficients(
             )
         return None
 
-    if 'fir_coefficients' in plugin_parameters:
+    if 'fir_coefficients' in plugin_parameters or 'fir_angular_coefficients' in plugin_parameters:
         raise ValueError(
             'source YAML must not contain fir_coefficients; use a Python '
             'FIR_FILTER_DESIGNS profile'
@@ -465,6 +478,10 @@ def inject_fir_coefficients(
     plugin_parameters['fir_effective_taps'] = len(coefficients)
     plugin_parameters['fir_coefficients_generated'] = True
     plugin_parameters['fir_filter_specification'] = filter_specification
+    if angular_specification not in (None, ''):
+        angular_design = filter_design_for_specification(angular_specification, len(coefficients))
+        plugin_parameters['fir_angular_filter_specification'] = canonical_filter_specification(angular_design)
+        plugin_parameters['fir_angular_coefficients'] = design_fir_coefficients_from_spec(angular_design)
     return DesignReport(
         profile_name=profile_name,
         requested_taps=design.num_taps,

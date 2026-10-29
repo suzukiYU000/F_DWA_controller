@@ -121,6 +121,12 @@ void NativeInputTrajectoryGenerator::initialize(
     node, plugin_name + ".fir_coefficients",
     rclcpp::ParameterValue(std::vector<double>{1.0}));
   nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".fir_angular_coefficients",
+    rclcpp::ParameterValue(std::vector<double>{}));
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name + ".fir_angular_filter_specification",
+    rclcpp::ParameterValue(std::string{}));
+  nav2_util::declare_parameter_if_not_declared(
     node, plugin_name + ".fir_coefficients_generated",
     rclcpp::ParameterValue(false));
   nav2_util::declare_parameter_if_not_declared(
@@ -171,6 +177,8 @@ void NativeInputTrajectoryGenerator::initialize(
   node->get_parameter(
     plugin_name + ".fir_coefficients", fir_coefficients_);
   node->get_parameter(
+    plugin_name + ".fir_angular_coefficients", fir_angular_coefficients_);
+  node->get_parameter(
     plugin_name + ".fir_coefficients_generated",
     fir_coefficients_generated_);
   node->get_parameter(
@@ -211,7 +219,10 @@ void NativeInputTrajectoryGenerator::initialize(
     fir_stop_coefficient_response_ =
       prepare_fir_stop_coefficient_response(
       fir_coefficients_, control_period_);
-    if (!fir_stop_coefficient_response_.valid) {
+    fir_angular_stop_coefficient_response_ =
+      prepare_fir_stop_coefficient_response(angular_fir_coefficients(), control_period_);
+    if (!fir_stop_coefficient_response_.valid ||
+      !fir_angular_stop_coefficient_response_.valid) {
       throw std::invalid_argument(
               plugin_name_ +
               " FIR terminal-stop coefficient response is invalid");
@@ -271,6 +282,18 @@ void NativeInputTrajectoryGenerator::validate_parameters() const
       static_cast<std::size_t>(effective_taps) != fir_coefficients_.size()))
     {
       throw std::invalid_argument(plugin_name_ + ".fir_effective_taps must match fir_coefficients");
+    }
+    if (!fir_angular_coefficients_.empty()) {
+      const auto & angular = fir_angular_coefficients_;
+      if (angular.size() != fir_coefficients_.size() ||
+        !std::all_of(angular.begin(), angular.end(),
+        [](double value) {return std::isfinite(value);}) ||
+        std::abs(angular.front()) <= 1.0e-12 ||
+        std::abs(std::accumulate(angular.begin(), angular.end(), 0.0) - 1.0) > 1.0e-6)
+      {
+        throw std::invalid_argument(
+                plugin_name_ + ".fir_angular_coefficients must be finite, unit-gain and match common taps");
+      }
     }
     const double coefficient_sum =
       std::accumulate(
@@ -405,6 +428,7 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   std::string updated_filter_specification = fir_filter_specification_;
   bool updated_coefficients_generated = fir_coefficients_generated_;
   std::vector<double> updated_coefficients = fir_coefficients_;
+  std::vector<double> updated_angular_coefficients = fir_angular_coefficients_;
   node->get_parameter(
     plugin_name_ + ".max_linear_jerk", updated_linear_jerk);
   node->get_parameter(
@@ -421,6 +445,8 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   if (input_order_ == NativeInputOrder::kFir) {
     node->get_parameter(
       plugin_name_ + ".fir_coefficients", updated_coefficients);
+    node->get_parameter(
+      plugin_name_ + ".fir_angular_coefficients", updated_angular_coefficients);
     node->get_parameter(
       plugin_name_ + ".fir_coefficients_generated",
       updated_coefficients_generated);
@@ -462,6 +488,8 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
     fir_filter_specification_;
   const bool previous_coefficients_generated = fir_coefficients_generated_;
   const std::vector<double> previous_coefficients = fir_coefficients_;
+  const auto previous_angular_coefficients = fir_angular_coefficients_;
+  const auto previous_angular_stop_response = fir_angular_stop_coefficient_response_;
   const FirStopCoefficientResponse previous_stop_response =
     fir_stop_coefficient_response_;
   const std::vector<double> previous_time_steps = fixed_time_steps_;
@@ -481,6 +509,7 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
   fir_filter_specification_ = std::move(updated_filter_specification);
   fir_coefficients_generated_ = updated_coefficients_generated;
   fir_coefficients_ = std::move(updated_coefficients);
+  fir_angular_coefficients_ = std::move(updated_angular_coefficients);
   try {
     if (!std::isfinite(native_input_pulse_duration_) ||
       native_input_pulse_duration_ < 0.0)
@@ -494,7 +523,10 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
       fir_stop_coefficient_response_ =
         prepare_fir_stop_coefficient_response(
         fir_coefficients_, control_period_);
-      if (!fir_stop_coefficient_response_.valid) {
+      fir_angular_stop_coefficient_response_ =
+        prepare_fir_stop_coefficient_response(angular_fir_coefficients(), control_period_);
+      if (!fir_stop_coefficient_response_.valid ||
+        !fir_angular_stop_coefficient_response_.valid) {
         throw std::invalid_argument(
                 plugin_name_ +
                 " FIR terminal-stop coefficient response is invalid");
@@ -516,6 +548,8 @@ void NativeInputTrajectoryGenerator::reload_runtime_parameters()
     fir_filter_specification_ = previous_filter_specification;
     fir_coefficients_generated_ = previous_coefficients_generated;
     fir_coefficients_ = previous_coefficients;
+    fir_angular_coefficients_ = previous_angular_coefficients;
+    fir_angular_stop_coefficient_response_ = previous_angular_stop_response;
     fir_stop_coefficient_response_ = previous_stop_response;
     fixed_time_steps_ = previous_time_steps;
     throw;
@@ -1045,7 +1079,7 @@ void NativeInputTrajectoryGenerator::startNewIteration(
       initial_linear_fir_history, control_period_, rollout_step_count);
     const EqualEffectFirContext angular_context =
       prepare_equal_effect_fir_context(
-      angular_state, angular_axis_limits, fir_coefficients_,
+      angular_state, angular_axis_limits, angular_fir_coefficients(),
       initial_angular_fir_history, control_period_, rollout_step_count);
     const EqualEffectFirSamples linear_samples =
       sample_equal_effect_fir_axis(linear_context, linear_samples_);
@@ -1136,7 +1170,7 @@ void NativeInputTrajectoryGenerator::startNewIteration(
         linear_recovery_response = prepare_zero_fir_response(linear_state, linear_axis_limits,
           fir_coefficients_, initial_linear_fir_history, control_period_, rollout_step_count);
         angular_recovery_response = prepare_zero_fir_response(angular_state, angular_axis_limits,
-          fir_coefficients_, initial_angular_fir_history, control_period_, rollout_step_count);
+          angular_fir_coefficients(), initial_angular_fir_history, control_period_, rollout_step_count);
         linear_recovery_intervals = linear_recovery_response.input_intervals;
         angular_recovery_intervals = angular_recovery_response.input_intervals;
       }
@@ -1164,7 +1198,7 @@ void NativeInputTrajectoryGenerator::startNewIteration(
         initial_linear_fir_history, control_period_, constraint_step_count,
         active_input_steps);
       angular_fir_response = prepare_pulsed_fir_affine_response(
-        angular_state, angular_axis_limits, fir_coefficients_,
+        angular_state, angular_axis_limits, angular_fir_coefficients(),
         initial_angular_fir_history, control_period_, constraint_step_count,
         active_input_steps);
       linear_interval = linear_fir_response.input_interval;
@@ -1653,18 +1687,18 @@ bool NativeInputTrajectoryGenerator::generate_direct_stop_trajectory(
       maximum_stop_steps, stop_velocity_threshold, true,
       &fir_stop_coefficient_response_, false);
     angular_stop = generate_fir_stop_sequence(
-      initial_angular_state, angular_limits(), fir_coefficients_,
+      initial_angular_state, angular_limits(), angular_fir_coefficients(),
       iteration_initial_angular_fir_history_, control_period_,
       maximum_stop_steps, stop_velocity_threshold, true,
-      &fir_stop_coefficient_response_, false);
+      &fir_angular_stop_coefficient_response_, false);
     if ((!angular_stop.feasible ||
       !angular_stop.terminal_state_cleared))
     {
       angular_stop = generate_fir_stop_sequence(
-        initial_angular_state, angular_limits(), fir_coefficients_,
+        initial_angular_state, angular_limits(), angular_fir_coefficients(),
         iteration_initial_angular_fir_history_, control_period_,
         maximum_stop_steps, stop_velocity_threshold, true,
-        &fir_stop_coefficient_response_, true);
+        &fir_angular_stop_coefficient_response_, true);
     }
   }
   if (!linear_stop.feasible || !linear_stop.terminal_state_cleared ||
@@ -1790,6 +1824,8 @@ NativeInputTrajectoryGenerator::get_axis_stop_cache(
   const AxisState & initial_state,
   const AxisLimits & limits,
   const std::vector<double> & initial_fir_history,
+  const std::vector<double> & coefficients,
+  const FirStopCoefficientResponse & stop_response,
   const int rollout_step_count,
   const int command_delay_steps,
   const int maximum_stop_steps,
@@ -1842,13 +1878,13 @@ NativeInputTrajectoryGenerator::get_axis_stop_cache(
       state = step.state;
     } else if (uses_fir_pulse) {
       const double acceleration = fir_acceleration(
-        fir_coefficients_, fir_history, rollout.first_native_input);
+        coefficients, fir_history, rollout.first_native_input);
       state = {state.velocity + acceleration * control_period_, acceleration};
       feasible = recovery_state_valid(state, limits);
       push_fir_input(fir_history, rollout.first_native_input);
     } else if (input_order_ == NativeInputOrder::kFir) {
       feasible = apply_projected_fir_step_in_place(
-        state, limits, fir_coefficients_, fir_history,
+        state, limits, coefficients, fir_history,
         rollout.native_input, control_period_);
     } else {
       const ProjectedAxisStep step =
@@ -1874,9 +1910,9 @@ NativeInputTrajectoryGenerator::get_axis_stop_cache(
       stop_velocity_threshold);
   } else {
     cache.stop_sequence = generate_fir_stop_sequence(
-      state, limits, fir_coefficients_, fir_history, control_period_,
+      state, limits, coefficients, fir_history, control_period_,
       maximum_stop_steps, stop_velocity_threshold, false,
-      &fir_stop_coefficient_response_, false);
+      &stop_response, false);
     if (allow_velocity_direction_reversal &&
       (!cache.stop_sequence.feasible ||
       !cache.stop_sequence.terminal_state_cleared))
@@ -1886,9 +1922,9 @@ NativeInputTrajectoryGenerator::get_axis_stop_cache(
       // then allow a bounded zero crossing, whose complete swept footprint is
       // still checked by StopAdmissibility.
       cache.stop_sequence = generate_fir_stop_sequence(
-        state, limits, fir_coefficients_, fir_history, control_period_,
+        state, limits, coefficients, fir_history, control_period_,
         maximum_stop_steps, stop_velocity_threshold, false,
-        &fir_stop_coefficient_response_, true);
+        &stop_response, true);
     }
   }
   cache.valid =
@@ -1937,12 +1973,14 @@ bool NativeInputTrajectoryGenerator::generate_candidate_stop_trajectory(
   const AxisStopCache & linear_cache =
     get_axis_stop_cache(
     *candidate.linear_rollout, initial_linear_state, linear_axis_limits,
-    iteration_initial_linear_fir_history_, rollout_step_count,
+    iteration_initial_linear_fir_history_, fir_coefficients_,
+    fir_stop_coefficient_response_, rollout_step_count,
     command_delay_steps, maximum_stop_steps, stop_velocity_threshold, false);
   const AxisStopCache & angular_cache =
     get_axis_stop_cache(
     *candidate.angular_rollout, initial_angular_state, angular_axis_limits,
-    iteration_initial_angular_fir_history_, rollout_step_count,
+    iteration_initial_angular_fir_history_, angular_fir_coefficients(),
+    fir_angular_stop_coefficient_response_, rollout_step_count,
     command_delay_steps, maximum_stop_steps, stop_velocity_threshold, true);
   if (!linear_cache.valid || !angular_cache.valid ||
     linear_cache.delayed_states.size() !=

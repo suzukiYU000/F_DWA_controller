@@ -5588,6 +5588,57 @@ TEST(InputRecovery, JerkPulseEndsAtFourCyclesWithoutResettingAcceleration)
   }
 }
 
+TEST_F(NativeInputTrajectoryGeneratorTest, AngularFirOverrideUsesIndependentConvolutionAndStop)
+{
+  for (const bool recovery : {false, true}) {
+    auto node = make_node(recovery ? "axis_recovery" : "axis_held");
+    node->declare_parameter("FollowPath.native_input_recovery", recovery);
+    node->declare_parameter("FollowPath.fir_angular_coefficients", std::vector<double>{.2, .3, .5});
+    FirTrajectoryGenerator generator;
+    generator.initialize(node, kPluginName);
+    generator.startNewIteration({});
+    ASSERT_GT(generator.candidate_count(), 0u);
+    geometry_msgs::msg::Pose2D pose;
+    bool nonzero_linear = false, nonzero_angular = false, stopped = false;
+    for (std::size_t k = 0; k < generator.candidate_count(); ++k) {
+      generator.nextTwist();
+      dwb_msgs::msg::Trajectory2D trajectory;
+      NativeInputTrajectoryGenerator::NativeCommandState state;
+      ASSERT_TRUE(generator.materialize_candidate(k, pose, trajectory, state));
+      const auto diagnostics = generator.active_candidate_diagnostics();
+      ASSERT_TRUE(diagnostics.has_value());
+      nonzero_linear |= std::abs(diagnostics->linear_native_input) > 1e-8;
+      nonzero_angular |= std::abs(diagnostics->angular_native_input) > 1e-8;
+      EXPECT_NEAR(state.command_velocity.x, .03 * .5 * diagnostics->linear_native_input, 1e-10);
+      EXPECT_NEAR(state.command_velocity.theta, .03 * .2 * diagnostics->angular_native_input, 1e-10);
+      std::vector<geometry_msgs::msg::Pose2D> poses;
+      std::vector<nav_2d_msgs::msg::Twist2D> velocities;
+      if (generator.generate_stop_trajectory(pose, 267, .01, poses, velocities)) {
+        ASSERT_FALSE(velocities.empty());
+        EXPECT_NEAR(velocities.front().x, state.command_velocity.x, 1e-10);
+        EXPECT_NEAR(velocities.front().theta, state.command_velocity.theta, 1e-10);
+        EXPECT_LE(std::abs(velocities.back().theta), .01);
+        stopped |= std::abs(state.command_velocity.theta) > 1e-8;
+      }
+    }
+    EXPECT_TRUE(nonzero_linear);
+    EXPECT_TRUE(nonzero_angular);
+    EXPECT_TRUE(stopped);
+  }
+}
+
+TEST_F(NativeInputTrajectoryGeneratorTest, AngularFirOverrideRejectsInvalidCoefficients)
+{
+  for (const auto & coefficients : std::vector<std::vector<double>>{
+      {.5, .5}, {.2, .3, .4}, {0., .5, .5}, {.2, NAN, .8}})
+  {
+    auto node = make_node("invalid_angular_fir");
+    node->declare_parameter("FollowPath.fir_angular_coefficients", coefficients);
+    FirTrajectoryGenerator generator;
+    EXPECT_THROW(generator.initialize(node, kPluginName), std::invalid_argument);
+  }
+}
+
 TEST_F(NativeInputTrajectoryGeneratorTest, InputRecoveryFirCommitsOnlyExecutedInputToHistory)
 {
   auto node = make_node("recovery_fir_memory", true, false, false, .06, 1.0);
@@ -5987,4 +6038,147 @@ TEST_F(NativeInputTrajectoryGeneratorTest, StandardVdwaAlsoKeepsZeroInsideTheBud
   EXPECT_EQ(commands.count({0.0, 0.0}), 1u);
 }
 
+}  // namespace f_dwa_controller
+
+#include "f_dwa_controller/reserve_exit_priority.hpp"
+
+TEST(ReserveExitPreference, RecordedSim3Alternatives)
+{
+  using f_dwa_controller::reserve_exit_priority;
+  // Fully scored and stop-admissible candidates at Sim3 12.074 s.
+  EXPECT_FALSE(reserve_exit_priority(true, -.0092730684, .0008987141, .1));
+  EXPECT_TRUE(reserve_exit_priority(true, -.0092730684, .1727769461, .1));
+  EXPECT_TRUE(reserve_exit_priority(true, -.0092730684, .1107598001, .1));
+  EXPECT_FALSE(reserve_exit_priority(false, -.0092730684, .1107598001, .1));
+}
+
+TEST(ReserveExitPreference, AbsoluteMarginPreventsRepeatedSmallImprovements)
+{
+  using f_dwa_controller::reserve_exit_priority;
+  EXPECT_FALSE(reserve_exit_priority(true, .01, .02, .1));
+  EXPECT_FALSE(reserve_exit_priority(true, .02, .03, .1));
+  EXPECT_TRUE(reserve_exit_priority(true, .01, .1, .1));
+  EXPECT_FALSE(reserve_exit_priority(true, .1, .2, .1));
+  EXPECT_FALSE(reserve_exit_priority(true, .2, .1, .1));
+}
+
+TEST(ReserveExitPreference, InvalidDistancesCannotGainPriority)
+{
+  using f_dwa_controller::reserve_exit_priority;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(reserve_exit_priority(true, nan, .2, .1));
+  EXPECT_FALSE(reserve_exit_priority(true, 0., nan, .1));
+  EXPECT_FALSE(reserve_exit_priority(true, 0., .2, nan));
+  EXPECT_FALSE(reserve_exit_priority(true, 0., .2, 0.));
+}
+#include "nav2_core/controller_exceptions.hpp"
+
+namespace f_dwa_controller
+{
+namespace
+{
+class FirBrakeRejectingCritic final : public dwb_core::TrajectoryCritic
+{
+public:
+  FirBrakeRejectingCritic()
+  {
+    name_ = "ObstacleFootprint";
+    scale_ = 1.0;
+  }
+  double scoreTrajectory(const dwb_msgs::msg::Trajectory2D &) override
+  {
+    // No partial-safe-prefix metadata: exercise the exhausted-window path.
+    throw dwb_core::IllegalTrajectoryException(name_, "forced obstacle rejection");
+  }
+};
+}  // namespace
+
+TEST_F(NativeInputTrajectoryGeneratorTest, FirExhaustedWindowBrakesThroughFilterWithoutException)
+{
+  for (const double angular_velocity : {-.2, .2}) {
+    for (const bool enabled : {false, true}) {
+      auto node = make_node("fir_exhausted_brake", true, false, false, 0.0, 1.2, 1.57, .05);
+      node->declare_parameter("publish_zero_velocity", true);
+      node->declare_parameter("FollowPath.trajectory_generator_name",
+        "dwb_plugins::StandardTrajectoryGenerator");
+      node->declare_parameter("FollowPath.critics", std::vector<std::string>{"GoalDist"});
+      node->declare_parameter("FollowPath.enable_no_valid_control_deceleration_fallback", enabled);
+      node->declare_parameter("FollowPath.certification_control_period", .05);
+      rclcpp::NodeOptions options;
+      options.use_global_arguments(false).parameter_overrides({
+          {"global_frame", "odom"}, {"plugins", std::vector<std::string>{}},
+          {"filters", std::vector<std::string>{}}, {"track_unknown_space", false}});
+      auto costmap = std::make_shared<nav2_costmap_2d::Costmap2DROS>(options);
+      ASSERT_EQ(costmap->on_configure(rclcpp_lifecycle::State()), nav2_util::CallbackReturn::SUCCESS);
+      costmap->getLayeredCostmap()->resizeMap(200u, 200u, .05, -5., -5.);
+      auto * grid = costmap->getCostmap();
+      for (unsigned int y = 0; y < 200u; ++y) {
+        for (unsigned int x = 0; x < 200u; ++x) {
+          grid->setCost(x, y, nav2_costmap_2d::LETHAL_OBSTACLE);
+        }
+      }
+      auto tf = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+      ScorePlannerAdapter planner;
+      planner.configure(node, kPluginName, tf, costmap);
+      auto generator = std::make_shared<FirTrajectoryGenerator>();
+      generator->initialize(node, kPluginName);
+      planner.set_test_components(generator, {std::make_shared<FirBrakeRejectingCritic>()});
+      auto snapshot = make_observable_zero_snapshot(node->now());
+      snapshot.activation_state.velocity.x = .6;
+      snapshot.activation_state.velocity.theta = angular_velocity;
+      snapshot.activation_state.linear_fir_history = {.1, -.05};
+      snapshot.activation_state.angular_fir_history = {.04, -.02};
+      snapshot.current_state = snapshot.activation_state;
+      generator->set_planning_snapshot(std::make_shared<const PlanningSnapshot>(snapshot));
+      geometry_msgs::msg::Pose2D pose;
+      auto result = std::make_shared<dwb_msgs::msg::LocalPlanEvaluation>();
+      if (!enabled) {
+        EXPECT_THROW(planner.run_terminal_core(pose, snapshot.current_state.velocity, result),
+          nav2_core::NoValidControl);
+      } else {
+        dwb_msgs::msg::TrajectoryScore selected;
+        ASSERT_NO_THROW(selected = planner.run_terminal_core(pose, snapshot.current_state.velocity, result));
+        const auto detail = [&selected](const std::string & name) {
+            const auto item = std::find_if(selected.scores.begin(), selected.scores.end(),
+                [&name](const auto & score) {return score.name == name;});
+            return item == selected.scores.end() ? NAN : item->raw_score;
+          };
+        EXPECT_DOUBLE_EQ(detail("FirMaximumDecelerationFallback"), 1.0);
+        EXPECT_DOUBLE_EQ(detail("RecoveryCollisionCertified"), 0.0);
+        EXPECT_NEAR(detail("FallbackLinearRawInput"), -1.2, 3e-7);
+        EXPECT_NEAR(detail("FallbackAngularRawInput"), angular_velocity > 0. ? -1.57 : 1.57, 3e-7);
+        const double linear_acceleration = .5 * detail("FallbackLinearRawInput") + .3 * .1 + .2 * -.05;
+        const double angular_acceleration = .5 * detail("FallbackAngularRawInput") + .3 * .04 + .2 * -.02;
+        // CriticScore.raw_score is float32; the native state remains double.
+        EXPECT_NEAR(selected.traj.velocity.x, .6 + .05 * linear_acceleration, 1e-8);
+        EXPECT_NEAR(selected.traj.velocity.theta, angular_velocity + .05 * angular_acceleration, 1e-8);
+        EXPECT_GT(selected.traj.velocity.x, .5);
+        ASSERT_EQ(result->twists.size(), generator->candidate_count() + 1u);
+        EXPECT_EQ(result->best_index, result->twists.size() - 1u);
+        const auto issued = node->now();
+        generator->commit_selected_command(selected.traj.velocity, issued);
+        f_dwa_controller::msg::CommandDispatch dispatch;
+        dispatch.header.stamp = issued;
+        dispatch.command.linear.x = selected.traj.velocity.x;
+        dispatch.command.angular.z = selected.traj.velocity.theta;
+        dispatch.has_sequence = true;
+        generator->observe_command_dispatch(dispatch);
+        auto next = make_observable_zero_snapshot(issued);
+        generator->enrich_planning_snapshot(next);
+        ASSERT_TRUE(next.current_state.native_state_valid);
+        ASSERT_EQ(next.current_state.linear_fir_history.size(), 2u);
+        EXPECT_NEAR(next.current_state.linear_fir_history[0], detail("FallbackLinearRawInput"), 1e-7);
+        EXPECT_DOUBLE_EQ(next.current_state.linear_fir_history[1], .1);
+        EXPECT_NEAR(next.current_state.angular_fir_history[0], detail("FallbackAngularRawInput"), 1e-7);
+        EXPECT_DOUBLE_EQ(next.current_state.angular_fir_history[1], .04);
+        EXPECT_NEAR(selected.traj.velocity.x, .6 + .05 *
+          (.5 * next.current_state.linear_fir_history[0] + .3 * .1 + .2 * -.05), 1e-12);
+        EXPECT_NEAR(selected.traj.velocity.theta, angular_velocity + .05 *
+          (.5 * next.current_state.angular_fir_history[0] + .3 * .04 + .2 * -.02), 1e-12);
+      }
+      planner.cleanup();
+      costmap->on_cleanup(rclcpp_lifecycle::State());
+    }
+  }
+}
 }  // namespace f_dwa_controller

@@ -139,6 +139,7 @@ def test_attenuation_bands_can_be_defined_in_python():
 @pytest.mark.parametrize(
     ('specification', 'mode', 'cutoff_hz', 'bands', 'canonical'),
     [
+        ('identity', 'identity', None, (), 'identity'),
         ('1.0', 'lowpass', 1.0, (), '1'),
         ('[0.8, 1.6]', 'bandstop', None, ((0.8, 1.6),), '[0.8, 1.6]'),
         (
@@ -266,3 +267,46 @@ def test_direct_yaml_coefficients_are_rejected():
 
     with pytest.raises(ValueError, match='must not contain fir_coefficients'):
         inject_fir_coefficients(invalid_parameters)
+
+
+def test_angular_override_injects_independent_unit_gain_filters():
+    parameters = _load_f_dwa_parameters()
+    plugin = parameters['controller_server']['ros__parameters']['FollowPath']
+    plugin.pop('fir_design_profile', None)
+    plugin.pop('fir_cutoff_frequency_hz', None)
+    plugin.update(fir_filter_specification='[0.7,2.3]',
+                  fir_angular_filter_specification='1.5', fir_effective_taps=54)
+    inject_fir_coefficients(parameters)
+    assert plugin['fir_filter_specification'] == '[0.7, 2.3]'
+    assert plugin['fir_angular_filter_specification'] == '1.5'
+    for key in ('fir_coefficients', 'fir_angular_coefficients'):
+        assert len(plugin[key]) == 54
+        assert sum(plugin[key]) == pytest.approx(1.)
+    linear, angular = plugin['fir_coefficients'], plugin['fir_angular_coefficients']
+    _, linear_gain = signal.freqz(linear, worN=[1.5, 4.], fs=20.)
+    _, angular_gain = signal.freqz(angular, worN=[.2, 4.], fs=20.)
+    assert abs(linear_gain[0]) < .2
+    assert abs(linear_gain[1]) > .8
+    assert abs(angular_gain[0]) > .8
+    assert abs(angular_gain[1]) < .2
+
+
+@pytest.mark.parametrize('angular', ['[2,1]', 'nan', '10', '[1,~]'])
+def test_angular_override_rejects_invalid_design(angular):
+    parameters = _load_f_dwa_parameters()
+    parameters['controller_server']['ros__parameters']['FollowPath'][
+        'fir_angular_filter_specification'] = angular
+    with pytest.raises(ValueError):
+        inject_fir_coefficients(parameters)
+
+
+def test_identity_preset_injects_exact_44_tap_impulse():
+    parameters = _load_f_dwa_parameters()
+    active = parameters['controller_server']['ros__parameters']['FollowPath']
+    active.pop('fir_cutoff_frequency_hz')
+    active.update(fir_filter_specification='identity', fir_effective_taps=44)
+    report = inject_fir_coefficients(parameters)
+    assert active['fir_coefficients'] == [1.0] + [0.0] * 43
+    assert report.mode == 'identity'
+    assert report.effective_taps == 44
+    assert report.step_response_overshoot_percent == 0.0

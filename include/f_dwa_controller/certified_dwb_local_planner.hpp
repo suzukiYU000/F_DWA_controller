@@ -419,6 +419,7 @@ private:
     transport_invalidation_client_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_trial_service_;
   bool certification_enabled_{false};
+  bool prefer_reserve_exit_{false};
   bool clearance_constraint_enabled_{false};
   std::string clearance_constraint_critic_name_{"FootprintClearance"};
   std::string clearance_constraint_trigger_critic_name_{

@@ -272,6 +272,8 @@ private:
     const AxisState & initial_state,
     const AxisLimits & limits,
     const std::vector<double> & initial_fir_history,
+    const std::vector<double> & coefficients,
+    const FirStopCoefficientResponse & stop_response,
     int rollout_step_count,
     int command_delay_steps,
     int maximum_stop_steps,
@@ -333,6 +335,13 @@ private:
   rclcpp::Time applied_dispatch_time_;
   NativeCommandState applied_native_state_;
   std::vector<double> fir_coefficients_;
+  // Empty angular override retains the original common-axis filter.
+  std::vector<double> fir_angular_coefficients_;
+  const std::vector<double> & angular_fir_coefficients() const
+  {
+    return fir_angular_coefficients_.empty() ? fir_coefficients_ : fir_angular_coefficients_;
+  }
+  FirStopCoefficientResponse fir_angular_stop_coefficient_response_;
   FirStopCoefficientResponse fir_stop_coefficient_response_;
   bool applied_command_state_ready_{false};
   std::deque<PendingNativeCommand> pending_native_commands_;

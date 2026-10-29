@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include "f_dwa_controller/certified_dwb_local_planner.hpp"
+#include "f_dwa_controller/reserve_exit_priority.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -319,6 +320,9 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".enable_certification",
     rclcpp::ParameterValue(false));
   nav2_util::declare_parameter_if_not_declared(
+    node, name + ".prefer_reserve_exit",
+    rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(
     node, name + ".enable_clearance_constraint",
     rclcpp::ParameterValue(false));
   nav2_util::declare_parameter_if_not_declared(
@@ -507,6 +511,8 @@ void CertifiedDWBLocalPlanner::configure(
     node, name + ".candidate_marker_max_points", rclcpp::ParameterValue(16));
 
   node->get_parameter(name + ".enable_certification", certification_enabled_);
+  node->get_parameter(
+    name + ".prefer_reserve_exit", prefer_reserve_exit_);
   node->get_parameter(
     name + ".enable_clearance_constraint", clearance_constraint_enabled_);
   node->get_parameter(
@@ -2947,7 +2953,8 @@ CertifiedDWBLocalPlanner::build_candidate_markers(
       selected_least_violation_recovery = std::any_of(
         score.scores.begin(), score.scores.end(),
         [](const dwb_msgs::msg::CriticScore & critic_score) {
-          return critic_score.name == "MethodNativeLeastViolationRecovery";
+          return critic_score.name == "MethodNativeLeastViolationRecovery" ||
+                 critic_score.name == "FirMaximumDecelerationFallback";
         });
       if (selected_least_violation_recovery && valid_count > 0u) {
         --valid_count;
@@ -3324,6 +3331,7 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
   bool best_rollout_has_heading_progress = false;
   bool best_stop_progress_was_evaluated = false;
   bool best_rollout_recovers_initial_clearance = false;
+  bool best_exits_reserve = false;
   bool best_captures_goal = false;
   struct ProgressEscapeCandidate
   {
@@ -3781,6 +3789,15 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         // rejection, preserving the physical-footprint gate's precedence.
         candidate_best_score = -1.0;
       }
+      // Evaluate full costs and unchanged stop safety before promoting an exit.
+      // A cheap weighted winner must not prune the safer-margin alternative.
+      const bool reserve_exit_context = prefer_reserve_exit_ &&
+        stop_admissibility_enabled_ && !inside_terminal_capture_region &&
+        clearance_constraint_guard_footprint_critic_;
+      if (reserve_exit_context) {
+        candidate_best_score = -1.0;
+      }
+      bool candidate_exits_reserve = false;
       bool candidate_uses_reserve_recovery = false;
       bool completed_weighted_score = true;
       double candidate_clearance_risk = 0.0;
@@ -3810,6 +3827,20 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           &strict_physical_stop_safety_proven,
           &candidate_guard_clearance_risk,
           &candidate_guard_approach_risk);
+      }
+      // This flag changes ranking only after both rollout and stop checks.
+      candidate_exits_reserve = reserve_exit_priority(
+        reserve_exit_context && completed_weighted_score &&
+        strict_physical_stop_safety_proven,
+        candidate_initial_directional_clearance,
+        candidate_terminal_directional_clearance,
+        localization_uncertainty_margin);
+      if (record_full_evaluation_details_ && reserve_exit_context) {
+        dwb_msgs::msg::CriticScore detail;
+        detail.name = "ReserveExitPriority";
+        detail.scale = 0.0;
+        detail.raw_score = candidate_exits_reserve ? 1.0 : 0.0;
+        score_scratch.scores.push_back(std::move(detail));
       }
       (void)candidate_clearance_risk;
       if (std::isfinite(candidate_guard_clearance_risk) &&
@@ -3960,7 +3991,13 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
       const bool terminal_capture_class_matches =
         !terminal_endpoint_policy_enabled ||
         terminal_stop_assessment.captures_goal == best_captures_goal;
+      const bool reserve_exit_class_matches =
+        candidate_exits_reserve == best_exits_reserve;
+      const bool reserve_exit_rank_is_better =
+        recovery_mode_matches && terminal_capture_class_matches &&
+        candidate_exits_reserve && !best_exits_reserve;
       const bool avoidance_rank_is_better =
+        reserve_exit_class_matches &&
         avoidance_constraint_context && recovery_mode_matches &&
         terminal_capture_class_matches &&
         (candidate_rollout_recovers_initial_clearance !=
@@ -3973,6 +4010,7 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         score_scratch.total, best.total,
         canonical_index, best_canonical_index));
       const bool normal_rank_is_better =
+        reserve_exit_class_matches &&
         !avoidance_constraint_context && recovery_mode_matches &&
         terminal_stop_prefers_candidate(
         terminal_stop_assessment.captures_goal, best_captures_goal,
@@ -3982,7 +4020,8 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         best.total < 0.0 ||
         (!candidate_uses_reserve_recovery &&
         best_uses_reserve_recovery) ||
-        terminal_capture_rank_is_better || avoidance_rank_is_better ||
+        terminal_capture_rank_is_better || reserve_exit_rank_is_better ||
+        avoidance_rank_is_better ||
         normal_rank_is_better;
       bool is_worst = worst_total < 0.0;
       if (!is_worst) {
@@ -4387,6 +4426,7 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
           best.traj.time_offsets.swap(trajectory_scratch.time_offsets);
         }
         best_canonical_index = canonical_index;
+        best_exits_reserve = candidate_exits_reserve;
         best_clearance_risk_bucket = candidate_clearance_risk_bucket;
         best_clearance_trigger_bucket = candidate_clearance_trigger_bucket;
         best_clearance_guard_bucket = candidate_clearance_guard_bucket;
@@ -5935,6 +5975,70 @@ CertifiedDWBLocalPlanner::coreScoringAlgorithm(
         std::make_move_iterator(best_stop_states.end()));
     }
     return best;
+  }
+
+  // Keep an exhausted FIR window on the native input/dispatch path. A zero
+  // velocity from Controller Server would bypass the filter and discard its
+  // continuous response. The stop solver uses the strongest deceleration input
+  // compatible with the velocity/acceleration limits and the exact FIR tail.
+  // This is a braking fallback, never a new ordinary sampled candidate or a
+  // claim that the obstacle geometry has become collision-free.
+  if (no_valid_control_deceleration_fallback_enabled_ &&
+    diagnostic_obstacle_candidate_index &&
+    std::dynamic_pointer_cast<FirTrajectoryGenerator>(native_generator))
+  {
+    const int maximum_stop_steps = static_cast<int>(std::ceil(
+        terminal_stop_maximum_time_ / certification_control_period_));
+    std::vector<geometry_msgs::msg::Pose2D> braking_poses;
+    std::vector<nav_2d_msgs::msg::Twist2D> braking_velocities;
+    std::vector<NativeInputTrajectoryGenerator::NativeCommandState>
+    braking_states;
+    if (native_generator->generate_direct_stop_trajectory(
+        pose, maximum_stop_steps, terminal_stop_velocity_threshold_,
+        braking_poses, braking_velocities, braking_states) &&
+      !braking_states.empty() && !braking_velocities.empty() &&
+      !braking_states.front().linear_fir_history.empty() &&
+      !braking_states.front().angular_fir_history.empty())
+    {
+      const auto & first = braking_states.front();
+      const bool collision_certified = certify_physical_sequence(
+        braking_poses, nullptr, nullptr);
+      dwb_msgs::msg::TrajectoryScore braking_score;
+      braking_score.total = 0.0;
+      braking_score.traj.velocity = first.command_velocity;
+      braking_score.traj.poses = std::move(braking_poses);
+      const auto detail = [&braking_score](const char * name, double value) {
+          dwb_msgs::msg::CriticScore score;
+          score.name = name;
+          score.scale = 0.0;
+          score.raw_score = value;
+          braking_score.scores.push_back(std::move(score));
+        };
+      detail("FirMaximumDecelerationFallback", 1.0);
+      detail("RecoveryCollisionCertified", collision_certified ? 1.0 : 0.0);
+      detail("FallbackLinearRawInput", first.linear_fir_history.front());
+      detail("FallbackAngularRawInput", first.angular_fir_history.front());
+      detail("FallbackLinearFilteredAcceleration", first.linear_state.acceleration);
+      detail("FallbackAngularFilteredAcceleration", first.angular_state.acceleration);
+      retained_backup_commands_.clear();
+      retained_backup_states_.clear();
+      terminal_stop_goal_capture_committed_ = false;
+      native_generator->select_command_for_dispatch(first);
+      if (results) {
+        results->twists.push_back(braking_score);
+        results->best_index = results->twists.size() - 1u;
+      }
+      RCLCPP_WARN_THROTTLE(
+        logger_, *clock_, 1000,
+        "fir_maximum_deceleration_fallback;linear_raw=%.9f;angular_raw=%.9f;"
+        "linear_filtered=%.9f;angular_filtered=%.9f;collision_certified=%s. "
+        "Preserving FIR history and dispatch continuity; independent stop "
+        "boundaries remain active",
+        first.linear_fir_history.front(), first.angular_fir_history.front(),
+        first.linear_state.acceleration, first.angular_state.acceleration,
+        collision_certified ? "true" : "false");
+      return braking_score;
+    }
   }
 
   std::string controller_failure_attribution;
